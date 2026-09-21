@@ -1,0 +1,15 @@
+import os
+
+AGENTS = min(max(2, os.cpu_count() or 4), 8)
+GAMMA = 0.99
+LR = 1e-3
+BATCH = 128
+REPLAY_CAP = 200000
+HIDDEN = 128
+TARGET_SYNC = 2000
+SAVE_EVERY = 5000
+EPS_START = 1.0
+EPS_END = 0.02
+EPS_DECAY = 800000
+CHECKPOINT = "checkpoint.pth"
+LOG = "train.log"
