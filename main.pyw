@@ -56,7 +56,7 @@ def draw_game(screen, g):
                 continue
             x = game.BRICK_LEFT + c * (game.BRICK_W + game.BRICK_GAP)
             y = game.BRICK_TOP + r * (game.BRICK_H + game.BRICK_GAP)
-            pygame.draw.rect(screen, game.COLORS[r], (x, y, game.BRICK_W, game.BRICK_H))
+            pygame.draw.rect(screen, game.COLORS[r % len(game.COLORS)], (x, y, game.BRICK_W, game.BRICK_H))
             pygame.draw.rect(screen, (10, 12, 18), (x, y, game.BRICK_W, game.BRICK_H), 2)
     px = int(g.paddle_x - game.PADDLE_W / 2)
     pygame.draw.rect(screen, (150, 190, 255), (px, game.PADDLE_Y, game.PADDLE_W, game.PADDLE_H))

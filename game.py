@@ -1,20 +1,20 @@
 import math
 import random
 
-W = 480
-H = 640
-PADDLE_W = 84
+W = 720
+H = 920
+PADDLE_W = 110
 PADDLE_H = 12
-BALL_R = 8
-ROWS = 6
-COLS = 8
-BRICK_W = 54
-BRICK_H = 18
-BRICK_GAP = 4
-BRICK_TOP = 64
+BALL_R = 9
+ROWS = 50
+COLS = 20
+BRICK_W = 35
+BRICK_H = 15
+BRICK_GAP = 1
+BRICK_TOP = 54
 BRICK_LEFT = (W - COLS * (BRICK_W + BRICK_GAP)) // 2
-PADDLE_Y = H - 36
-BALL_SPEED = 6.0
+PADDLE_Y = H - 46
+BALL_SPEED = 9.0
 COLORS = [(230, 80, 80), (230, 150, 70), (230, 210, 80), (110, 200, 100), (90, 160, 230), (170, 110, 230)]
 
 
@@ -53,9 +53,9 @@ class Breakout:
 
     def step(self, action):
         if action == 0:
-            self.paddle_x = max(PADDLE_W / 2, self.paddle_x - 12)
+            self.paddle_x = max(PADDLE_W / 2, self.paddle_x - 16)
         elif action == 1:
-            self.paddle_x = min(W - PADDLE_W / 2, self.paddle_x + 12)
+            self.paddle_x = min(W - PADDLE_W / 2, self.paddle_x + 16)
 
         bx = self.ball_x + self.vx
         by = self.ball_y + self.vy
@@ -109,7 +109,7 @@ class Breakout:
             reward -= 1.0
         elif not any(any(row) for row in self.bricks):
             done = True
-            reward += 5.0
+            reward += 10.0
 
         self.ball_x = bx
         self.ball_y = by

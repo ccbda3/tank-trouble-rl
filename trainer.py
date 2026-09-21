@@ -19,6 +19,7 @@ class Trainer:
         self.loss = 0.0
 
     def loop(self, stop_event):
+        last_save = time.time()
         while not stop_event.is_set():
             if len(self.buffer) < self.config.BATCH:
                 time.sleep(0.05)
@@ -45,4 +46,7 @@ class Trainer:
             if self.train_steps % self.config.TARGET_SYNC == 0:
                 self.target_net.load_state_dict(self.net.state_dict())
             if self.train_steps % self.config.SAVE_EVERY == 0:
+                torch.save(self.net.state_dict(), self.config.CHECKPOINT)
+            if time.time() - last_save > self.config.CHECKPOINT_INTERVAL:
+                last_save = time.time()
                 torch.save(self.net.state_dict(), self.config.CHECKPOINT)
