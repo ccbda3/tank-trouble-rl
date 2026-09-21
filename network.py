@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class DQN(nn.Module):
     def __init__(self, input_dim, hidden=128, actions=3):

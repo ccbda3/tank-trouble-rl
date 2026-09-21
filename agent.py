@@ -4,6 +4,8 @@ import time
 
 import torch
 
+from network import DEVICE
+
 
 class Counter:
     def __init__(self, value=0):
@@ -33,7 +35,7 @@ class Agent:
         if random.random() < self.epsilon():
             return random.randrange(3)
         with torch.no_grad():
-            q = self.net(torch.tensor(s, dtype=torch.float32).unsqueeze(0))
+            q = self.net(torch.tensor(s, dtype=torch.float32, device=DEVICE).unsqueeze(0))
             return int(q.argmax().item())
 
     def epsilon(self):

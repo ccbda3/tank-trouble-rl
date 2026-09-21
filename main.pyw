@@ -21,7 +21,7 @@ import env
 import game
 from agent import Agent, Counter
 from buffer import ReplayBuffer
-from network import DQN
+from network import DQN, DEVICE
 from trainer import Trainer
 
 torch.set_num_threads(1)
@@ -103,6 +103,7 @@ def draw(screen, fonts, g, stats, counter, agent, buffer, trainer):
     lines = [
         ("打砖块 · DQN 强化学习", font_title, (255, 255, 255)),
         (f"后台智能体  {config.AGENTS} 个（共用一张网络）", font_small, (170, 200, 255)),
+        (f"计算设备  {'CUDA (GPU)' if DEVICE.type == 'cuda' else 'CPU'}", font_small, (170, 200, 255)),
         (f"全局步数  {counter.get():,}", font, (230, 235, 245)),
         (f"探索率 ε  {agent.epsilon():.3f}", font, (230, 235, 245)),
         (f"经验池  {len(buffer):,} / {config.REPLAY_CAP:,}", font, (230, 235, 245)),
@@ -127,8 +128,8 @@ def draw(screen, fonts, g, stats, counter, agent, buffer, trainer):
 
 def main():
     state_dim = 5 + game.ROWS + 1
-    net = DQN(state_dim, config.HIDDEN, 3)
-    target_net = DQN(state_dim, config.HIDDEN, 3)
+    net = DQN(state_dim, config.HIDDEN, 3).to(DEVICE)
+    target_net = DQN(state_dim, config.HIDDEN, 3).to(DEVICE)
     target_net.load_state_dict(net.state_dict())
     if os.path.exists(config.CHECKPOINT):
         try:
@@ -142,6 +143,7 @@ def main():
     optimizer = torch.optim.Adam(net.parameters(), lr=config.LR)
     counter = Counter()
     stats = {"lock": threading.Lock(), "recent": deque(maxlen=200), "episodes": 0, "loss": 0.0}
+    log.info("device: %s", DEVICE)
 
     stop_event = threading.Event()
     trainer = Trainer(net, target_net, buffer, optimizer, counter, config, stats)
