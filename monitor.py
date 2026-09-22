@@ -31,6 +31,14 @@ def act_stats(net, obs):
     gray = np.asarray(obs, dtype=float).mean(0)
     h, w = gray.shape
     in_arr = [float(gray[int(i * h / 10):int((i + 1) * h / 10)].mean()) for i in range(10)]
+    wf = np.array([torch.mean(torch.abs(t)).item() for t in [
+        net.net[0].weight,
+        net.net[2].weight,
+        net.net[4].weight,
+        net.fc[0].weight,
+        net.fc[2].weight,
+    ]])
+    wf = (wf / (wf.max() or 1.0)).tolist()
     return {
         "in": in_arr,
         "c1": group_avg(c1, 12),
@@ -38,6 +46,7 @@ def act_stats(net, obs):
         "c3": group_avg(c3, 12),
         "fc": group_avg(fc, 12),
         "out": group_avg(out, 3),
+        "wf": wf,
     }
 
 
@@ -77,7 +86,7 @@ canvas{width:100%;display:block;background:#0b0e14;border-radius:8px}
 <div class="grid" id="cards"></div>
 <section>
   <div class="panel"><h2>神经网络 · 逐层神经元连接（真实激活驱动亮度闪烁）</h2><canvas id="nn" height="330"></canvas>
-    <div class="lg"><span><i style="background:#1d7fd1"></i>输入</span><span><i style="background:#e76a2e"></i>卷积/FC</span><span><i style="background:#6bff8f"></i>输出</span><span style="opacity:.8">← 线越亮=两端神经元激活越强</span></div>
+    <div class="lg"><span><i style="background:#1d7fd1"></i>输入</span><span><i style="background:#e76a2e"></i>卷积/FC</span><span><i style="background:#6bff8f"></i>输出</span><span style="opacity:.8">← 线亮 = 真实权重|W| × 激活</span></div>
   </div>
   <div class="panel"><h2>梯度下降 · 3D 损失面</h2><canvas id="gd" height="330"></canvas>
     <div class="lg"><span><i style="background:#3a465c"></i>损失面 z=x²+y²</span><span><i style="background:#ff8f5a"></i>当前 Loss 位置</span></div>
@@ -96,20 +105,20 @@ function pick(k,d){switch(k){
 function cls(k){return(k==="平均最远"||k==="历史最远"||k==="GPU 利用率")?" good":(k==="探索率 ε"?" cy":"");}
 const keys=["步数","探索率 ε","训练步数","经验池","Loss","本局最远","平均最远","历史最远","GPU 利用率","局数"];
 const LN=[["in","输入",10],["c1","C1·32",12],["c2","C2·64",14],["c3","C3·64",12],["fc","FC·512",12],["out","输出",3]];
-let A={in:new Array(10).fill(0),c1:new Array(12).fill(0),c2:new Array(14).fill(0),c3:new Array(12).fill(0),fc:new Array(12).fill(0),out:new Array(3).fill(0)};
+let A={in:new Array(10).fill(0),c1:new Array(12).fill(0),c2:new Array(14).fill(0),c3:new Array(12).fill(0),fc:new Array(12).fill(0),out:new Array(3).fill(0),wf:[0.5,0.5,0.5,0.5,0.5]};
 function norm(v){const m=Math.max.apply(null,v);return m>0?v.map(x=>Math.max(0,x)/m):v;}
 function drawNN(t){
  const c=$("nn"),x=c.getContext("2d"),W=c.clientWidth,H=330;
  c.width=W;c.height=H;x.clearRect(0,0,W,H);
  const pad=40;const xs=LN.map((_,i)=>pad+i*(W-2*pad)/(LN.length-1));
  const pos=LN.map(f=>{const n=f[2],ys=[];for(let i=0;i<n;i++)ys.push(H/2+(i-(n-1)/2)*(H-80)/n);return ys;});
- const actv=key=>Math.log1p(10*norm(A[key])[i]||0)/Math.log(10);// placeholder
  for(let li=0;li<LN.length-1;li++){
   const aarr=norm(A[LN[li][0]]),barr=norm(A[LN[li+1][0]]);
+  const wfv=(A.wf&&A.wf[li])||0;
   for(let i=0;i<LN[li][2];i++)for(let j=0;j<LN[li+1][2];j++){
    const a=aarr[i],b=barr[j],amp=a*b,pulse=.45+.55*Math.abs(Math.sin(t/300+li*1.7+i*0.4+j*0.25));
-   const al=Math.min(1,amp*2.4*pulse);
-   if(al<0.02)continue;
+   const al=Math.min(1,(amp*(0.5+wfv*1.8)+wfv*0.3)*pulse);
+   if(al<0.03)continue;
    x.beginPath();x.strokeStyle="rgba(255,143,90,"+al.toFixed(2)+")";
    x.lineWidth=Math.min(2.2,.6+al*1.8);
    if(al>0.5){x.shadowColor="rgba(255,143,90,"+al.toFixed(2)+")";x.shadowBlur=8;}else x.shadowBlur=0;
@@ -188,7 +197,7 @@ async function poll(){
   $("info").innerHTML=[
    ["环境",d.mark],["有效批量",(d.batch*d.accum)+"（batch "+d.batch+" × 累积 "+d.accum+"）"],
    ["智能体数",d.agents],["算法","Double DQN + 优先级经验池"],["设备",d.device],
-   ["动作空间","7（SIMPLE_MOVEMENT）"],["帧输入","4 帧 × 96 × 96 灰度"],["神经元激活","当前画面逐层真实前向（线亮=激活强）"]
+   ["动作空间","7（SIMPLE_MOVEMENT）"],["帧输入","4 帧 × 96 × 96 灰度"],["连线亮度","真实权重 |W| × 两端真实激活（参数越大越亮）"]
   ].map(x=>'<div><b>'+x[0]+'</b>'+x[1]+'</div>').join("");
  }catch(e){$("meta").textContent="离线 / 连接断开";}
  setTimeout(poll,1000);
