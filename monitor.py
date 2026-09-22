@@ -11,34 +11,16 @@ import config
 _EDGE_CACHE = {"t": 0.0, "v": None}
 
 
-def group_avg(a, n):
-    a = np.asarray(a, dtype=float).ravel()
-    if len(a) <= n:
-        return [float(x) for x in a]
-    idx = np.linspace(0, len(a), n + 1).astype(int)
-    return [float(a[idx[i]:idx[i + 1]].mean()) for i in range(n)]
-
-
-def disp_bucket(real_n, disp_n, conn):
-    d = ((np.arange(real_n) + 0.5) * disp_n / real_n).astype(np.int64)
-    d = np.clip(d, 0, max(0, disp_n - 1))
-    return np.clip(((d + 0.5) * conn / disp_n).astype(np.int64), 0, conn - 1)
-
-
-def bucket_edges(weight, conn, n_src, n_dst):
+def chan_matrix(weight):
     w = torch.abs(weight)
     while w.dim() > 2:
         w = w.mean(-1)
-    W = w.detach().cpu().numpy().astype(np.float32)
-    t_n, s_n = W.shape
-    gs = disp_bucket(s_n, n_src, conn)
-    gt = disp_bucket(t_n, n_dst, conn)
-    idx = (gt[:, None] * conn + gs[None, :]).ravel()
-    acc = np.bincount(idx, weights=W.ravel(), minlength=conn * conn)
-    cnt = np.bincount(idx, minlength=conn * conn)
-    out = np.zeros(conn * conn, np.float32)
-    np.divide(acc, cnt, out=out, where=cnt > 0)
-    return out
+    return np.round(w.detach().cpu().numpy().astype(np.float32), 5)
+
+
+def fc_matrix(weight, chan):
+    w = torch.abs(weight).detach().cpu().numpy().astype(np.float32)
+    return np.round(w.reshape(w.shape[0], chan, -1).mean(2), 5)
 
 
 def act_stats(net, obs):
@@ -57,27 +39,20 @@ def act_stats(net, obs):
         fc = f[0].cpu().numpy()
         out = net.fc[2](f)[0].cpu().numpy()
 
-    gray = np.asarray(obs, dtype=float).mean(0)
-    rows, cols = 6, 8
-    rh = gray.shape[0] // rows
-    cw = gray.shape[1] // cols
-    in_arr = []
-    for r in range(rows):
-        for c in range(cols):
-            in_arr.append(float(gray[r * rh:(r + 1) * rh, c * cw:(c + 1) * cw].mean()))
+    frames = np.asarray(obs, dtype=float)
+    nfr = frames.shape[0]
+    frame_act = [float(frames[i].mean()) for i in range(nfr)]
 
-    conn = 16
-
-    def layer(name, detail, shown, tdim, params, outsz):
+    def layer(name, detail, shown, params, out_desc, real):
         arr = np.asarray(shown, dtype=float)
         return {
             "name": name,
             "detail": detail,
-            "nodeCount": len(arr),
-            "trueDim": int(tdim),
+            "nodeCount": int(arr.size),
             "nodes": [float(v) for v in arr],
             "params": int(params),
-            "out": outsz,
+            "out": out_desc,
+            "realCount": int(real),
             "actMin": float(arr.min()) if arr.size else 0.0,
             "actMax": float(arr.max()) if arr.size else 0.0,
             "actMean": float(arr.mean()) if arr.size else 0.0,
@@ -88,31 +63,31 @@ def act_stats(net, obs):
 
     k1, k2, k3 = net.net[0].out_channels, net.net[2].out_channels, net.net[4].out_channels
     s1, s2, s3 = c1a.shape[-1], c2a.shape[-1], c3a.shape[-1]
+    nf = net.fc[0].out_features
 
     layers = [
-        layer("输入", f"{config.GRID}×{config.GRID} 灰度 · 融合 {config.FRAME_STACK} 帧",
-              in_arr, config.GRID * config.GRID, 0, f"{rows}×{cols} 网格采样"),
-        layer("C1", f"{k1} 通道 @ {s1}×{s1} 卷积", group_avg(c1, 24), k1, nparam(net.net[0]),
-              f"{k1} @ {s1}×{s1}"),
-        layer("C2", f"{k2} 通道 @ {s2}×{s2} 卷积", group_avg(c2, 24), k2, nparam(net.net[2]),
-              f"{k2} @ {s2}×{s2}"),
-        layer("C3", f"{k3} 通道 @ {s3}×{s3} 卷积", group_avg(c3, 24), k3, nparam(net.net[4]),
-              f"{k3} @ {s3}×{s3}"),
-        layer("FC", f"全连接 {net.fc[0].out_features} · 展平 {int(net.fc[0].in_features)}",
-              group_avg(fc, 24), net.fc[0].out_features, nparam(net.fc[0]),
-              f"{net.fc[0].out_features} 特征"),
-        layer("输出", "四个动作 Q 值", out.tolist(), config.ACTIONS, nparam(net.fc[2]),
-              "上 / 下 / 左 / 右"),
+        layer("输入", f"{nfr} 帧 × {config.GRID}×{config.GRID} 灰度",
+              frame_act, 0, f"{nfr} 帧", nfr * config.GRID * config.GRID),
+        layer("C1", f"{k1} 通道 · 每通道 {s1}×{s1}",
+              c1, nparam(net.net[0]), f"{k1}×{s1}×{s1}", k1 * s1 * s1),
+        layer("C2", f"{k2} 通道 · 每通道 {s2}×{s2}",
+              c2, nparam(net.net[2]), f"{k2}×{s2}×{s2}", k2 * s2 * s2),
+        layer("C3", f"{k3} 通道 · 每通道 {s3}×{s3}",
+              c3, nparam(net.net[4]), f"{k3}×{s3}×{s3}", k3 * s3 * s3),
+        layer("FC", f"{nf} 个神经元 · 全部显示",
+              fc, nparam(net.fc[0]), f"{nf}", nf),
+        layer("输出", f"{config.ACTIONS} 个动作 · 全部显示",
+              out, nparam(net.fc[2]), "上/下/左/右", config.ACTIONS),
     ]
 
     now = time.time()
     if _EDGE_CACHE["v"] is None or now - _EDGE_CACHE["t"] > 5.0:
         _EDGE_CACHE["v"] = [
-            [float(net.net[0].weight.abs().mean().item())] * (conn * conn),
-            bucket_edges(net.net[2].weight, conn, 24, 24).tolist(),
-            bucket_edges(net.net[4].weight, conn, 24, 24).tolist(),
-            bucket_edges(net.fc[0].weight, conn, 24, 24).tolist(),
-            bucket_edges(net.fc[2].weight, conn, 24, config.ACTIONS).tolist(),
+            chan_matrix(net.net[0].weight).tolist(),
+            chan_matrix(net.net[2].weight).tolist(),
+            chan_matrix(net.net[4].weight).tolist(),
+            fc_matrix(net.fc[0].weight, k3).tolist(),
+            chan_matrix(net.fc[2].weight).tolist(),
         ]
         _EDGE_CACHE["t"] = now
     edges = _EDGE_CACHE["v"]
@@ -121,7 +96,6 @@ def act_stats(net, obs):
         "ready": 1,
         "layers": layers,
         "edges": edges,
-        "conn": conn,
         "value": float(out.max()) if out.size else 0.0,
     }
 
@@ -146,7 +120,6 @@ CFG = {
     "betaFrames": config.BETA_FRAMES,
     "saveEvery": config.SAVE_EVERY,
     "ckptEvery": config.CHECKPOINT_INTERVAL,
-    "connBucket": 16,
 }
 
 PAGE = """<!DOCTYPE html>
@@ -228,7 +201,7 @@ main{display:flex;flex-direction:column;gap:10px;padding:10px;min-width:0}
 .vbtn{font:12px "Microsoft YaHei UI","Segoe UI",sans-serif;color:#9fb2c6;background:#151b22;border:1px solid #263039;border-radius:5px;padding:3px 10px;margin-left:6px;cursor:pointer}
 .vbtn:hover{border-color:#3b4a58;color:#cfd8e3}
 .vbtn.on{color:#0d1218;background:#5fb0e8;border-color:#5fb0e8;font-weight:700}
-.netwrap{position:relative;width:100%;height:560px;background:radial-gradient(120% 100% at 50% 0%,#141b24 0%,#0d1218 72%);border:1px solid #1c232b;border-radius:6px;overflow:hidden}
+.netwrap{position:relative;width:100%;height:780px;background:radial-gradient(120% 100% at 50% 0%,#141b24 0%,#0d1218 72%);border:1px solid #1c232b;border-radius:6px;overflow:hidden}
 #netcv{display:block;width:100%;height:100%;cursor:crosshair}
 .nettip{position:absolute;display:none;z-index:4;max-width:264px;padding:6px 9px;background:rgba(11,15,20,.95);border:1px solid #2b3644;border-radius:5px;font-size:11px;line-height:1.55;color:#b9c4d1;pointer-events:none;box-shadow:0 8px 20px rgba(0,0,0,.55)}
 .nettip.on{display:block}
@@ -244,7 +217,7 @@ main{display:flex;flex-direction:column;gap:10px;padding:10px;min-width:0}
 .hint i{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}
 .help{font-size:12px;color:#79828f;line-height:1.9;margin-top:6px}
 .help b{color:#c8d0da}
-@media(max-width:860px){.netwrap{height:440px}}
+@media(max-width:860px){.netwrap{height:640px}}
 </style>
 </head>
 <body>
@@ -269,16 +242,17 @@ main{display:flex;flex-direction:column;gap:10px;padding:10px;min-width:0}
 <div class="charts" id="charts"></div>
 </section>
 <section class="card">
-<div class="chead"><span class="ctitle">神经网络连接强度</span><span class="csub" id="netSub">等待数据…</span><span class="chint">每秒取一次真实前向快照 · 连线亮度 = 权重 × 源激活 · 3D 可拖拽旋转/滚轮缩放 · 悬停节点看细节</span><button class="vbtn on" id="v-3d" data-view="3d">3D 立体</button><button class="vbtn" id="v-2d" data-view="2d">2D 平面</button></div>
+<div class="chead"><span class="ctitle">神经网络 · 全部神经元</span><span class="csub" id="netSub">等待数据…</span><span class="chint">每秒取一次真实前向快照 · 全量显示不作抽样 · 3D 可拖拽旋转/滚轮缩放 · 悬停节点看细节</span><button class="vbtn on" id="v-3d" data-view="3d">3D 立体</button><button class="vbtn" id="v-2d" data-view="2d">2D 平面</button></div>
 <div class="netwrap" id="netwrap">
 <canvas id="netcv"></canvas>
 <div class="nettip" id="nettip"></div>
 </div>
 <div class="netlegend">
-<span><i style="background:linear-gradient(90deg,#101e2a,#2f6f97,#8ce0fa)"></i>节点颜色 = 该层激活强度（按本层节点值 min~max 归一）</span>
-<span><i style="background:linear-gradient(90deg,rgba(126,170,216,.05),rgba(126,170,216,.9))"></i>连线明暗与粗细 = 权重 × 源节点激活，越强越亮</span>
+<span><i style="background:#8ce0fa"></i>节点 = 真实神经元，全部显示：C1 32 通道 / C2·C3 64 通道 / FC 512 个 / 输出 4 个，无抽样</span>
+<span><i style="background:linear-gradient(90deg,#101e2a,#2f6f97,#8ce0fa)"></i>节点颜色 = 该层激活强度（按本层 min~max 归一）</span>
+<span><i style="background:linear-gradient(90deg,rgba(126,170,216,.05),rgba(126,170,216,.9))"></i>连线 = 真实权重矩阵（通道对精确值，非分桶近似）</span>
 <span><i style="background:#ffb020"></i>最强通路</span>
-<span>每秒随训练快照刷新一次（拖动/缩放时即时重绘）</span>
+<span>连线仅绘制最强若干条（保证每个神经元至少 1 条），实际总条数见上方标题</span>
 </div>
 </section>
 <section class="card">
@@ -402,17 +376,16 @@ function renderCharts(){
  el("chartSub").textContent="历史 "+fInt(HIST.length)+" 点 · 每 1 秒刷新";
 }
 var panelSig=null;
-function panelSigOf(d){var c=d.config||{},L=(d.acts&&d.acts.layers)||[];return JSON.stringify([c,c.L?0:L.map(function(l){return l.params+"/"+l.trueDim;})]);}
 function buildPanels(d){
  var c=d.config||{},L=(d.acts&&d.acts.layers)||[];
  var h='<div class="pnl"><div class="pnlh">网络结构 · Double DQN</div><div class="lyrs">';
- h+='<div class="lyr hd"><span>层</span><span>结构</span><span>参数量</span><span>输出</span></div>';
- var i,tot=0;
- for(i=0;i<L.length;i++){var ly=L[i];tot+=ly.params;
-  h+='<div class="lyr"><span class="lnm" title="'+esc(ly.name)+'">'+esc(ly.name)+'</span><span class="lsh" title="'+esc(ly.detail)+'">'+esc(ly.detail)+'</span><span class="lpr">'+fInt(ly.params)+'</span><span class="lot">'+esc(ly.out)+'</span></div>';
-  if(i<L.length-1){h+='<div class="lyr"><span class="lnm">↘ 连接</span><span class="lsh">'+fInt(ly.nodeCount)+' → '+fInt(L[i+1].nodeCount)+' 桶 · 权重绝对均值采样</span><span class="lpr">-</span><span class="lot">桶化 '+fInt(c.connBucket)+'×'+fInt(c.connBucket)+'</span></div>';}
+ h+='<div class="lyr hd"><span>层</span><span>结构</span><span>参数量</span><span>真实值数</span></div>';
+ var i,tot=0,rtot=0;
+ for(i=0;i<L.length;i++){var ly=L[i];tot+=ly.params;rtot+=ly.realCount;
+  h+='<div class="lyr"><span class="lnm" title="'+esc(ly.name)+'">'+esc(ly.name)+'</span><span class="lsh" title="'+esc(ly.detail)+'">'+esc(ly.detail)+'</span><span class="lpr">'+fInt(ly.params)+'</span><span class="lot">'+fInt(ly.realCount)+'</span></div>';
+  if(i<L.length-1){h+='<div class="lyr"><span class="lnm">↘ 连接</span><span class="lsh">'+fInt(ly.nodeCount)+' 节点 → '+fInt(L[i+1].nodeCount)+' 节点 · 真实权重</span><span class="lpr">-</span><span class="lot">共 '+fInt(ly.nodeCount*L[i+1].nodeCount)+' 条</span></div>';}
  }
- h+='<div class="lyr tot"><span class="lnm">合计</span><span class="lsh">'+fInt(L.length)+' 层</span><span class="lpr">'+fInt(tot)+'</span><span class="lot">'+fInt(c.actions)+' 动作</span></div>';
+ h+='<div class="lyr tot"><span class="lnm">合计</span><span class="lsh">'+fInt(L.length)+' 层</span><span class="lpr">'+fInt(tot)+'</span><span class="lot">'+fInt(rtot)+'</span></div>';
  h+='</div><div class="row" style="margin-top:5px"><span class="rk">算力</span><span class="rv"><b>'+(d.gpu>=0?"GPU 加速":"CPU")+'</b></span></div></div>';
  h+='<div class="pnl"><div class="pnlh">DQN 超参数</div>';
  h+=row("Double DQN",'<b class="yes">启用</b>');
@@ -454,46 +427,51 @@ function updatePanels(d){
  setT("p-gpu",d.gpu>=0?d.gpu+"%":"CPU 训练");
  el("paramSub").textContent="第 "+fInt(d.episodes)+" 局 · 步数 "+fInt(d.steps)+" · "+fFix(d.loss,4)+" Loss";
 }
-var NET={ready:false,layers:[],edges:[],conn:0,act:[],pick:[],maxS:1,hover:null,hoverKey:"",view:null,mode:"3d",iter:0,samples:0,value:0,budget:480,cv:null,ctx:null,pairs:[[0,1],[1,2],[2,3],[3,4],[4,5]],cam:{yaw:-1.05,pitch:0.30,dist:40.0,drag:false,lx:0,ly:0}};
+var NET={ready:false,layers:[],edges:[],act:[],pick:[],maxS:1,totalEdges:0,hover:null,hoverKey:"",view:null,mode:"3d",iter:0,samples:0,value:0,budget:1200,cv:null,ctx:null,pairs:[[0,1],[1,2],[2,3],[3,4],[4,5]],cam:{yaw:-1.05,pitch:0.30,dist:40.0,drag:false,lx:0,ly:0}};
 var NET_FONT='10px "Microsoft YaHei UI","Segoe UI",sans-serif';
-function netBucket(b,n,conn){var v=Math.floor((b+0.5)*conn/n);return v<0?0:(v>conn-1?conn-1:v);}
 function netColorRange(ly){var cnt=Math.max(1,ly.nodeCount|0),raw=ly.nodes||[],lo=Infinity,hi=-Infinity,j,v;for(j=0;j<cnt;j++){v=Number(raw[j]);if(!isFinite(v))continue;if(v<lo)lo=v;if(v>hi)hi=v;}return isFinite(lo)&&isFinite(hi)?[lo,hi]:[0,0];}
+function netTotalNodes(){var t=0,i;for(i=0;i<NET.layers.length;i++)t+=NET.layers[i].nodeCount|0;return t;}
 function netColor(t){t=t<0?0:(t>1?1:t);var r,g,b;if(t<0.5){var u=t/0.5;r=16+(47-16)*u;g=30+(111-30)*u;b=42+(151-42)*u;}else{var v=(t-0.5)/0.5;r=47+(140-47)*v;g=111+(224-111)*v;b=151+(250-151)*v;}return "rgb("+(r|0)+","+(g|0)+","+(b|0)+")";}
 function netNodeAct(ly){var cnt=Math.max(1,ly.nodeCount|0),raw=ly.nodes||[],sc=netColorRange(ly),span=sc[1]-sc[0],out=[],j,v;for(j=0;j<cnt;j++){v=Number(raw[j]);out.push(isFinite(v)?(span>1e-12?((v-sc[0])/span<0?0:((v-sc[0])/span>1?1:(v-sc[0])/span)):0.5):0.5);}return out;}
 function buildNetPick(){
- var L=NET.layers,E=NET.edges,conn=NET.conn,n=L.length,i,e,j,k;
+ var L=NET.layers,E=NET.edges,n=L.length,i,e,j,k;
  NET.act=[];
  for(i=0;i<n;i++)NET.act.push(netNodeAct(L[i]));
- var pairs=Math.max(1,NET.pairs.length),per=Math.max(20,Math.round(NET.budget/pairs)),all=[];
+ var pairs=Math.max(1,NET.pairs.length);
+ var perPair=Math.max(24,Math.round(NET.budget/pairs));
+ var all=[],total=0;
  for(e=0;e<pairs;e++){
   var pr=NET.pairs[e]||[e,e+1];
   if(!L[pr[0]]||!L[pr[1]])continue;
   var src=NET.act[pr[0]],sN=Math.max(1,L[pr[0]].nodeCount|0),tN=Math.max(1,L[pr[1]].nodeCount|0);
-  var M=E[e]||[],cand=[];
-  for(j=0;j<sN;j++){
-   var sj=netBucket(j,sN,conn),sa=src[j];
-   for(k=0;k<tN;k++){
-    var w=Number(M[netBucket(k,tN,conn)*conn+sj]);
+  var M=E[e]||[];
+  total+=sN*tN;
+  var kPer=Math.max(1,Math.round(perPair/tN));
+  for(k=0;k<tN;k++){
+   var row=M[k]||[],tmp=[];
+   for(j=0;j<sN;j++){
+    var w=Number(row[j]);
     if(!isFinite(w)||w<=0)continue;
-    cand.push({e:e,s:pr[0],t:pr[1],j:j,i:k,w:w,a:sa,v:w*(0.28+0.72*sa)});
+    tmp.push({e:e,s:pr[0],t:pr[1],j:j,i:k,w:w,a:src[j],v:w*(0.28+0.72*src[j])});
    }
+   tmp.sort(function(p,q){return q.v-p.v;});
+   var lim=Math.min(kPer,tmp.length);
+   for(j=0;j<lim;j++)all.push(tmp[j]);
   }
-  cand.sort(function(p,q){return q.v-p.v;});
-  var lim=Math.min(per,cand.length);
-  for(j=0;j<lim;j++)all.push(cand[j]);
  }
  all.sort(function(p,q){return p.v-q.v;});
  NET.pick=all;
+ NET.totalEdges=total;
  NET.strong=all.length?all[all.length-1]:null;
  NET.maxS=1e-9;
  for(i=0;i<all.length;i++)if(all[i].v>NET.maxS)NET.maxS=all[i].v;
 }
 function prepNet(d){
- NET.ready=false;NET.layers=[];NET.edges=[];NET.conn=0;NET.act=[];NET.pick=[];NET.strong=null;
+ NET.ready=false;NET.layers=[];NET.edges=[];NET.act=[];NET.pick=[];NET.strong=null;
  if(!d||Number(d.ready)!==1)return;
- var L=d.layers||[],conn=Number(d.conn)|0;
- if(!L.length||conn<2)return;
- NET.layers=L;NET.edges=d.edges||[];NET.conn=conn;
+ var L=d.layers||[];
+ if(L.length<2)return;
+ NET.layers=L;NET.edges=d.edges||[];
  NET.iter=Number(d.iteration);NET.samples=Number(d.samples);NET.value=Number(d.value);
  NET.ready=true;buildNetPick();
 }
@@ -542,7 +520,7 @@ function drawNet3D(){
  var st2=NET.strong;
  if(st2){var SA=scr[st2.s]&&scr[st2.s][st2.j],SB=scr[st2.t]&&scr[st2.t][st2.i];if(SA&&SB){ctx.save();ctx.strokeStyle="rgba(255,176,32,.85)";ctx.lineWidth=1.8;ctx.shadowColor="rgba(255,176,32,.8)";ctx.shadowBlur=9;ctx.beginPath();ctx.moveTo(SA.x,SA.y);ctx.lineTo(SB.x,SB.y);ctx.stroke();ctx.restore();}}
  ctx.textAlign="center";ctx.textBaseline="alphabetic";
- for(i=0;i<n;i++){var bb=lay.boxes[i],lyr=L[i],lp=netProj(c,bb.x,0,bb.halfZ+0.42);var lx=ox+lp[0]*FOCAL,ly=oy-lp[1]*FOCAL;var al2=0.55+0.45*(1-depthF(lp[2]));ctx.font='700 12px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="rgba(223,231,239,"+al2.toFixed(2)+")";ctx.fillText(String(lyr.name||""),lx,ly);ctx.font=NET_FONT;ctx.fillStyle="rgba(139,149,163,"+al2.toFixed(2)+")";ctx.fillText(String(lyr.detail||""),lx,ly+13);ctx.fillStyle="rgba(102,112,125,"+al2.toFixed(2)+")";ctx.fillText("激活均值 "+fSmart(Number(lyr.actMean)),lx,ly+25);}
+ for(i=0;i<n;i++){var bb=lay.boxes[i],lyr=L[i],lp=netProj(c,bb.x,0,bb.halfZ+0.42);var lx=ox+lp[0]*FOCAL,ly=oy-lp[1]*FOCAL;var al2=0.55+0.45*(1-depthF(lp[2]));ctx.font='700 12px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="rgba(223,231,239,"+al2.toFixed(2)+")";ctx.fillText(String(lyr.name||""),lx,ly);ctx.font=NET_FONT;ctx.fillStyle="rgba(139,149,163,"+al2.toFixed(2)+")";ctx.fillText(String(lyr.detail||""),lx,ly+13);ctx.fillStyle="rgba(102,112,125,"+al2.toFixed(2)+")";ctx.fillText(lyr.nodeCount+" 节点 · 均值 "+fSmart(Number(lyr.actMean)),lx,ly+25);}
  var hv=NET.hover;
  if(hv&&scr[hv.li]&&scr[hv.li][hv.bi]){var hn=scr[hv.li][hv.bi];ctx.strokeStyle="#e8eef5";ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(hn.x,hn.y,hn.r+3.4,0,Math.PI*2);ctx.stroke();}
  ctx.font=NET_FONT;ctx.textAlign="left";ctx.fillStyle="rgba(170,208,240,.8)";
@@ -560,7 +538,7 @@ function drawNet2D(){
  var step=n>1?(w-padX*2)/(n-1):0;
  var yTop=60,yBot=h-80;if(yBot-yTop<100){yTop=48;yBot=h-64;}
  var cols=[],nodes=[];
- for(i=0;i<n;i++){var ly=L[i],cnt=Math.max(1,ly.nodeCount|0),x=padX+step*i;var sp=cnt>1?(yBot-yTop)/(cnt-1):0;var rad=cnt>1?((sp*0.34)<1.5?1.5:(sp*0.34>5.2?5.2:sp*0.34)):6.5;var ys=[];for(j=0;j<cnt;j++)ys.push(cnt>1?yTop+sp*j:(yTop+yBot)*0.5);var col={x:x,ys:ys,r:rad,act:NET.act[i]||netNodeAct(ly),sc:netColorRange(ly),ly:ly};cols.push(col);for(j=0;j<ys.length;j++)nodes.push({x:x,y:ys[j],r:rad,li:i,bi:j,a:col.act[j]});}
+ for(i=0;i<n;i++){var ly=L[i],cnt=Math.max(1,ly.nodeCount|0),x=padX+step*i;var sp=cnt>1?(yBot-yTop)/(cnt-1):0;var rad=cnt>1?Math.max(0.45,Math.min(5.2,sp*0.42)):6.5;var ys=[];for(j=0;j<cnt;j++)ys.push(cnt>1?yTop+sp*j:(yTop+yBot)*0.5);var col={x:x,ys:ys,r:rad,act:NET.act[i]||netNodeAct(ly),sc:netColorRange(ly),ly:ly};cols.push(col);for(j=0;j<ys.length;j++)nodes.push({x:x,y:ys[j],r:rad,li:i,bi:j,a:col.act[j]});}
  NET.view={nodes:nodes,cols:cols};
  var pick=NET.pick,maxS=NET.maxS||1;
  ctx.lineCap="round";
@@ -576,12 +554,12 @@ function drawNet2D(){
  ctx.lineCap="butt";
  for(i=0;i<n;i++){var cc=cols[i];
   for(j=0;j<cc.ys.length;j++){var a=cc.act[j];
-   if(a>0.5){ctx.beginPath();ctx.arc(cc.x,cc.ys[j],cc.r+1.2+2.6*a,0,Math.PI*2);ctx.fillStyle="rgba(150,214,255,"+(0.05+0.26*a).toFixed(3)+")";ctx.fill();}
+   if(a>0.62){ctx.beginPath();ctx.arc(cc.x,cc.ys[j],cc.r+0.6+1.8*a,0,Math.PI*2);ctx.fillStyle="rgba(150,214,255,"+(0.05+0.26*a).toFixed(3)+")";ctx.fill();}
    ctx.beginPath();ctx.arc(cc.x,cc.ys[j],cc.r,0,Math.PI*2);ctx.fillStyle=netColor(a);ctx.fill();}}
  var st=NET.strong;
  if(st){var sa=cols[st.s],sb=cols[st.t];var x0=sa.x+sa.r,y0=sa.ys[st.j],x1=sb.x-sb.r,y1=sb.ys[st.i];ctx.save();ctx.strokeStyle="#ffb020";ctx.lineWidth=2;ctx.shadowColor="rgba(255,176,32,.85)";ctx.shadowBlur=11;ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.stroke();ctx.restore();ctx.strokeStyle="rgba(255,213,138,.95)";ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(sa.x,y0,sa.r+3.4,0,Math.PI*2);ctx.stroke();ctx.beginPath();ctx.arc(sb.x,y1,sb.r+3.4,0,Math.PI*2);ctx.stroke();ctx.textAlign="left";ctx.textBaseline="middle";ctx.font=NET_FONT;ctx.fillStyle="#ffd58a";ctx.fillText("最强通路 强度 "+st.v.toFixed(3),"6",h-8);ctx.textBaseline="alphabetic";}
  ctx.textAlign="center";
- for(i=0;i<n;i++){var cl=cols[i],lyr=cl.ly;ctx.font='700 12px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="#dfe7ef";ctx.fillText(String(lyr.name||""),cl.x,16);ctx.font=NET_FONT;ctx.fillStyle="#8b95a3";ctx.fillText(String(lyr.detail||""),cl.x,30);ctx.font=NET_FONT;ctx.fillStyle="#66707d";ctx.textAlign="center";ctx.fillText("真实宽度 "+(lyr.trueDim|0),cl.x,43);var bw2=(step>0?step*0.62:90)<40?40:((step>0?step*0.62:90)>150?150:step>0?step*0.62:90);var gx=cl.x-bw2*0.5,gy=h-62;for(j=0;j<24;j++){ctx.fillStyle=netColor(j/23);ctx.fillRect(gx+bw2*j/24,gy,bw2/24+1,7);}ctx.strokeStyle="rgba(220,235,250,.2)";ctx.lineWidth=1;ctx.strokeRect(gx+.5,gy+.5,bw2,7);ctx.font=NET_FONT;ctx.fillStyle="#8794a3";ctx.textAlign="left";ctx.fillText(fSmart(cl.sc[0]),gx,gy+21);ctx.textAlign="right";ctx.fillText(fSmart(cl.sc[1]),gx+bw2,gy+21);ctx.textAlign="center";ctx.fillStyle="#79828f";ctx.fillText("均值 "+fSmart(Number(lyr.actMean)),cl.x,gy+36);ctx.fillStyle="#66707d";ctx.fillText("全层 "+fSmart(Number(lyr.actMin))+" ~ "+fSmart(Number(lyr.actMax)),cl.x,gy+48);}
+ for(i=0;i<n;i++){var cl=cols[i],lyr=cl.ly;ctx.font='700 12px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="#dfe7ef";ctx.fillText(String(lyr.name||""),cl.x,16);ctx.font=NET_FONT;ctx.fillStyle="#8b95a3";ctx.fillText(String(lyr.detail||""),cl.x,30);ctx.font=NET_FONT;ctx.fillStyle="#66707d";ctx.textAlign="center";ctx.fillText(cl.ys.length+" 个节点 · 共 "+fInt(lyr.realCount)+" 个值",cl.x,43);var bw2=(step>0?step*0.62:90)<40?40:((step>0?step*0.62:90)>150?150:step>0?step*0.62:90);var gx=cl.x-bw2*0.5,gy=h-62;for(j=0;j<24;j++){ctx.fillStyle=netColor(j/23);ctx.fillRect(gx+bw2*j/24,gy,bw2/24+1,7);}ctx.strokeStyle="rgba(220,235,250,.2)";ctx.lineWidth=1;ctx.strokeRect(gx+.5,gy+.5,bw2,7);ctx.font=NET_FONT;ctx.fillStyle="#8794a3";ctx.textAlign="left";ctx.fillText(fSmart(cl.sc[0]),gx,gy+21);ctx.textAlign="right";ctx.fillText(fSmart(cl.sc[1]),gx+bw2,gy+21);ctx.textAlign="center";ctx.fillStyle="#79828f";ctx.fillText("均值 "+fSmart(Number(lyr.actMean)),cl.x,gy+36);ctx.fillStyle="#66707d";ctx.fillText("全层 "+fSmart(Number(lyr.actMin))+" ~ "+fSmart(Number(lyr.actMax)),cl.x,gy+48);}
  if(NET.hover&&cols[NET.hover.li]){var hc=cols[NET.hover.li],hy=hc.ys[NET.hover.bi];if(hy!==undefined){ctx.strokeStyle="#e8eef5";ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(hc.x,hy,hc.r+3.6,0,Math.PI*2);ctx.stroke();}}
  ctx.font=NET_FONT;ctx.textAlign="left";ctx.textBaseline="alphabetic";ctx.fillStyle="rgba(170,208,240,.8)";ctx.fillText("2D 平面 · 连线亮度 = 权重 × 源激活 · 每秒刷新",8,14);
 }
@@ -591,21 +569,22 @@ function requestNet(){if(netRaf)return;netRaf=requestAnimationFrame(function(){n
 function netHit(mx,my){var v=NET.view;if(!v)return null;var best=null,bd=Infinity,i,nd,d,rr;for(i=0;i<v.nodes.length;i++){nd=v.nodes[i];d=(nd.x-mx)*(nd.x-mx)+(nd.y-my)*(nd.y-my);rr=nd.r+4;if(d<=rr*rr&&d<bd){bd=d;best=nd;}}return best;}
 function netTipHTML(hit){
  var L=NET.layers,ly=L[hit.li],j=hit.bi;
- var cnt=Math.max(1,ly.nodeCount|0),td=Math.max(1,ly.trueDim|0);
- var raw=Number((ly.nodes||[])[j]);
- var h='<div class="th">'+esc(ly.name)+' · 节点 '+(j+1)+' / '+cnt+'</div>';
- h+='<div class="tr"><span>激活值</span><i>'+fSmart(raw)+'</i></div>';
- h+='<div class="tr"><span>覆盖真实索引</span><i>'+Math.floor(j*td/cnt)+' ~ '+Math.floor((j+1)*td/cnt)+'</i></div>';
- h+='<div class="tr"><span>层真实宽度</span><i>'+td+'</i></div>';
+ var cnt=Math.max(1,ly.nodeCount|0);
+ var h='<div class="th">'+esc(ly.name)+' · 第 '+(j+1)+' / '+cnt+' 个</div>';
+ h+='<div class="tr"><span>激活值</span><i>'+fSmart(Number((ly.nodes||[])[j]))+'</i></div>';
+ h+='<div class="tr"><span>本层真实值总数</span><i>'+fInt(ly.realCount)+'</i></div>';
+ if(ly.name==="输入")h+='<div class="tr"><span>含义</span><i>第 '+(j+1)+' 帧 · '+fInt(ly.realCount/cnt)+' 个像素</i></div>';
+ else if(ly.name==="FC"||ly.name==="输出")h+='<div class="tr"><span>含义</span><i>第 '+(j+1)+' 个神经元</i></div>';
+ else h+='<div class="tr"><span>含义</span><i>第 '+(j+1)+' 个通道</i></div>';
  h+='<div class="tr"><span>本层范围</span><i>'+fSmart(ly.actMin)+' ~ '+fSmart(ly.actMax)+'</i></div>';
  var gi=-1,kk;
  for(kk=0;kk<NET.pairs.length;kk++){if(NET.pairs[kk][0]===hit.li){gi=kk;break;}}
  if(gi>=0){
-  var tgt=NET.pairs[gi][1],conn=NET.conn,M=NET.edges[gi]||[],sj=netBucket(j,cnt,conn),arr=[],k,wv;
-  for(k=0;k<conn;k++){wv=Number(M[k*conn+sj]);if(isFinite(wv))arr.push([k,wv]);}
+  var tgt=NET.pairs[gi][1],M=NET.edges[gi]||[],tN=Math.max(1,L[tgt].nodeCount|0),arr=[],k,wv;
+  for(k=0;k<tN;k++){var row=M[k]||[];wv=Number(row[j]);if(isFinite(wv))arr.push([k,wv]);}
   arr.sort(function(p,q){return q[1]-p[1];});
-  h+='<div class="th sub">输出连接最强 5 条 → '+esc(L[tgt].name)+'</div>';
-  for(k=0;k<Math.min(5,arr.length);k++){h+='<div class="tr"><span>目标桶 '+arr[k][0]+'</span><i>'+fFix(arr[k][1],3)+'</i></div>';}
+  h+='<div class="th sub">输出连接最强 5 条 → '+esc(L[tgt].name)+'（实际共 '+fInt(tN)+' 条）</div>';
+  for(k=0;k<Math.min(5,arr.length);k++){h+='<div class="tr"><span>'+esc(L[tgt].name)+' 第 '+(arr[k][0]+1)+' 个</span><i>'+fFix(arr[k][1],4)+'</i></div>';}
  }else{h+='<div class="tr"><span>输出层</span><i>无后续连接</i></div>';}
  return h;
 }
@@ -615,7 +594,7 @@ function setNetMode(v){NET.mode=(v==="2d")?"2d":"3d";var a=el("v-3d"),b=el("v-2d
  if(b)b.className="vbtn"+(NET.mode==="2d"?" on":"");
  if(NET.cv)NET.cv.style.cursor=(NET.mode==="3d")?"grab":"default";requestNet();}
 function renderNetwork(dd){prepNet(dd);var tip=el("nettip");if(NET.ready){NET.value=(dd&&Number(dd.value))||0;NET.iter=(dd&&Number(dd.iteration))||0;NET.samples=(dd&&Number(dd.samples))||0;
- el("netSub").textContent="第 "+fInt(NET.iter)+" 步快照 · "+fInt(NET.samples)+" 局 · 最优 Q "+fFix(NET.value,4)+" · 边缘矩阵 "+NET.conn+"×"+NET.conn+" · 可见连线 "+fInt(NET.pick.length)+" · 最强强度 "+fFix(NET.maxS,3);
+ el("netSub").textContent="第 "+fInt(NET.iter)+" 步快照 · 最优 Q "+fFix(NET.value,4)+" · 神经元 "+fInt(netTotalNodes())+" 个（全部显示）· 连线已绘 "+fInt(NET.pick.length)+" / 共 "+fInt(NET.totalEdges)+" 条";
  }else{el("netSub").textContent="等待网络快照…";NET.hover=null;NET.hoverKey="";if(tip){tip.className="nettip";tip.innerHTML="";}}
  requestNet();}
 function bindNet(){
@@ -809,7 +788,7 @@ async function poll(){
   GD.land=(ld&&Number(ld.ready)===1&&ld.values&&ld.values.length>=4)?ld:null;
   var lsub=el("gdSub");
   if(lsub)lsub.textContent=GD.land?("网格 "+GD.land.res+"×"+GD.land.res+" · 窗口 ±"+fFix(GD.land.ext,2)+" · 已测 "+fInt(GD.land.probeCount)+" 次 · 轨迹 "+fInt((GD.land.path||[]).length)+" 点"):"等待首次测量…";
-  var sig=(d.config||{});var sigS=JSON.stringify(sig)+"|"+((d.acts&&d.acts.layers||[]).map(function(l){return l.params+"/"+l.trueDim;})).join(",");
+  var sig=(d.config||{});var sigS=JSON.stringify(sig)+"|"+((d.acts&&d.acts.layers||[]).map(function(l){return l.params+"/"+l.realCount;})).join(",");
   if(sigS!==panelSig){panelSig=sigS;buildPanels(d);}
   updatePanels(d);
   updateCtlBtns(d);
