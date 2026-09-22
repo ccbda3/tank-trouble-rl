@@ -231,4 +231,5 @@ class LandscapeProbe:
                 self.measure()
             except Exception:
                 pass
-            time.sleep(self.interval)
+            if stop_event.wait(self.interval):
+                break

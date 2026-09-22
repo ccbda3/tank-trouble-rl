@@ -152,20 +152,48 @@ def main():
     except Exception as e:
         log.warning("tensorboard launch failed: %s", e)
 
-    stop_event = threading.Event()
     trainer = Trainer(net, target_net, buffer, optimizer, counter, config, stats, writer=writer)
     trainer.train_steps = saved["train_steps"]
     trainer.updates = saved["updates"]
-    threading.Thread(target=trainer.loop, args=(stop_event,), daemon=True).start()
-
     probe = LandscapeProbe(net, target_net, buffer, config)
-    threading.Thread(target=probe.loop, args=(stop_event,), daemon=True).start()
-
     per_worker = max(1, config.AGENTS // config.WORKERS)
-    for _ in range(config.WORKERS):
-        envs = [env.Env(config.GRID, config.FRAME_STACK) for _ in range(per_worker)]
-        worker = EnvWorker(net, buffer, envs, counter, config, stats, trainer)
-        threading.Thread(target=worker.loop, args=(stop_event,), daemon=True).start()
+    run = {"stop": None, "threads": []}
+
+    def start_training():
+        if run["stop"] is not None:
+            return False
+        ev = threading.Event()
+        threads = [
+            threading.Thread(target=trainer.loop, args=(ev,), daemon=True),
+            threading.Thread(target=probe.loop, args=(ev,), daemon=True),
+        ]
+        for _ in range(config.WORKERS):
+            envs = [env.Env(config.GRID, config.FRAME_STACK) for _ in range(per_worker)]
+            worker = EnvWorker(net, buffer, envs, counter, config, stats, trainer)
+            threads.append(threading.Thread(target=worker.loop, args=(ev,), daemon=True))
+        for t in threads:
+            t.start()
+        run["stop"] = ev
+        run["threads"] = threads
+        log.info("训练已启动：%d 个采集线程 + 训练线程 + 曲面探针", config.WORKERS)
+        return True
+
+    def stop_training(save=True):
+        ev = run["stop"]
+        if ev is None:
+            return False
+        ev.set()
+        for t in run["threads"]:
+            t.join(timeout=5.0)
+        run["stop"] = None
+        run["threads"] = []
+        if save:
+            torch.save(net.state_dict(), config.CHECKPOINT)
+            trainer.save_full()
+            log.info("训练已停止并保存：步伐 %d、梯度更新 %d", counter.get(), trainer.train_steps)
+        return True
+
+    start_training()
 
     pygame.init()
     info = pygame.display.Info()
@@ -194,6 +222,7 @@ def main():
             "gpu": gpu_pct(),
             "episodes": stats["episodes"],
             "agents": config.AGENTS,
+            "training": run["stop"] is not None,
             "acts": self_acts(),
             "landscape": probe.snapshot(),
         }
@@ -207,7 +236,7 @@ def main():
         except Exception:
             return None
 
-    mon_port[0] = Monitor(state_fn).start()
+    mon_port[0] = Monitor(state_fn, start_fn=start_training, stop_fn=stop_training).start()
     log.info("监控面板: http://127.0.0.1:%d (中文)", mon_port[0])
     s = r_env.reset()
     state = {"running": True}
@@ -261,7 +290,8 @@ def main():
             if g is not None:
                 writer.add_scalar("metric/gpu", g, gstep)
 
-    stop_event.set()
+    if stop_training(save=False):
+        log.info("退出前停止训练线程")
     torch.save(net.state_dict(), config.CHECKPOINT)
     trainer.save_full()
     writer.close()

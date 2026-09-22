@@ -171,6 +171,18 @@ header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:14px;
 .conn.ok{color:#9fe6bf}
 .conn.bad .dot{background:#ff5f56;box-shadow:0 0 6px #ff5f56}
 .conn.bad{color:#ff9d97}
+.hctl{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.hbtn{font:12px "Microsoft YaHei UI","Segoe UI",sans-serif;color:#c8d0da;background:#1a212a;border:1px solid #2b3340;border-radius:5px;padding:4px 12px;cursor:pointer;white-space:nowrap}
+.hbtn:hover:enabled{color:#e8eef5;border-color:#3a4657;background:#202832}
+.hbtn:disabled{opacity:.38;cursor:not-allowed}
+.hbtn.go:enabled{background:#16281f;border-color:#2f6b4c;color:#9fe6bf}
+.hbtn.go:hover:enabled{background:#1b3327}
+.hbtn.stop:enabled{background:#2a1b1b;border-color:#6b3030;color:#ffb3b3}
+.hbtn.stop:hover:enabled{background:#332020}
+.hmsg{font-size:11px;color:#79828f}
+.chip{font-size:11px;padding:2px 9px;border-radius:10px;border:1px solid #2b3340;background:#161c24;color:#8b95a3;white-space:nowrap}
+.chip.on{color:#9fe6bf;border-color:#2f6b4c;background:#101d16}
+.chip.off{color:#ffd489;border-color:#6b571f;background:#1c1a10}
 main{display:flex;flex-direction:column;gap:10px;padding:10px;min-width:0}
 .card{min-width:0;background:#151a21;border:1px solid #232a33;border-radius:8px;padding:8px 10px 10px}
 .chead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:8px}
@@ -239,6 +251,12 @@ main{display:flex;flex-direction:column;gap:10px;padding:10px;min-width:0}
 <header>
 <span class="brand">贪吃蛇 · DQN 强化学习训练监控</span>
 <div class="stats" id="stats"></div>
+<div class="hctl">
+<span class="chip" id="hState">—</span>
+<button class="hbtn go" id="h-start">启动训练</button>
+<button class="hbtn stop" id="h-stop">结束训练并保存</button>
+<span class="hmsg" id="hMsg"></span>
+</div>
 <div class="conn" id="conn"><i class="dot"></i><span id="connTxt">连接中</span></div>
 </header>
 <main>
@@ -735,6 +753,44 @@ function bindGD(){
  cv.addEventListener("wheel",function(e){e.preventDefault();GD.dist=(GD.dist*Math.exp(e.deltaY*0.0012))<1.7?1.7:((GD.dist*Math.exp(e.deltaY*0.0012))>11?11:GD.dist*Math.exp(e.deltaY*0.0012));},{passive:false});
 }
 function setConn(ok){var e=el("conn"),t=el("connTxt");if(!ok){e.className="conn bad";t.textContent="连接断开";return;}e.className="conn ok";t.textContent="已连接";}
+var CTL={last:null,busy:false};
+function updateCtlBtns(d){
+ CTL.last=d;
+ var on=!!d.training;
+ var bs=el("h-start"),bt=el("h-stop"),st=el("hState");
+ if(bs)bs.disabled=on;
+ if(bt)bt.disabled=!on;
+ if(st){st.className="chip "+(on?"on":"off");st.textContent=on?"训练中":"已停止";}
+}
+function ctlSend(act){
+ if(CTL.busy)return;
+ CTL.busy=true;
+ var msg=el("hMsg"),bs=el("h-start"),bt=el("h-stop");
+ if(msg)msg.textContent=act==="start"?"正在启动…":"正在结束并保存…";
+ if(bs)bs.disabled=true;
+ if(bt)bt.disabled=true;
+ fetch("/api/"+act,{method:"POST",cache:"no-store"})
+  .then(function(r){return r.json();})
+  .then(function(j){
+   if(j.ok){
+    if(msg)msg.textContent=act==="start"?"已启动训练":"已结束训练，存档已保存";
+    updateCtlBtns({training:j.training});
+   }else{
+    if(msg)msg.textContent="失败："+(j.msg||"未知错误");
+    if(CTL.last)updateCtlBtns(CTL.last);
+   }
+  })
+  .catch(function(){
+   if(msg)msg.textContent="请求失败，服务可能未运行";
+   if(CTL.last)updateCtlBtns(CTL.last);
+  })
+  .then(function(){CTL.busy=false;});
+}
+function bindCtl(){
+ var bs=el("h-start"),bt=el("h-stop");
+ if(bs)bs.addEventListener("click",function(){ctlSend("start");});
+ if(bt)bt.addEventListener("click",function(){ctlSend("stop");});
+}
 var PREV=null;
 async function poll(){
  try{
@@ -756,6 +812,7 @@ async function poll(){
   var sig=(d.config||{});var sigS=JSON.stringify(sig)+"|"+((d.acts&&d.acts.layers||[]).map(function(l){return l.params+"/"+l.trueDim;})).join(",");
   if(sigS!==panelSig){panelSig=sigS;buildPanels(d);}
   updatePanels(d);
+  updateCtlBtns(d);
  }catch(e){setConn(false);}
  setTimeout(poll,1000);
 }
@@ -767,6 +824,7 @@ bindNetView();
 setNetMode("3d");
 bindGD();
 gdFrame();
+bindCtl();
 renderNetwork(null);
 poll();
 window.addEventListener("resize",function(){var i;for(i=0;i<charts.length;i++)drawChart(charts[i]);requestNet();});
@@ -778,32 +836,62 @@ window.addEventListener("resize",function(){var i;for(i=0;i<charts.length;i++)dr
 
 
 class Monitor:
-    def __init__(self, state_fn, port=8787):
+    def __init__(self, state_fn, port=8787, start_fn=None, stop_fn=None):
         self.port = port
         self.state_fn = state_fn
+        self.start_fn = start_fn
+        self.stop_fn = stop_fn
 
     def start(self):
         state_fn = self.state_fn
+        start_fn = self.start_fn
+        stop_fn = self.stop_fn
         port = self.port
 
         class H(BaseHTTPRequestHandler):
+            def send_json(self, obj):
+                body = json.dumps(obj).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def send_page(self):
+                body = PAGE.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):  # noqa: N802
                 if self.path == "/stats":
                     d = dict(state_fn())
                     d["config"] = CFG
-                    body = json.dumps(d).encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self.send_json(d)
                 else:
-                    body = PAGE.encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self.send_page()
+
+            def do_POST(self):  # noqa: N802
+                try:
+                    if self.path == "/api/start":
+                        if start_fn is None:
+                            return self.send_json({"ok": False, "msg": "不支持"})
+                        changed = bool(start_fn())
+                    elif self.path == "/api/stop":
+                        if stop_fn is None:
+                            return self.send_json({"ok": False, "msg": "不支持"})
+                        changed = bool(stop_fn())
+                    else:
+                        return self.send_json({"ok": False, "msg": "未知操作"})
+                    self.send_json({
+                        "ok": True,
+                        "changed": changed,
+                        "training": bool(state_fn().get("training")),
+                    })
+                except Exception as e:
+                    self.send_json({"ok": False, "msg": str(e)})
 
             def log_message(self, *a):
                 return
