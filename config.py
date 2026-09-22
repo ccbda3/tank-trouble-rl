@@ -1,6 +1,6 @@
 import os
 
-AGENTS = min(max(2, os.cpu_count() or 4), 8)
+AGENTS = max(2, os.cpu_count() or 4)
 GAMMA = 0.99
 LR = 5e-4
 BATCH = 1024
