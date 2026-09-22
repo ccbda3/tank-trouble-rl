@@ -71,6 +71,7 @@ h1{font-size:20px;margin:0;font-weight:600}
 .card .v{font-size:23px;font-weight:600;font-variant-numeric:tabular-nums}
 .card .v.acc{color:var(--acc)}.card .v.good{color:var(--good)}.card .v.cy{color:var(--acc2)}
 section{padding:6px 22px 24px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.panel.rowwide{grid-column:1/-1}
 @media(max-width:900px){section{grid-template-columns:1fr}}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
 .panel h2{font-size:14px;margin:0 0 10px;color:var(--dim);font-weight:600}
@@ -85,11 +86,8 @@ canvas{width:100%;display:block;background:#0b0e14;border-radius:8px}
 <header><span class="dot"></span><h1>DQN 训练监控 · 超级马里奥</h1><span class="meta" id="meta">连接中…</span></header>
 <div class="grid" id="cards"></div>
 <section>
-  <div class="panel"><h2>神经网络 · 逐层神经元连接（真实激活驱动亮度闪烁）</h2><canvas id="nn" height="330"></canvas>
-    <div class="lg"><span><i style="background:#1d7fd1"></i>输入</span><span><i style="background:#e76a2e"></i>卷积/FC</span><span><i style="background:#6bff8f"></i>输出</span><span style="opacity:.8">← 线亮 = 真实权重|W| × 激活</span></div>
-  </div>
-  <div class="panel"><h2>梯度下降 · 3D 损失面</h2><canvas id="gd" height="330"></canvas>
-    <div class="lg"><span><i style="background:#3a465c"></i>损失面 z=x²+y²</span><span><i style="background:#ff8f5a"></i>当前 Loss 位置</span></div>
+  <div class="panel rowwide"><h2>神经网络 · 逐层神经元连接（线亮 = 真实权重 |W| × 两端真实激活）</h2><canvas id="nn" height="460"></canvas>
+    <div class="lg"><span><i style="background:#1d7fd1"></i>输入</span><span><i style="background:#e76a2e"></i>卷积/FC</span><span><i style="background:#6bff8f"></i>输出</span><span style="opacity:.8">← 活跃神经元放大、连线随激活脉动</span></div>
   </div>
   <div class="panel"><h2>训练曲线（Loss 与 平均最远距离）</h2><canvas id="chart" height="220"></canvas></div>
   <div class="panel"><h2>工程信息</h2><div id="info"></div></div>
@@ -108,7 +106,7 @@ const LN=[["in","输入",10],["c1","C1·32",12],["c2","C2·64",14],["c3","C3·64
 let A={in:new Array(10).fill(0),c1:new Array(12).fill(0),c2:new Array(14).fill(0),c3:new Array(12).fill(0),fc:new Array(12).fill(0),out:new Array(3).fill(0),wf:[0.5,0.5,0.5,0.5,0.5]};
 function norm(v){const m=Math.max.apply(null,v);return m>0?v.map(x=>Math.max(0,x)/m):v;}
 function drawNN(t){
- const c=$("nn"),x=c.getContext("2d"),W=c.clientWidth,H=330;
+ const c=$("nn"),x=c.getContext("2d"),W=c.clientWidth,H=c.clientHeight||460;
  c.width=W;c.height=H;x.clearRect(0,0,W,H);
  const pad=40;const xs=LN.map((_,i)=>pad+i*(W-2*pad)/(LN.length-1));
  const pos=LN.map(f=>{const n=f[2],ys=[];for(let i=0;i<n;i++)ys.push(H/2+(i-(n-1)/2)*(H-80)/n);return ys;});
@@ -136,38 +134,6 @@ function drawNN(t){
   x.font="11px sans-serif";x.fillStyle="#7d8aa0";x.textAlign="center";x.fillText(LN[li][1],xs[li],H-6);
  }
 }
-function drawGD(t){
- const c=$("gd"),x=c.getContext("2d"),W=c.clientWidth,H=330;
- c.width=W;c.height=H;x.clearRect(0,0,W,H);
- const cx=W/2,cy=H/2+10,S=Math.min(W,H)*0.30,rot=t/2600,rot2=Math.sin(t/5200)*0.5;
- function pr(u,v,h){
-  const r=Math.hypot(u,v);
-  let X=(u*Math.cos(rot)-v*Math.sin(rot));
-  let Z=(u*Math.sin(rot)+v*Math.cos(rot));
-  const Y=h + Math.sin(rot2)*X*0.5 + Math.cos(rot2)*Z*0.5;
-  const per=(1/(1.6+Y*0.06));
-  return [cx+X*S*per, cy - Y*S*per];
- }
- const N=26;
- x.strokeStyle="#2a3245";x.lineWidth=1.1;
- for(let i=0;i<=N;i++){
-  const u=-1+2*i/N;
-  x.beginPath();
-  for(let j=0;j<=N;j++){const v=-1+2*j/N,h=(u*u+v*v)/2;const p=pr(u,v,h);j?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]);}
-  x.stroke();
-  x.beginPath();
-  for(let j=0;j<=N;j++){const v=-1+2*j/N,h=(u*u+v*v)/2;const p=pr(v,u,h);j?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]);}
-  x.stroke();
- }
- const th=(t/3200)%1;const gs=Math.sin(th*Math.PI);const bu=Math.cos(th*2)*0.35,ba=Math.sin(th*2)*0.35;
- const bh=(bu*bu+ba*ba)/2;
- const bp=pr(bu,ba,bh);
- x.beginPath();x.arc(bp[0],bp[1],9,0,7);x.fillStyle="#ff8f5a";x.shadowColor="#ff8f5a";x.shadowBlur=16;x.fill();x.shadowBlur=0;
- x.strokeStyle="#ff8f5a";x.lineWidth=2;x.globalAlpha=.4;
- x.beginPath();for(let i=0;i<=40;i++){const tt=th-i*0.01,gg=Math.max(0,tt),bu2=Math.cos(gg*2)*0.4,ba2=Math.sin(gg*2)*0.4,bh2=(bu2*bu2+ba2*ba2)/2;const p=pr(bu2,ba2,bh2);i?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]);}x.stroke();x.globalAlpha=1;
- x.font="12px sans-serif";x.fillStyle="#7d8aa0";x.fillText("Loss 曲面 (真 3D) · 小球沿梯度滑向谷底 (Loss 最小化)",10,18);
-}
-const LN2={}; // unused helper flag
 let loss=[],avg=[];
 function drawChart(la){
  const c=$("chart"),x=c.getContext("2d"),W=c.clientWidth,H=220,pad=24;
@@ -183,7 +149,7 @@ function drawChart(la){
 function loop(){
  requestAnimationFrame(loop);
  const t=performance.now();
- drawNN(t);drawGD(t);
+ drawNN(t);
 }
 async function poll(){
  try{
