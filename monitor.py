@@ -19,14 +19,20 @@ def group_avg(a, n):
     return [float(a[idx[i]:idx[i + 1]].mean()) for i in range(n)]
 
 
+def disp_bucket(real_n, disp_n, conn):
+    d = ((np.arange(real_n) + 0.5) * disp_n / real_n).astype(np.int64)
+    d = np.clip(d, 0, max(0, disp_n - 1))
+    return np.clip(((d + 0.5) * conn / disp_n).astype(np.int64), 0, conn - 1)
+
+
 def bucket_edges(weight, conn, n_src, n_dst):
     w = torch.abs(weight)
     while w.dim() > 2:
         w = w.mean(-1)
     W = w.detach().cpu().numpy().astype(np.float32)
     t_n, s_n = W.shape
-    gs = np.clip(((np.arange(s_n) + 0.5) * conn / n_src).astype(np.int64), 0, conn - 1)
-    gt = np.clip(((np.arange(t_n) + 0.5) * conn / n_dst).astype(np.int64), 0, conn - 1)
+    gs = disp_bucket(s_n, n_src, conn)
+    gt = disp_bucket(t_n, n_dst, conn)
     idx = (gt[:, None] * conn + gs[None, :]).ravel()
     acc = np.bincount(idx, weights=W.ravel(), minlength=conn * conn)
     cnt = np.bincount(idx, minlength=conn * conn)
@@ -106,7 +112,7 @@ def act_stats(net, obs):
             bucket_edges(net.net[2].weight, conn, 24, 24).tolist(),
             bucket_edges(net.net[4].weight, conn, 24, 24).tolist(),
             bucket_edges(net.fc[0].weight, conn, 24, 24).tolist(),
-            bucket_edges(net.fc[2].weight, conn, 24, 24).tolist(),
+            bucket_edges(net.fc[2].weight, conn, 24, config.ACTIONS).tolist(),
         ]
         _EDGE_CACHE["t"] = now
     edges = _EDGE_CACHE["v"]
