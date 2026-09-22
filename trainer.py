@@ -7,7 +7,7 @@ from network import DEVICE
 
 
 class Trainer:
-    def __init__(self, net, target_net, buffer, optimizer, counter, config, stats):
+    def __init__(self, net, target_net, buffer, optimizer, counter, config, stats, writer=None):
         self.net = net
         self.target_net = target_net
         self.buffer = buffer
@@ -15,8 +15,16 @@ class Trainer:
         self.counter = counter
         self.config = config
         self.stats = stats
+        self.writer = writer
         self.train_steps = 0
+        self.updates = 0
         self.loss = 0.0
+
+    def _hist(self, world, named_params, step):
+        for name, p in named_params:
+            self.writer.add_histogram(f"{world}/{name}", p.detach().cpu(), step)
+            if p.grad is not None:
+                self.writer.add_histogram(f"{world}/{name}_grad", p.grad.detach().cpu(), step)
 
     def loop(self, stop_event):
         last_save = time.time()
@@ -50,6 +58,14 @@ class Trainer:
             if self.train_steps % self.config.ACCUM == 0:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
+                self.updates += 1
+                if self.writer is not None:
+                    with self.stats["lock"]:
+                        cur_loss = self.stats["loss"]
+                    self.writer.add_scalar("train/loss", cur_loss, self.updates)
+                    self.writer.add_scalar("train/steps", self.counter.get(), self.updates)
+                    if self.updates % 25 == 0:
+                        self._hist("weights", self.net.named_parameters(), self.updates)
                 if self.train_steps % self.config.TARGET_SYNC == 0:
                     self.target_net.load_state_dict(self.net.state_dict())
                 if self.train_steps % self.config.SAVE_EVERY == 0:

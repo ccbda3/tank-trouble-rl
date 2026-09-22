@@ -1,6 +1,8 @@
 import ctypes
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -36,8 +38,8 @@ import config
 from agent import Agent, Counter
 from buffer import PrioritizedReplayBuffer
 from mario_env import MarioEnv, SIMPLE_MOVEMENT
-from monitor import Monitor, act_stats
 from network import DQN, DEVICE
+from torch.utils.tensorboard import SummaryWriter
 from trainer import Trainer
 
 MARIO_LOG = "mario_train.log"
@@ -167,8 +169,21 @@ def main():
     stats = {"lock": threading.Lock(), "recent": deque(maxlen=200), "episodes": 0, "loss": 0.0}
     log.info("device: %s actions=%d size=%d", DEVICE, actions, config.SIZE)
 
+    log_dir = os.path.abspath("runs")
+    writer = SummaryWriter(os.path.join(log_dir, "mario"))
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "tensorboard.main", "--logdir", log_dir, "--host", "127.0.0.1", "--port", "6006"],
+            creationflags=0x208,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info("tensorboard: http://127.0.0.1:6006")
+    except Exception as e:
+        log.warning("tensorboard launch failed: %s", e)
+
     stop_event = threading.Event()
-    trainer = Trainer(net, target_net, buffer, optimizer, counter, config, stats)
+    trainer = Trainer(net, target_net, buffer, optimizer, counter, config, stats, writer=writer)
     threading.Thread(target=trainer.loop, args=(stop_event,), daemon=True).start()
 
     for _ in range(config.AGENTS - 1):
@@ -190,43 +205,6 @@ def main():
 
     r_env = MarioEnv(config.FRAME_STACK, config.SIZE, config.MARIO_ACCEL)
     r_agent = Agent(net, buffer, r_env, counter, config, stats)
-
-    mon_port = [0]
-    params = sum(p.numel() for p in net.parameters())
-
-    def state_fn():
-        return {
-            "port": mon_port[0],
-            "steps": counter.get(),
-            "eps": r_agent.epsilon(),
-            "trainSteps": trainer.train_steps,
-            "buffer": len(buffer),
-            "loss": stats["loss"],
-            "score": r_env.score,
-            "avgScore": avg(stats),
-            "bestScore": max_score(stats),
-            "gpu": gpu_util() or -1,
-            "episodes": stats["episodes"],
-            "agents": config.AGENTS,
-            "batch": config.BATCH,
-            "accum": config.ACCUM,
-            "device": str(DEVICE),
-            "mark": "NES 模拟器 (gym-super-mario-bros)",
-            "frames": config.FRAME_STACK,
-            "size": config.SIZE,
-            "actions": actions,
-            "params": params,
-            "acts": self_acts(),
-        }
-
-    def self_acts():
-        try:
-            return act_stats(net, r_env._stack())
-        except Exception:
-            return None
-
-    mon_port[0] = Monitor(state_fn).start()
-    log.info("monitor: http://127.0.0.1:%d", mon_port[0])
     s = r_env.reset()
     state = {"running": True}
 
@@ -262,6 +240,7 @@ def main():
         now = time.time()
         if now - last_log > 5:
             last_log = now
+            gstep = trainer.updates
             log.info(
                 "steps=%d eps=%.3f buffer=%d loss=%.4f episodes=%d avg=%.0f best=%d",
                 counter.get(),
@@ -272,9 +251,17 @@ def main():
                 avg(stats),
                 max_score(stats),
             )
+            writer.add_scalar("metric/eps", r_agent.epsilon(), gstep)
+            writer.add_scalar("metric/avg_x", avg(stats), gstep)
+            writer.add_scalar("metric/best_x", max_score(stats), gstep)
+            writer.add_scalar("metric/episodes", stats["episodes"], gstep)
+            g = gpu_util()
+            if g is not None:
+                writer.add_scalar("metric/gpu", g, gstep)
 
     stop_event.set()
     torch.save(net.state_dict(), checkpoint)
+    writer.close()
     log.info("saved %s, total steps=%d", checkpoint, counter.get())
     pygame.quit()
 
