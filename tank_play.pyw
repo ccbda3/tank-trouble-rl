@@ -5,7 +5,7 @@ import pygame
 
 from tank import CELL, COLS, HEIGHT, ROWS, TANK_R, WIDTH, Bot, World
 
-HUD = 56
+HUD = 74
 DT = 1.0 / 60.0
 BAR = (22, 24, 31)
 FLOOR = (34, 37, 45)
@@ -18,9 +18,6 @@ SHOT = (255, 216, 104)
 TEXT = (212, 218, 230)
 DIM = (134, 142, 160)
 
-UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
-
-
 def make_font(size):
     for name in ("microsoftyahei", "msyh", "simhei", "simsun"):
         path = pygame.font.match_font(name)
@@ -29,10 +26,10 @@ def make_font(size):
     return pygame.font.Font(None, size)
 
 
-def read_move(keys, mapping):
-    dx = (1 if keys[mapping[RIGHT]] else 0) - (1 if keys[mapping[LEFT]] else 0)
-    dy = (1 if keys[mapping[DOWN]] else 0) - (1 if keys[mapping[UP]] else 0)
-    return dx, dy
+def read_drive(keys, up, down, left, right, fire):
+    turn = (1 if keys[right] else 0) - (1 if keys[left] else 0)
+    thrust = (1 if keys[up] else 0) - (1 if keys[down] else 0)
+    return (turn, thrust, 1 if any(keys[k] for k in fire) else 0)
 
 
 def draw_world():
@@ -72,26 +69,19 @@ def draw_bullets():
 def draw_hud():
     pygame.draw.rect(screen, BAR, (0, HEIGHT, WIDTH, HUD))
     pygame.draw.line(screen, (48, 52, 64), (0, HEIGHT), (WIDTH, HEIGHT))
-    screen.blit(font_big.render("P1", True, P1_COLOR), (12, HEIGHT + 5))
-    screen.blit(font_big.render("%d" % tally[0], True, TEXT), (52, HEIGHT + 5))
-    screen.blit(font_big.render(":", True, DIM), (76, HEIGHT + 5))
-    screen.blit(font_big.render("%d" % tally[1], True, TEXT), (90, HEIGHT + 5))
-    screen.blit(font_big.render("P2", True, P2_COLOR), (122, HEIGHT + 5))
+    screen.blit(font_big.render("P1", True, P1_COLOR), (12, HEIGHT + 4))
+    screen.blit(font_big.render("%d" % tally[0], True, TEXT), (52, HEIGHT + 4))
+    screen.blit(font_big.render(":", True, DIM), (76, HEIGHT + 4))
+    screen.blit(font_big.render("%d" % tally[1], True, TEXT), (90, HEIGHT + 4))
+    screen.blit(font_big.render("P2", True, P2_COLOR), (122, HEIGHT + 4))
     roles = "机器人 Lv%d" % bot_level if bot_on else "双人同屏"
-    screen.blit(font_small.render(roles, True, DIM), (176, HEIGHT + 10))
+    screen.blit(font_small.render(roles, True, DIM), (176, HEIGHT + 9))
     if world.over:
         msg = "平局" if world.winner is None else "P%d 胜" % (world.winner + 1)
         color = DIM if world.winner is None else (P1_COLOR if world.winner == 0 else P2_COLOR)
-        screen.blit(font_big.render(msg, True, color), (WIDTH - 96, HEIGHT + 5))
-    screen.blit(
-        font_small.render("P2 你：方向键移动 + 空格/M/回车开火", True, TEXT), (12, HEIGHT + 33)
-    )
-    screen.blit(
-        font_small.render("P1：WASD + Q", True, DIM), (300, HEIGHT + 33)
-    )
-    screen.blit(
-        font_small.render("B 换人   R 重开本局   N 换迷宫   ESC 退出", True, DIM), (440, HEIGHT + 33)
-    )
+        screen.blit(font_big.render(msg, True, color), (WIDTH - 96, HEIGHT + 4))
+    screen.blit(font_tip.render(TIP1, True, TEXT), (12, HEIGHT + 31))
+    screen.blit(font_tip.render(TIP2, True, DIM), (12, HEIGHT + 31 + tip_h + 3))
 
 
 pygame.init()
@@ -101,6 +91,14 @@ clock = pygame.time.Clock()
 font_big = make_font(21)
 font_small = make_font(15)
 
+TIP1 = "你(P2)：← → 原地转向     ↑ ↓ 前进后退     空格 / M / 回车 开火"
+TIP2 = "P1：A D 转向   W S 前进后退   Q 开火          B 换人    R 重开    N 换迷宫    ESC 退出"
+tip_size = 15
+while tip_size > 9 and max(make_font(tip_size).size(TIP1)[0], make_font(tip_size).size(TIP2)[0]) > WIDTH - 24:
+    tip_size -= 1
+font_tip = make_font(tip_size)
+tip_h = font_tip.get_height()
+
 world = World()
 bot_on = True
 bot_level = 2
@@ -109,9 +107,14 @@ tally = [0, 0]
 restart_at = None
 running = True
 
-KEYS_P1 = {UP: pygame.K_w, DOWN: pygame.K_s, LEFT: pygame.K_a, RIGHT: pygame.K_d}
-KEYS_P2 = {UP: pygame.K_UP, DOWN: pygame.K_DOWN, LEFT: pygame.K_LEFT, RIGHT: pygame.K_RIGHT}
-FIRE_P2 = (pygame.K_m, pygame.K_RETURN, pygame.K_SPACE)
+KEYS_P1 = (pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d, (pygame.K_q,))
+KEYS_P2 = (
+    pygame.K_UP,
+    pygame.K_DOWN,
+    pygame.K_LEFT,
+    pygame.K_RIGHT,
+    (pygame.K_m, pygame.K_RETURN, pygame.K_SPACE),
+)
 
 while running:
     clock.tick(60)
@@ -134,13 +137,8 @@ while running:
                 bot = Bot(0.05 + 0.25 * bot_level, seed=7)
                 bot_on = True
     keys = pygame.key.get_pressed()
-    if bot_on:
-        c0 = bot.act(world, world.tanks[0], world.tanks[1], DT)
-    else:
-        dx, dy = read_move(keys, KEYS_P1)
-        c0 = (dx, dy, 1 if keys[pygame.K_q] else 0)
-    dx, dy = read_move(keys, KEYS_P2)
-    c1 = (dx, dy, 1 if any(keys[k] for k in FIRE_P2) else 0)
+    c0 = bot.act(world, world.tanks[0], world.tanks[1], DT) if bot_on else read_drive(keys, *KEYS_P1)
+    c1 = read_drive(keys, *KEYS_P2)
     was_over = world.over
     world.step(DT, c0, c1)
     if world.over and not was_over:

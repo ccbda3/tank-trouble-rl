@@ -8,7 +8,9 @@ WIDTH = COLS * CELL
 HEIGHT = ROWS * CELL
 
 TANK_R = 10.0
-TANK_SPEED = 126.0
+TANK_SPEED = 128.0
+TANK_BACK = 82.0
+TANK_TURN = 3.1
 BULLET_R = 3.5
 BULLET_SPEED = 340.0
 BULLET_LIFE = 4.0
@@ -16,12 +18,25 @@ BOUNCE_LIMIT = 6
 FIRE_COOLDOWN = 0.34
 MAX_BULLETS = 5
 
-DIR8 = ((1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1))
-MOVES = ((0, 0), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1))
-MOVE_NAMES = ("停", "右", "右下", "下", "左下", "左", "左上", "上", "右上")
-ACTIONS = 18
-ACTION_NAMES = tuple(MOVE_NAMES[i % 9] + ("+开火" if i >= 9 else "") for i in range(ACTIONS))
-ACTION_CTRL = tuple((MOVES[i % 9][0], MOVES[i % 9][1], 1 if i >= 9 else 0) for i in range(ACTIONS))
+
+def _ctrl_name(turn, thrust, fire):
+    parts = []
+    if turn < 0:
+        parts.append("左转")
+    elif turn > 0:
+        parts.append("右转")
+    if thrust > 0:
+        parts.append("前进")
+    elif thrust < 0:
+        parts.append("后退")
+    if fire:
+        parts.append("开火")
+    return "+".join(parts) if parts else "停"
+
+
+ACTION_CTRL = tuple((t, th, f) for f in (0, 1) for th in (1, 0, -1) for t in (-1, 0, 1))
+ACTION_NAMES = tuple(_ctrl_name(*c) for c in ACTION_CTRL)
+ACTIONS = len(ACTION_CTRL)
 
 
 def generate(seed=None, braid=0.35):
@@ -97,14 +112,14 @@ class World:
             for c in range(1, COLS - 1)
             if self.grid[r][c] == "."
         ]
-        best = None
-        for _ in range(80):
-            a = rng.choice(cells)
-            b = rng.choice(cells)
-            d = abs(a[0] - b[0]) + abs(a[1] - b[1])
-            if best is None or d > best[0]:
-                best = (d, a, b)
-        _, a, b = best
+        if rng.random() < 0.5:
+            corners = ((1, 1), (ROWS - 2, COLS - 2))
+        else:
+            corners = ((1, COLS - 2), (ROWS - 2, 1))
+        picks = []
+        for cr, cc in corners:
+            picks.append(min(cells, key=lambda rc: (rc[0] - cr) ** 2 + (rc[1] - cc) ** 2))
+        a, b = picks
         self.tanks = [
             Tank((a[1] + 0.5) * CELL, (a[0] + 0.5) * CELL, 0.0),
             Tank((b[1] + 0.5) * CELL, (b[0] + 0.5) * CELL, 0.0),
@@ -203,12 +218,13 @@ class World:
         return True
 
     def _drive(self, t, ctrl, dt):
-        dx, dy, fire = ctrl
-        if dx or dy:
-            n = math.hypot(dx, dy)
-            t.angle = math.atan2(dy, dx)
-            nx = t.x + dx / n * TANK_SPEED * dt
-            ny = t.y + dy / n * TANK_SPEED * dt
+        turn, thrust, fire = ctrl
+        if turn:
+            t.angle += turn * TANK_TURN * dt
+        if thrust:
+            v = TANK_SPEED if thrust > 0 else -TANK_BACK
+            nx = t.x + math.cos(t.angle) * v * dt
+            ny = t.y + math.sin(t.angle) * v * dt
             t.x, t.y = self._push_out(nx, ny, TANK_R)
         t.cool = max(0.0, t.cool - dt)
         if fire:
@@ -295,6 +311,9 @@ class Bot:
         self.skill = float(skill)
         self.think = 0.0
         self.way = None
+        self.ready = 0.0
+        self.detour = 0.0
+        self.detour_dir = 1
 
     def _los(self, world, me, foe):
         d = math.hypot(foe.x - me.x, foe.y - me.y)
@@ -333,58 +352,50 @@ class Bot:
             node = prev[node]
         return ((node[1] + 0.5) * CELL, (node[0] + 0.5) * CELL)
 
-    def _dir_index(self, dx, dy):
-        return int(round(math.atan2(dy, dx) / (math.pi / 4))) % 8
-
-    def _aim_hit(self, world, me, foe, angle):
-        cx = math.cos(angle)
-        cy = math.sin(angle)
-        d = TANK_R + BULLET_R + 1.0
-        while d < 420.0:
-            px = me.x + cx * d
-            py = me.y + cy * d
-            if world._circle_hit(px, py, BULLET_R):
-                return False
-            if (px - foe.x) ** 2 + (py - foe.y) ** 2 <= (TANK_R + BULLET_R) ** 2:
-                return True
-            d += 6.0
-        return False
-
     def act(self, world, me, foe, dt):
         if not me.alive or not foe.alive:
             return (0, 0, 0)
+        seen = self._los(world, me, foe)
+        dist = math.hypot(foe.x - me.x, foe.y - me.y)
         self.think -= dt
         if self.think <= 0.0:
             self.think = self.rng.uniform(0.10, 0.22)
             self.way = self._next_cell(world, me, foe)
-        seen = self._los(world, me, foe)
-        dist = math.hypot(foe.x - me.x, foe.y - me.y)
-        dx = 0
-        dy = 0
         if seen:
-            idx = self._dir_index(foe.x - me.x, foe.y - me.y)
-            dx, dy = DIR8[idx]
+            tx = foe.x
+            ty = foe.y
         elif self.way is not None:
             tx, ty = self.way
-            if math.hypot(tx - me.x, ty - me.y) < 7.0:
+            if math.hypot(tx - me.x, ty - me.y) < 8.0:
                 self.think = 0.0
-            if abs(tx - me.x) > 5.0:
-                dx = 1 if tx > me.x else -1
-            if abs(ty - me.y) > 5.0:
-                dy = 1 if ty > me.y else -1
-        if dx == 0 and dy == 0:
-            dx, dy = DIR8[self.rng.randrange(8)]
+        else:
+            tx = me.x + math.cos(me.angle) * 64.0
+            ty = me.y + math.sin(me.angle) * 64.0
+        diff = (math.atan2(ty - me.y, tx - me.x) - me.angle + math.pi) % (2 * math.pi) - math.pi
+        probe_x = me.x + math.cos(me.angle) * 26.0
+        probe_y = me.y + math.sin(me.angle) * 26.0
+        blocked = world._circle_hit(probe_x, probe_y, TANK_R)
+        if self.detour > 0.0:
+            self.detour -= dt
+            turn = self.detour_dir
+            thrust = 1
+        elif blocked and abs(diff) < 0.6:
+            self.detour = self.rng.uniform(0.35, 0.9)
+            self.detour_dir = self.rng.choice((-1, 1))
+            turn = self.detour_dir
+            thrust = 1
+        else:
+            turn = 0 if abs(diff) < 0.05 else (1 if diff > 0 else -1)
+            thrust = 1 if (not blocked and abs(diff) < 1.5) else 0
         fire = 0
+        self.ready -= dt
         if seen:
-            mine = math.atan2(dy, dx)
-            safe = world.clear_ahead(me.x, me.y, mine, 54.0) >= 54.0
-            if safe and self._aim_hit(world, me, foe, mine):
-                if self.rng.random() < 0.30 + 0.6 * self.skill:
+            tol = math.atan2(TANK_R * (1.0 + 3.0 * (1.0 - self.skill)), max(1.0, dist))
+            safe = world.clear_ahead(me.x, me.y, me.angle, 54.0) >= 54.0
+            if abs(diff) < tol and safe and self.ready <= 0.0:
+                if self.rng.random() < 0.45 + 0.5 * self.skill:
                     fire = 1
-            elif safe:
-                aim = math.atan2(foe.y - me.y, foe.x - me.x)
-                d2 = abs((aim - mine + math.pi) % (2 * math.pi) - math.pi)
-                tol = math.atan2(14.0 + 90.0 * (1.0 - self.skill), max(40.0, dist))
-                if d2 < tol and self.rng.random() < 0.04 + 0.10 * self.skill:
-                    fire = 1
-        return (dx, dy, fire)
+                    self.ready = self.rng.uniform(0.0, 0.7 * (1.0 - self.skill))
+        else:
+            self.ready = 0.0
+        return (turn, thrust, fire)
