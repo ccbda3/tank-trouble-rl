@@ -1,6 +1,6 @@
 import os
 
-GRID = 64
+GRID = 24
 FRAME_STACK = 4
 ACTIONS = 4
 AGENTS = max(2, (os.cpu_count() or 6) * 2 // 3)
