@@ -2,6 +2,45 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import numpy as np
+import torch
+
+
+def group_avg(a, n):
+    a = np.asarray(a, dtype=float).ravel()
+    if len(a) <= n:
+        return [float(x) for x in a]
+    idx = np.linspace(0, len(a), n + 1).astype(int)
+    return [float(a[idx[i]:idx[i + 1]].mean()) for i in range(n)]
+
+
+def act_stats(net, obs):
+    x = torch.tensor(np.asarray(obs, dtype=np.float32) / 255.0).unsqueeze(0).to(
+        net.fc[0].weight.device
+    )
+    with torch.no_grad():
+        z = net.net[1](net.net[0](x))
+        c1 = z.mean((2, 3))[0].cpu().numpy()
+        z = net.net[3](net.net[2](z))
+        c2 = z.mean((2, 3))[0].cpu().numpy()
+        z = net.net[5](net.net[4](z))
+        c3 = z.mean((2, 3))[0].cpu().numpy()
+        f = net.fc[1](net.fc[0](torch.flatten(z, 1)))
+        fc = f[0].cpu().numpy()
+        out = net.fc[2](f)[0].cpu().numpy()
+    gray = np.asarray(obs, dtype=float).mean(0)
+    h, w = gray.shape
+    in_arr = [float(gray[int(i * h / 10):int((i + 1) * h / 10)].mean()) for i in range(10)]
+    return {
+        "in": in_arr,
+        "c1": group_avg(c1, 12),
+        "c2": group_avg(c2, 14),
+        "c3": group_avg(c3, 12),
+        "fc": group_avg(fc, 12),
+        "out": group_avg(out, 3),
+    }
+
+
 PAGE = """<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -27,131 +66,134 @@ section{padding:6px 22px 24px;display:grid;grid-template-columns:1fr 1fr;gap:14p
 .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
 .panel h2{font-size:14px;margin:0 0 10px;color:var(--dim);font-weight:600}
 canvas{width:100%;display:block;background:#0b0e14;border-radius:8px}
-.net{display:flex;align-items:stretch;gap:8px;overflow-x:auto;padding:8px 2px}
-.lay{flex:0 0 auto;border:1px solid var(--line);border-radius:10px;padding:12px 13px;background:#10151f;min-width:92px;text-align:center}
-.lay .n{font-size:12px;color:var(--dim)}
-.lay .s{font-size:15px;margin-top:6px;font-weight:600}
-.lay .p{font-size:11px;color:var(--good);margin-top:4px}
-.arr{align-self:center;color:var(--dim);font-size:20px;flex:none}
 #info{font-size:13px;line-height:2.1;color:var(--dim)}
 #info b{color:var(--txt);font-weight:600;margin-right:8px}
+.lg{display:flex;gap:14px;font-size:11px;color:var(--dim);margin-top:6px;flex-wrap:wrap}
+.lg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
 </style>
 </head>
 <body>
 <header><span class="dot"></span><h1>DQN 训练监控 · 超级马里奥</h1><span class="meta" id="meta">连接中…</span></header>
 <div class="grid" id="cards"></div>
 <section>
-  <div class="panel"><h2>训练曲线（Loss ↑ · 平均最远距离 ↓）</h2><canvas id="chart" height="220"></canvas></div>
-  <div class="panel"><h2>梯度下降 · 损失曲面模拟</h2><canvas id="gd" height="220"></canvas></div>
-  <div class="panel"><h2>神经网络结构（CNN DQN）</h2><div id="netmap"></div></div>
+  <div class="panel"><h2>神经网络 · 逐层神经元连接（真实激活驱动亮度闪烁）</h2><canvas id="nn" height="330"></canvas>
+    <div class="lg"><span><i style="background:#1d7fd1"></i>输入</span><span><i style="background:#e76a2e"></i>卷积/FC</span><span><i style="background:#6bff8f"></i>输出</span><span style="opacity:.8">← 线越亮=两端神经元激活越强</span></div>
+  </div>
+  <div class="panel"><h2>梯度下降 · 3D 损失面</h2><canvas id="gd" height="330"></canvas>
+    <div class="lg"><span><i style="background:#3a465c"></i>损失面 z=x²+y²</span><span><i style="background:#ff8f5a"></i>当前 Loss 位置</span></div>
+  </div>
+  <div class="panel"><h2>训练曲线（Loss 与 平均最远距离）</h2><canvas id="chart" height="220"></canvas></div>
   <div class="panel"><h2>工程信息</h2><div id="info"></div></div>
 </section>
 <script>
 const $=id=>document.getElementById(id);
 const num=v=>Math.round(v||0).toLocaleString();
-function pick(k,d){
- switch(k){
-  case"步数":return num(d.steps);
-  case"探索率 ε":return d.eps.toFixed(3);
-  case"训练步数":return num(d.trainSteps);
-  case"经验池":return num(d.buffer);
-  case"Loss":return d.loss.toFixed(4);
-  case"本局最远":return num(d.score);
-  case"平均最远":return num(d.avgScore);
-  case"历史最远":return num(d.bestScore);
-  case"GPU 利用率":return d.gpu+"%";
-  case"局数":return num(d.episodes);
-  default:return"—";
- }
-}
-function cls(k){
- if(k==="平均最远"||k==="历史最远"||k==="GPU 利用率")return" good";
- if(k==="探索率 ε")return" cy";
- return"";
-}
+function pick(k,d){switch(k){
+ case"步数":return num(d.steps);case"探索率 ε":return d.eps.toFixed(3);case"训练步数":return num(d.trainSteps);
+ case"经验池":return num(d.buffer);case"Loss":return d.loss.toFixed(4);case"本局最远":return num(d.score);
+ case"平均最远":return num(d.avgScore);case"历史最远":return num(d.bestScore);case"GPU 利用率":return d.gpu+"%";
+ case"局数":return num(d.episodes);default:return"—";}}
+function cls(k){return(k==="平均最远"||k==="历史最远"||k==="GPU 利用率")?" good":(k==="探索率 ε"?" cy":"");}
 const keys=["步数","探索率 ε","训练步数","经验池","Loss","本局最远","平均最远","历史最远","GPU 利用率","局数"];
-function drawChart(loss,avgScore){
- const c=$("chart"),cs=198,x=c.getContext("2d");
- const W=c.clientWidth,H=cs,pad=24;
+const LN=[["in","输入",10],["c1","C1·32",12],["c2","C2·64",14],["c3","C3·64",12],["fc","FC·512",12],["out","输出",3]];
+let A={in:new Array(10).fill(0),c1:new Array(12).fill(0),c2:new Array(14).fill(0),c3:new Array(12).fill(0),fc:new Array(12).fill(0),out:new Array(3).fill(0)};
+function norm(v){const m=Math.max.apply(null,v);return m>0?v.map(x=>Math.max(0,x)/m):v;}
+function drawNN(t){
+ const c=$("nn"),x=c.getContext("2d"),W=c.clientWidth,H=330;
  c.width=W;c.height=H;x.clearRect(0,0,W,H);
- x.strokeStyle="#2a3245";x.lineWidth=1;
- for(let i=1;i<4;i++){const yy=pad+(H-2*pad)*i/4;x.beginPath();x.moveTo(pad,yy);x.lineTo(W-pad,yy);x.stroke();}
- const N=Math.max(loss.length,200),L=loss.length;
- const maxl=Math.max.apply(null,loss.slice(-N))||1,maxa=Math.max.apply(null,avgScore.slice(-N))||1;
- const line=(arr,max,color)=>{
-  x.beginPath();x.strokeStyle=color;x.lineWidth=2;
-  for(let i=0;i<arr.length;i++){
-   const px=pad+(i/(N-1))*(W-2*pad);
-   const py=H-pad-(arr[arr.length-1-i]/max)*(H-2*pad);
-   i?x.lineTo(px,py):x.moveTo(px,py);
+ const pad=40;const xs=LN.map((_,i)=>pad+i*(W-2*pad)/(LN.length-1));
+ const pos=LN.map(f=>{const n=f[2],ys=[];for(let i=0;i<n;i++)ys.push(H/2+(i-(n-1)/2)*(H-80)/n);return ys;});
+ const actv=key=>Math.log1p(10*norm(A[key])[i]||0)/Math.log(10);// placeholder
+ for(let li=0;li<LN.length-1;li++){
+  const aarr=norm(A[LN[li][0]]),barr=norm(A[LN[li+1][0]]);
+  for(let i=0;i<LN[li][2];i++)for(let j=0;j<LN[li+1][2];j++){
+   const a=aarr[i],b=barr[j],amp=a*b,pulse=.45+.55*Math.abs(Math.sin(t/300+li*1.7+i*0.4+j*0.25));
+   const al=Math.min(1,amp*2.4*pulse);
+   if(al<0.02)continue;
+   x.beginPath();x.strokeStyle="rgba(255,143,90,"+al.toFixed(2)+")";
+   x.lineWidth=Math.min(2.2,.6+al*1.8);
+   if(al>0.5){x.shadowColor="rgba(255,143,90,"+al.toFixed(2)+")";x.shadowBlur=8;}else x.shadowBlur=0;
+   x.moveTo(xs[li],pos[li][i]);x.lineTo(xs[li+1],pos[li+1][j]);x.stroke();
   }
-  x.stroke();
- };
- line(loss.slice(-N),maxl,"#ff8f5a");
- line(avgScore.slice(-N),maxa,"#6bff8f");
- x.fillStyle="#7d8aa0";x.font="12px sans-serif";
- x.fillText("0",4,H-8);
- x.fillStyle="#5ac8ff";x.fillText("Loss 轴",W-70,12);
- x.fillStyle="#6bff8f";x.fillText("均距 轴",W-70,26);
-}
-function gd(){
- const c=$("gd"),x=c.getContext("2d");
- const W=c.clientWidth,H=208,cx=W/2,cy=H/2-4;
- function frame(t){
-  c.width=W;c.height=H;x.clearRect(0,0,W,H);
-  x.strokeStyle="#2a3245";x.lineWidth=1.5;
-  const tilt=Math.sin(t/1500)*0.12,cam=t*0.0016;
-  for(let ring=0;ring<6;ring++){
-   const r0=ring*W/13+10;
-   x.beginPath();
-   for(let i=0;i<=80;i++){
-    const a=cam+(i/80)*Math.PI*2;
-    const r=r0*(1+0.06*ring);
-    const px=cx+r*Math.cos(a);
-    const py=cy+r*Math.sin(a)- (ring*ring/8)*(tilt*80);
-    i?x.lineTo(px,py):x.moveTo(px,py);
-   }
-   x.closePath();x.stroke();
-  }
-  const dec=Math.min(1,t/16000);
-  const ball=8+5*Math.E**(3*(dec-1))*3-0;
-  const rr=Math.max(8,W/5*(1-dec));
-  const bx=cx+rr*Math.cos(Math.PI/2),by=cy+rr*Math.sin(Math.PI/2)-(1-dec)*(1-dec)*26;
-  x.beginPath();x.arc(cx,cy-((1-dec)*30),rr,0,7);x.strokeStyle="#ff8f5a";x.stroke();
-  x.fillStyle="#ff8f5a";x.shadowColor="#ff8f5a";x.shadowBlur=14;
-  x.beginPath();x.arc(cx,cy-(1-dec)*30,6,0,7);x.fill();x.shadowBlur=0;
-  x.fillStyle="#7d8aa0";x.font="12px sans-serif";
-  x.fillText("小球沿梯度从高处滚向谷底（Loss 最小化）",10,16);
-  requestAnimationFrame(frame);
+  x.shadowBlur=0;
  }
- requestAnimationFrame(frame);
+ for(let li=0;li<LN.length;li++){
+  const aarr=norm(A[LN[li][0]]);
+  for(let i=0;i<LN[li][2];i++){
+   const v=aarr[i],col=li===0?"#1d7fd1":(li===LN.length-1?"#6bff8f":"#e76a2e");
+   const r=2.5+v*6;
+   x.beginPath();x.arc(xs[li],pos[li][i],r,0,7);x.fillStyle=col;x.globalAlpha=.35+.65*v;x.shadowBlur=10;x.shadowColor=col;x.fill();x.globalAlpha=1;x.shadowBlur=0;
+  }
+  x.font="11px sans-serif";x.fillStyle="#7d8aa0";x.textAlign="center";x.fillText(LN[li][1],xs[li],H-6);
+ }
 }
-function renderNet(d){
- const parts=[];
- parts.push(["Input","4×96×96","灰度4帧"]);
- [["Conv1",32,"8·S4"],["Conv2",64,"4·S2"],["Conv3",64,"3·S1"]].forEach(x=>parts.push(["Conv2d "+x[0],x[1]+" 通道","核 "+x[2]]));
- parts.push(["FC 512","512","ReLU"]);
- parts.push(["Output",d.actions+" 动作","Q 值"]);
- $("netmap").innerHTML='<div class="net">'+parts.map(p=>'<div class="lay"><div class="n">'+p[0]+'</div><div class="s">'+p[1]+'</div><div class="p">'+p[2]+'</div></div>').join('<span class="arr">→</span>')+'<div class="lay"><div class="n">参数量</div><div class="s">'+num(d.params)+'</div><div class="p">训练中最优</div></div></div>';
+function drawGD(t){
+ const c=$("gd"),x=c.getContext("2d"),W=c.clientWidth,H=330;
+ c.width=W;c.height=H;x.clearRect(0,0,W,H);
+ const cx=W/2,cy=H/2+10,S=Math.min(W,H)*0.30,rot=t/2600,rot2=Math.sin(t/5200)*0.5;
+ function pr(u,v,h){
+  const r=Math.hypot(u,v);
+  let X=(u*Math.cos(rot)-v*Math.sin(rot));
+  let Z=(u*Math.sin(rot)+v*Math.cos(rot));
+  const Y=h + Math.sin(rot2)*X*0.5 + Math.cos(rot2)*Z*0.5;
+  const per=(1/(1.6+Y*0.06));
+  return [cx+X*S*per, cy - Y*S*per];
+ }
+ const N=26;
+ x.strokeStyle="#2a3245";x.lineWidth=1.1;
+ for(let i=0;i<=N;i++){
+  const u=-1+2*i/N;
+  x.beginPath();
+  for(let j=0;j<=N;j++){const v=-1+2*j/N,h=(u*u+v*v)/2;const p=pr(u,v,h);j?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]);}
+  x.stroke();
+  x.beginPath();
+  for(let j=0;j<=N;j++){const v=-1+2*j/N,h=(u*u+v*v)/2;const p=pr(v,u,h);j?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]);}
+  x.stroke();
+ }
+ const th=(t/3200)%1;const gs=Math.sin(th*Math.PI);const bu=Math.cos(th*2)*0.35,ba=Math.sin(th*2)*0.35;
+ const bh=(bu*bu+ba*ba)/2;
+ const bp=pr(bu,ba,bh);
+ x.beginPath();x.arc(bp[0],bp[1],9,0,7);x.fillStyle="#ff8f5a";x.shadowColor="#ff8f5a";x.shadowBlur=16;x.fill();x.shadowBlur=0;
+ x.strokeStyle="#ff8f5a";x.lineWidth=2;x.globalAlpha=.4;
+ x.beginPath();for(let i=0;i<=40;i++){const tt=th-i*0.01,gg=Math.max(0,tt),bu2=Math.cos(gg*2)*0.4,ba2=Math.sin(gg*2)*0.4,bh2=(bu2*bu2+ba2*ba2)/2;const p=pr(bu2,ba2,bh2);i?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]);}x.stroke();x.globalAlpha=1;
+ x.font="12px sans-serif";x.fillStyle="#7d8aa0";x.fillText("Loss 曲面 (真 3D) · 小球沿梯度滑向谷底 (Loss 最小化)",10,18);
 }
+const LN2={}; // unused helper flag
 let loss=[],avg=[];
+function drawChart(la){
+ const c=$("chart"),x=c.getContext("2d"),W=c.clientWidth,H=220,pad=24;
+ c.width=W;c.height=H;x.clearRect(0,0,W,H);
+ x.strokeStyle="#2a3245";for(let i=1;i<4;i++){const yy=pad+(H-2*pad)*i/4;x.beginPath();x.moveTo(pad,yy);x.lineTo(W-pad,yy);x.stroke();}
+ const N=Math.max(loss.length,200),nl=loss.slice(-N),na=avg.slice(-N);
+ const maxl=Math.max.apply(null,nl)||1,maxa=Math.max.apply(null,na)||1;
+ const line=(arr,max,col)=>{x.beginPath();x.strokeStyle=col;x.lineWidth=2;
+  for(let i=0;i<arr.length;i++){const px=pad+(i/(N-1))*(W-2*pad),py=H-pad-(arr[arr.length-1-i]/max)*(H-2*pad);i?x.lineTo(px,py):x.moveTo(px,py);}x.stroke();};
+ line(nl,maxl,"#ff8f5a");line(na,maxa,"#6bff8f");
+ x.fillStyle="#7d8aa0";x.font="12px sans-serif";x.fillText("0",4,H-8);x.fillStyle="#5ac8ff";x.fillText("Loss",W-44,12);x.fillStyle="#6bff8f";x.fillText("距离",W-44,26);
+}
+function loop(){
+ requestAnimationFrame(loop);
+ const t=performance.now();
+ drawNN(t);drawGD(t);
+}
 async function poll(){
  try{
   const d=await (await fetch("/stats")).json();
   $("meta").textContent="在线 · 每 1 秒刷新  ·  http://127.0.0.1:"+d.port;
-  loss.push(d.loss);avg.push(d.avgScore||0);
-  if(loss.length>400){loss.shift();avg.shift();}
+  if(d.acts){A=d.acts;for(const k in A)if((A[k]).length>2){// clamp
+   }}else for(const k in A)A[k]=new Array(A[k].length).fill(0);
+  loss.push(d.loss);avg.push(d.avgScore||0);if(loss.length>400){loss.shift();avg.shift();}
   $("cards").innerHTML=keys.map(k=>'<div class="card"><div class="k">'+k+'</div><div class="v'+cls(k)+'">'+pick(k,d)+'</div></div>').join("");
-  drawChart(loss,avg);
+  drawChart();
   $("info").innerHTML=[
    ["环境",d.mark],["有效批量",(d.batch*d.accum)+"（batch "+d.batch+" × 累积 "+d.accum+"）"],
    ["智能体数",d.agents],["算法","Double DQN + 优先级经验池"],["设备",d.device],
-   ["动作空间","7（右/跳/跑…）SIMPLE_MOVEMENT"],["帧输入","4 帧 × 96 × 96 灰度"],["探索衰减","ε: "+d.eps+" → 随步数线性下降"]
+   ["动作空间","7（SIMPLE_MOVEMENT）"],["帧输入","4 帧 × 96 × 96 灰度"],["神经元激活","当前画面逐层真实前向（线亮=激活强）"]
   ].map(x=>'<div><b>'+x[0]+'</b>'+x[1]+'</div>').join("");
  }catch(e){$("meta").textContent="离线 / 连接断开";}
  setTimeout(poll,1000);
 }
-poll();gd();setTimeout(()=>renderNet({actions:7,params:2177187}),60);
+requestAnimationFrame(loop);poll();drawChart();
 </script>
 </body>
 </html>

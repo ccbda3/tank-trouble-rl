@@ -36,7 +36,7 @@ import config
 from agent import Agent, Counter
 from buffer import PrioritizedReplayBuffer
 from mario_env import MarioEnv, SIMPLE_MOVEMENT
-from monitor import Monitor
+from monitor import Monitor, act_stats
 from network import DQN, DEVICE
 from trainer import Trainer
 
@@ -216,7 +216,14 @@ def main():
             "size": config.SIZE,
             "actions": actions,
             "params": params,
+            "acts": self_acts(),
         }
+
+    def self_acts():
+        try:
+            return act_stats(net, r_env._stack())
+        except Exception:
+            return None
 
     mon_port[0] = Monitor(state_fn).start()
     log.info("monitor: http://127.0.0.1:%d", mon_port[0])
