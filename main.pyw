@@ -42,7 +42,7 @@ from buffer import PrioritizedReplayBuffer
 from monitor import Monitor, act_stats
 from network import DQN, DEVICE
 from torch.utils.tensorboard import SummaryWriter
-from trainer import LandscapeProbe, Trainer
+from trainer import LandscapeProbe, Trainer, load_optimizer
 
 logging.basicConfig(
     filename=config.LOG,
@@ -91,6 +91,14 @@ def draw_scene(screen, g, scene_px):
     pygame.draw.rect(screen, (60, 70, 90), (0, 0, scene_px, scene_px), 2)
 
 
+def load_partial(module, state):
+    own = module.state_dict()
+    kept = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape}
+    own.update(kept)
+    module.load_state_dict(own)
+    return len(kept), len(own)
+
+
 def main():
     net = DQN(config.FRAME_STACK, config.GRID, config.ACTIONS).to(DEVICE)
     target_net = DQN(config.FRAME_STACK, config.GRID, config.ACTIONS).to(DEVICE)
@@ -106,22 +114,28 @@ def main():
     if os.path.exists(config.FULL_STATE):
         try:
             d = torch.load(config.FULL_STATE, map_location=DEVICE)
-            net.load_state_dict(d["net"])
-            target_net.load_state_dict(d["target"])
-            optimizer.load_state_dict(d["opt"])
+            kept, total = load_partial(net, d["net"])
+            load_partial(target_net, d["target"])
+            if load_optimizer(optimizer, d["opt"]):
+                log.info("已恢复优化器状态")
+            else:
+                log.warning("优化器状态与当前网络不匹配，已重新初始化")
             counter.set(int(d.get("steps", 0)))
-            saved["train_steps"] = int(d.get("train_steps", 0))
-            saved["updates"] = int(d.get("updates", 0))
-            log.info("完整续训成功：加载 %s，已累计步伐 %d、梯度更新 %d",
-                     config.FULL_STATE, counter.get(), saved["train_steps"])
+            if kept == total:
+                saved["train_steps"] = int(d.get("train_steps", 0))
+                saved["updates"] = int(d.get("updates", 0))
+            else:
+                log.warning("网络结构有变化（%d/%d 层迁移），决策层重学、探索进度重置", kept, total)
+            log.info("续训成功：迁移 %d/%d 层权重，已累计步伐 %d、梯度更新 %d",
+                     kept, total, counter.get(), saved["train_steps"])
             resumed = True
         except Exception as e:
-            log.warning("完整续训失败，回退普通恢复: %s", e)
+            log.warning("续训失败，回退普通恢复: %s", e)
     if not resumed and os.path.exists(config.CHECKPOINT):
         try:
-            net.load_state_dict(torch.load(config.CHECKPOINT, map_location="cpu"))
+            kept, total = load_partial(net, torch.load(config.CHECKPOINT, map_location="cpu"))
             target_net.load_state_dict(net.state_dict())
-            log.info("loaded %s", config.CHECKPOINT)
+            log.info("已加载检查点：迁移 %d/%d 层权重", kept, total)
         except Exception as e:
             log.warning("load failed: %s", e)
 

@@ -5,8 +5,9 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class DQN(nn.Module):
-    def __init__(self, frames=4, size=24, actions=4):
+    def __init__(self, frames=4, size=32, actions=4):
         super().__init__()
+        feat = max(8, size // 2)
         self.net = nn.Sequential(
             nn.Conv2d(frames, 32, 3, 2, 1),
             nn.ReLU(),
@@ -14,10 +15,10 @@ class DQN(nn.Module):
             nn.ReLU(),
             nn.Conv2d(64, 64, 3, 1, 1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((12, 12)),
+            nn.AdaptiveAvgPool2d((feat, feat)),
         )
         self.fc = nn.Sequential(
-            nn.Linear(64 * 12 * 12, 512),
+            nn.Linear(64 * feat * feat, 512),
             nn.ReLU(),
             nn.Linear(512, actions),
         )

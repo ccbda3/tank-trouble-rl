@@ -1,3 +1,4 @@
+import logging
 import random
 import threading
 import time
@@ -6,6 +7,8 @@ import numpy as np
 import torch
 
 from network import DEVICE
+
+log = logging.getLogger("snake")
 
 
 class Counter:
@@ -78,25 +81,32 @@ class EnvWorker:
             return self.net(x).argmax(1).cpu().tolist()
 
     def loop(self, stop_event):
-        n = len(self.envs)
         states = [e.reset() for e in self.envs]
         interval = getattr(self.config, "TICK_INTERVAL", 0.0)
         while not stop_event.is_set():
-            t0 = time.perf_counter()
-            acts = self.act_batch(states, self.epsilon())
-            for i in range(n):
-                s = states[i]
-                s2, r, done = self.envs[i].step(acts[i])
-                self.buffer.push(s, acts[i], r, s2, done)
-                self.counter.add(1)
-                if done:
-                    with self.stats["lock"]:
-                        self.stats["recent"].append(self.envs[i].score)
-                        self.stats["episodes"] += 1
-                    states[i] = self.envs[i].reset()
-                else:
-                    states[i] = s2
-            if interval > 0:
-                rest = interval - (time.perf_counter() - t0)
-                if rest > 0:
-                    time.sleep(rest)
+            try:
+                self._tick(states, interval)
+            except Exception as e:
+                log.exception("采集线程出错，0.5 秒后重试: %s", e)
+                time.sleep(0.5)
+
+    def _tick(self, states, interval):
+        n = len(self.envs)
+        t0 = time.perf_counter()
+        acts = self.act_batch(states, self.epsilon())
+        for i in range(n):
+            s = states[i]
+            s2, r, done = self.envs[i].step(acts[i])
+            self.buffer.push(s, acts[i], r, s2, done)
+            self.counter.add(1)
+            if done:
+                with self.stats["lock"]:
+                    self.stats["recent"].append(self.envs[i].score)
+                    self.stats["episodes"] += 1
+                states[i] = self.envs[i].reset()
+            else:
+                states[i] = s2
+        if interval > 0:
+            rest = interval - (time.perf_counter() - t0)
+            if rest > 0:
+                time.sleep(rest)

@@ -1,9 +1,22 @@
+import logging
 import threading
 import time
 
 import torch
 
 from network import DEVICE, DQN
+
+log = logging.getLogger("snake")
+
+
+def load_optimizer(optimizer, state):
+    own = {p.shape for g in optimizer.param_groups for p in g["params"]}
+    for item in state["state"].values():
+        for v in item.values():
+            if hasattr(v, "shape") and v.shape not in own:
+                return False
+    optimizer.load_state_dict(state)
+    return True
 
 
 class Trainer:
@@ -44,48 +57,56 @@ class Trainer:
             if len(self.buffer) < self.config.BATCH:
                 time.sleep(0.05)
                 continue
-            batch = self.buffer.sample(self.config.BATCH)
-            pos, obs, acts, rews, nobs, dones, wts = batch
-            s = torch.from_numpy(obs).to(DEVICE)
-            a = torch.from_numpy(acts).to(DEVICE).unsqueeze(1)
-            r = torch.from_numpy(rews).to(DEVICE).unsqueeze(1)
-            s2 = torch.from_numpy(nobs).to(DEVICE)
-            d = torch.from_numpy(dones).to(DEVICE).unsqueeze(1)
-            w = torch.from_numpy(wts).to(DEVICE).unsqueeze(1)
+            try:
+                last_save = self._train_once(last_save)
+            except Exception as e:
+                log.exception("训练线程出错，1 秒后重试: %s", e)
+                time.sleep(1.0)
 
-            with torch.no_grad():
-                a_argmax = self.net(s2).max(1, keepdim=True).indices
-                target = r + self.config.GAMMA * (1 - d) * self.target_net(s2).gather(1, a_argmax)
-            q = self.net(s).gather(1, a)
-            td = (q - target).abs()
-            loss = (w * torch.nn.functional.smooth_l1_loss(q, target, reduction="none")).mean()
-            self.buffer.update_priorities(pos, td.detach().squeeze(1).cpu().numpy())
+    def _train_once(self, last_save):
+        batch = self.buffer.sample(self.config.BATCH)
+        pos, obs, acts, rews, nobs, dones, wts = batch
+        s = torch.from_numpy(obs).to(DEVICE)
+        a = torch.from_numpy(acts).to(DEVICE).unsqueeze(1)
+        r = torch.from_numpy(rews).to(DEVICE).unsqueeze(1)
+        s2 = torch.from_numpy(nobs).to(DEVICE)
+        d = torch.from_numpy(dones).to(DEVICE).unsqueeze(1)
+        w = torch.from_numpy(wts).to(DEVICE).unsqueeze(1)
 
-            loss = loss / self.config.ACCUM
-            loss.backward()
-            self.train_steps += 1
-            with self.stats["lock"]:
-                self.stats["loss"] = float(loss.item() * self.config.ACCUM)
+        with torch.no_grad():
+            a_argmax = self.net(s2).max(1, keepdim=True).indices
+            target = r + self.config.GAMMA * (1 - d) * self.target_net(s2).gather(1, a_argmax)
+        q = self.net(s).gather(1, a)
+        td = (q - target).abs()
+        loss = (w * torch.nn.functional.smooth_l1_loss(q, target, reduction="none")).mean()
+        self.buffer.update_priorities(pos, td.detach().squeeze(1).cpu().numpy())
 
-            if self.train_steps % self.config.ACCUM == 0:
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                self.updates += 1
-                if self.writer is not None:
-                    with self.stats["lock"]:
-                        cur_loss = self.stats["loss"]
-                    self.writer.add_scalar("train/loss", cur_loss, self.updates)
-                    self.writer.add_scalar("train/steps", self.counter.get(), self.updates)
-                    if self.updates % 25 == 0:
-                        self._hist("weights", self.net.named_parameters(), self.updates)
-                if self.train_steps % self.config.TARGET_SYNC == 0:
-                    self.target_net.load_state_dict(self.net.state_dict())
-                if self.train_steps % self.config.SAVE_EVERY == 0:
-                    torch.save(self.net.state_dict(), self.config.CHECKPOINT)
-                if time.time() - last_save > self.config.CHECKPOINT_INTERVAL:
-                    last_save = time.time()
-                    torch.save(self.net.state_dict(), self.config.CHECKPOINT)
-                    self.save_full()
+        loss = loss / self.config.ACCUM
+        loss.backward()
+        self.train_steps += 1
+        with self.stats["lock"]:
+            self.stats["loss"] = float(loss.item() * self.config.ACCUM)
+
+        if self.train_steps % self.config.ACCUM == 0:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            self.updates += 1
+            if self.writer is not None:
+                with self.stats["lock"]:
+                    cur_loss = self.stats["loss"]
+                self.writer.add_scalar("train/loss", cur_loss, self.updates)
+                self.writer.add_scalar("train/steps", self.counter.get(), self.updates)
+                if self.updates % 25 == 0:
+                    self._hist("weights", self.net.named_parameters(), self.updates)
+            if self.train_steps % self.config.TARGET_SYNC == 0:
+                self.target_net.load_state_dict(self.net.state_dict())
+            if self.train_steps % self.config.SAVE_EVERY == 0:
+                torch.save(self.net.state_dict(), self.config.CHECKPOINT)
+            if time.time() - last_save > self.config.CHECKPOINT_INTERVAL:
+                last_save = time.time()
+                torch.save(self.net.state_dict(), self.config.CHECKPOINT)
+                self.save_full()
+        return last_save
 
 
 class LandscapeProbe:
