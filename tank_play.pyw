@@ -3,7 +3,8 @@ import sys
 
 import pygame
 
-from tank import CELL, COLS, HEIGHT, ROWS, TANK_R, WIDTH, Bot, World
+import tank
+from tank import CELL, COLS, HEIGHT, ROWS, TANK_R, WIDTH, Bot, World, read_ctrl
 
 HUD = 74
 DT = 1.0 / 60.0
@@ -26,10 +27,8 @@ def make_font(size):
     return pygame.font.Font(None, size)
 
 
-def read_drive(keys, up, down, left, right, fire):
-    turn = (1 if keys[right] else 0) - (1 if keys[left] else 0)
-    thrust = (1 if keys[up] else 0) - (1 if keys[down] else 0)
-    return (turn, thrust, 1 if any(keys[k] for k in fire) else 0)
+def read_drive(keys, keyset):
+    return read_ctrl(keys.__getitem__, keyset)
 
 
 def draw_world():
@@ -107,14 +106,28 @@ tally = [0, 0]
 restart_at = None
 running = True
 
-KEYS_P1 = (pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d, (pygame.K_q,))
-KEYS_P2 = (
-    pygame.K_UP,
-    pygame.K_DOWN,
-    pygame.K_LEFT,
-    pygame.K_RIGHT,
-    (pygame.K_m, pygame.K_RETURN, pygame.K_SPACE),
-)
+KEYCODE = {
+    "w": pygame.K_w,
+    "a": pygame.K_a,
+    "s": pygame.K_s,
+    "d": pygame.K_d,
+    "q": pygame.K_q,
+    "up": pygame.K_UP,
+    "down": pygame.K_DOWN,
+    "left": pygame.K_LEFT,
+    "right": pygame.K_RIGHT,
+    "m": pygame.K_m,
+    "return": pygame.K_RETURN,
+    "space": pygame.K_SPACE,
+}
+
+
+def bind_keys(keyset):
+    return {name: tuple(KEYCODE[k] for k in keyset[name]) for name in keyset}
+
+
+KEYS_P1 = bind_keys(tank.P1_KEYMAP)
+KEYS_P2 = bind_keys(tank.P2_KEYMAP)
 
 while running:
     clock.tick(60)
@@ -137,8 +150,8 @@ while running:
                 bot = Bot(0.05 + 0.25 * bot_level, seed=7)
                 bot_on = True
     keys = pygame.key.get_pressed()
-    c0 = bot.act(world, world.tanks[0], world.tanks[1], DT) if bot_on else read_drive(keys, *KEYS_P1)
-    c1 = read_drive(keys, *KEYS_P2)
+    c0 = bot.act(world, world.tanks[0], world.tanks[1], DT) if bot_on else read_drive(keys, KEYS_P1)
+    c1 = read_drive(keys, KEYS_P2)
     was_over = world.over
     world.step(DT, c0, c1)
     if world.over and not was_over:

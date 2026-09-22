@@ -38,6 +38,30 @@ ACTION_CTRL = tuple((t, th, f) for f in (0, 1) for th in (1, 0, -1) for t in (-1
 ACTION_NAMES = tuple(_ctrl_name(*c) for c in ACTION_CTRL)
 ACTIONS = len(ACTION_CTRL)
 
+P1_KEYMAP = {
+    "up": ("w",),
+    "down": ("s",),
+    "left": ("a",),
+    "right": ("d",),
+    "fire": ("q",),
+}
+P2_KEYMAP = {
+    "up": ("up",),
+    "down": ("down",),
+    "left": ("left",),
+    "right": ("right",),
+    "fire": ("m", "return", "space"),
+}
+
+
+def read_ctrl(down, keys):
+    def held(name):
+        return any(down(k) for k in keys[name])
+
+    turn = (1 if held("right") else 0) - (1 if held("left") else 0)
+    thrust = (1 if held("up") else 0) - (1 if held("down") else 0)
+    return (turn, thrust, 1 if held("fire") else 0)
+
 
 def generate(seed=None, braid=0.35):
     rng = random.Random(seed)
