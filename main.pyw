@@ -22,16 +22,9 @@ import torch
 try:
     import pynvml
 
-    _nvml_ok = pynvml.nvmlInit() == 0
+    pynvml.nvmlInit()
+    _gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 except Exception:
-    _nvml_ok = False
-
-if _nvml_ok:
-    try:
-        _gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-    except Exception:
-        _gpu_handle = None
-else:
     _gpu_handle = None
 
 import config
@@ -73,6 +66,11 @@ def gpu_util():
         return pynvml.nvmlDeviceGetUtilizationRates(_gpu_handle).gpu
     except Exception:
         return None
+
+
+def gpu_pct():
+    g = gpu_util()
+    return -1 if g is None else g
 
 
 def draw_scene(screen, g, scene_px):
@@ -193,7 +191,7 @@ def main():
             "score": r_env.score,
             "avgScore": avg(stats),
             "bestScore": max_score(stats),
-            "gpu": gpu_util() or -1,
+            "gpu": gpu_pct(),
             "episodes": stats["episodes"],
             "agents": config.AGENTS,
             "acts": self_acts(),

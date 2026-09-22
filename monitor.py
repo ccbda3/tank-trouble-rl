@@ -349,7 +349,7 @@ var METRICS=[
 var KEYS=[["steps","总步数",""],["eps","探索率 ε","cy"],["trainSteps","训练步数",""],["buffer","经验池容量",""],
  ["loss","Loss","acc"],["score","本局蛇长","good"],["avgScore","平均蛇长","good"],["bestScore","最长蛇身","good"],
  ["dps","决策/秒",""],["gpu","GPU 利用率","acc"],["episodes","完成局数",""]];
-function fmt(k,d){var v=d[k];switch(k){case"eps":return Number(v).toFixed(3);case"loss":return Number(v).toFixed(4);case"gpu":return Number(v)>0?Number(v)+"%":"CPU";case"dps":return Number(v).toLocaleString("en-US");default:return Number(v).toLocaleString("en-US");}}
+function fmt(k,d){var v=d[k];switch(k){case"eps":return Number(v).toFixed(3);case"loss":return Number(v).toFixed(4);case"gpu":return Number(v)>=0?Number(v)+"%":"CPU";case"dps":return Number(v).toLocaleString("en-US");default:return Number(v).toLocaleString("en-US");}}
 var statRefs=[];
 function renderStats(d){
  var h="";
@@ -395,7 +395,7 @@ function buildPanels(d){
   if(i<L.length-1){h+='<div class="lyr"><span class="lnm">↘ 连接</span><span class="lsh">'+fInt(ly.nodeCount)+' → '+fInt(L[i+1].nodeCount)+' 桶 · 权重绝对均值采样</span><span class="lpr">-</span><span class="lot">桶化 '+fInt(c.connBucket)+'×'+fInt(c.connBucket)+'</span></div>';}
  }
  h+='<div class="lyr tot"><span class="lnm">合计</span><span class="lsh">'+fInt(L.length)+' 层</span><span class="lpr">'+fInt(tot)+'</span><span class="lot">'+fInt(c.actions)+' 动作</span></div>';
- h+='</div><div class="row" style="margin-top:5px"><span class="rk">算力</span><span class="rv"><b>'+(d.gpu>0?"GPU 加速":"CPU")+'</b></span></div></div>';
+ h+='</div><div class="row" style="margin-top:5px"><span class="rk">算力</span><span class="rv"><b>'+(d.gpu>=0?"GPU 加速":"CPU")+'</b></span></div></div>';
  h+='<div class="pnl"><div class="pnlh">DQN 超参数</div>';
  h+=row("Double DQN",'<b class="yes">启用</b>');
  h+=row("优先级经验池","SumTree · α="+fFix(c.alpha,2));
@@ -433,7 +433,7 @@ function updatePanels(d){
  var cc=d.config||{},bs=Number(cc.batch)||1,st=Number(d.steps)||1;
  setT("p-ratio",(Number(d.trainSteps)*bs/st).toFixed(2)+" ×");
  setT("p-loss",fFix(d.loss,4));
- setT("p-gpu",d.gpu>0?d.gpu+"%":"CPU 训练");
+ setT("p-gpu",d.gpu>=0?d.gpu+"%":"CPU 训练");
  el("paramSub").textContent="第 "+fInt(d.episodes)+" 局 · 步数 "+fInt(d.steps)+" · "+fFix(d.loss,4)+" Loss";
 }
 var NET={ready:false,layers:[],edges:[],conn:0,act:[],pick:[],maxS:1,hover:null,hoverKey:"",view:null,mode:"3d",iter:0,samples:0,value:0,budget:480,cv:null,ctx:null,pairs:[[0,1],[1,2],[2,3],[3,4],[4,5]],cam:{yaw:-1.05,pitch:0.30,dist:40.0,drag:false,lx:0,ly:0}};
