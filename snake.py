@@ -26,9 +26,9 @@ class Snake:
 
     def render(self):
         img = np.zeros((self.grid, self.grid), np.uint8)
-        img[self.apple[0], self.apple[1]] = 180
+        img[self.apple[0], self.apple[1]] = 255
         for i, (x, y) in enumerate(self.body):
-            img[x, y] = 255 if i == 0 else 150
+            img[x, y] = 170 if i == 0 else 80
         return img
 
     def step(self, action):
@@ -42,10 +42,12 @@ class Snake:
             return -10.0, True
         if nh in self.body[:-1]:
             return -10.0, True
+        old_d = abs(head[0] - self.apple[0]) + abs(head[1] - self.apple[1])
         self.body.insert(0, nh)
         if nh == self.apple:
             self.score += 1
             self._place_apple()
             return 10.0, False
         self.body.pop()
-        return -0.02, False
+        new_d = abs(nh[0] - self.apple[0]) + abs(nh[1] - self.apple[1])
+        return (0.1 if new_d < old_d else -0.15), False

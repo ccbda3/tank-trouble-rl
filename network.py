@@ -8,16 +8,16 @@ class DQN(nn.Module):
     def __init__(self, frames=4, size=24, actions=4):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(frames, 32, 3, 2, 1),
+            nn.Conv2d(frames, 32, 3, 1, 1),
             nn.ReLU(),
             nn.Conv2d(32, 64, 3, 2, 1),
             nn.ReLU(),
             nn.Conv2d(64, 64, 3, 1, 1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
+            nn.AdaptiveAvgPool2d((12, 12)),
         )
         self.fc = nn.Sequential(
-            nn.Linear(64, 512),
+            nn.Linear(64 * 12 * 12, 512),
             nn.ReLU(),
             nn.Linear(512, actions),
         )

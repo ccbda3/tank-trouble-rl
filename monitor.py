@@ -83,16 +83,26 @@ def act_stats(net, obs):
             "actMean": float(arr.mean()) if arr.size else 0.0,
         }
 
+    def nparam(m):
+        return sum(p.numel() for p in m.parameters())
+
+    k1, k2, k3 = net.net[0].out_channels, net.net[2].out_channels, net.net[4].out_channels
+    s1, s2, s3 = c1a.shape[-1], c2a.shape[-1], c3a.shape[-1]
+
     layers = [
         layer("输入", f"{config.GRID}×{config.GRID} 灰度 · 融合 {config.FRAME_STACK} 帧",
               in_arr, config.GRID * config.GRID, 0, f"{rows}×{cols} 网格采样"),
-        layer("C1", "32 通道 @ 12×12 卷积", group_avg(c1, 24), 32,
-              32 * config.FRAME_STACK * 9 + 32, "32 @ 12×12"),
-        layer("C2", "64 通道 @ 6×6 卷积", group_avg(c2, 24), 64, 64 * 32 * 9 + 64, "64 @ 6×6"),
-        layer("C3", "64 通道 @ 6×6 卷积", group_avg(c3, 24), 64, 64 * 64 * 9 + 64, "64 @ 6×6"),
-        layer("FC", "全连接 512", group_avg(fc, 24), 512, 64 * 512 + 512, "512 特征"),
-        layer("输出", "四个动作 Q 值", out.tolist(), config.ACTIONS,
-              512 * config.ACTIONS + config.ACTIONS, "上 / 下 / 左 / 右"),
+        layer("C1", f"{k1} 通道 @ {s1}×{s1} 卷积", group_avg(c1, 24), k1, nparam(net.net[0]),
+              f"{k1} @ {s1}×{s1}"),
+        layer("C2", f"{k2} 通道 @ {s2}×{s2} 卷积", group_avg(c2, 24), k2, nparam(net.net[2]),
+              f"{k2} @ {s2}×{s2}"),
+        layer("C3", f"{k3} 通道 @ {s3}×{s3} 卷积", group_avg(c3, 24), k3, nparam(net.net[4]),
+              f"{k3} @ {s3}×{s3}"),
+        layer("FC", f"全连接 {net.fc[0].out_features} · 展平 {int(net.fc[0].in_features)}",
+              group_avg(fc, 24), net.fc[0].out_features, nparam(net.fc[0]),
+              f"{net.fc[0].out_features} 特征"),
+        layer("输出", "四个动作 Q 值", out.tolist(), config.ACTIONS, nparam(net.fc[2]),
+              "上 / 下 / 左 / 右"),
     ]
 
     edges = [
