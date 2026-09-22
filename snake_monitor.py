@@ -12,17 +12,23 @@ EDGE_TTL = 5.0
 HIST_TTL = 5.0
 
 
+def _convs(net):
+    return [m for m in net.net if isinstance(m, torch.nn.Conv2d)]
+
+
 def _forward(net, obs):
     x = torch.from_numpy(np.asarray(obs)).unsqueeze(0).to(net.fc[0].weight.device)
     x = x.float() / 255.0
     with torch.no_grad():
-        c1a = net.net[1](net.net[0](x))
-        c2a = net.net[3](net.net[2](c1a))
-        c3a = net.net[5](net.net[4](c2a))
-        pool = net.net[6](c3a)
-        f = net.fc[1](net.fc[0](torch.flatten(pool, 1)))
+        feats = []
+        y = x
+        for m in net.net:
+            y = m(y)
+            if isinstance(m, torch.nn.Conv2d):
+                feats.append(y)
+        f = net.fc[1](net.fc[0](torch.flatten(y, 1)))
         out = net.fc[2](f)
-    return c1a, c2a, c3a, f, out
+    return feats[0], feats[1], feats[2], f, out
 
 
 def _chan_matrix(weight):
@@ -68,9 +74,10 @@ class SnakeMonitor:
         zero = np.zeros((config.FRAME_STACK, config.GRID, config.GRID), np.uint8)
         c1a, c2a, c3a, _, _ = _forward(net, zero)
         self._shape = (int(c1a.shape[-1]), int(c2a.shape[-1]), int(c3a.shape[-1]))
-        k1 = net.net[0].out_channels
-        k2 = net.net[2].out_channels
-        k3 = net.net[4].out_channels
+        cv = _convs(net)
+        k1 = cv[0].out_channels
+        k2 = cv[1].out_channels
+        k3 = cv[2].out_channels
         s1, s2, s3 = self._shape
         nf = net.fc[0].out_features
         self._chans = (k1, k2, k3)
@@ -79,12 +86,12 @@ class SnakeMonitor:
         self._meta = [
             {"name": "输入", "detail": "%d 帧 × %d×%d" % (config.FRAME_STACK, config.GRID, config.GRID),
              "params": 0, "realCount": config.FRAME_STACK * config.GRID * config.GRID},
-            {"name": "C1", "detail": "%d 通道 × %d×%d" % (k1, s1, s1),
-             "params": _nparam(net.net[0]), "realCount": k1 * s1 * s1},
+            {"name": "C1", "detail": "%d 通道 × %d×%d · 逐格精确" % (k1, s1, s1),
+             "params": _nparam(cv[0]), "realCount": k1 * s1 * s1},
             {"name": "C2", "detail": "%d 通道 × %d×%d" % (k2, s2, s2),
-             "params": _nparam(net.net[2]), "realCount": k2 * s2 * s2},
-            {"name": "C3", "detail": "%d 通道 × %d×%d" % (k3, s3, s3),
-             "params": _nparam(net.net[4]), "realCount": k3 * s3 * s3},
+             "params": _nparam(cv[1]), "realCount": k2 * s2 * s2},
+            {"name": "C3", "detail": "%d 通道 × %d×%d · 膨胀卷积" % (k3, s3, s3),
+             "params": _nparam(cv[2]), "realCount": k3 * s3 * s3},
             {"name": "FC", "detail": "%d 个神经元 · 全部显示" % nf,
              "params": _nparam(net.fc[0]), "realCount": nf},
             {"name": "输出", "detail": "%d 个动作 · 全部显示" % config.ACTIONS,
@@ -101,11 +108,12 @@ class SnakeMonitor:
         if self._edges["v"] is not None and now - self._edges["t"] < EDGE_TTL:
             return self._edges["v"]
         net = self.net
+        cv = _convs(net)
         self._edges["v"] = [
-            _chan_matrix(net.net[0].weight),
-            _chan_matrix(net.net[2].weight),
-            _chan_matrix(net.net[4].weight),
-            _fc_matrix(net.fc[0].weight, net.net[4].out_channels),
+            _chan_matrix(cv[0].weight),
+            _chan_matrix(cv[1].weight),
+            _chan_matrix(cv[2].weight),
+            _fc_matrix(net.fc[0].weight, cv[2].out_channels),
             _chan_matrix(net.fc[2].weight),
         ]
         self._edges["t"] = now
@@ -341,6 +349,7 @@ class SnakeMonitor:
                       ["总参数量", "<b>%d</b>" % sum(p.numel() for p in net.parameters())]]},
             {"title": "DQN 超参数", "rows": [
                 ["Double DQN", "<b>启用</b>"],
+                ["感知层", "首层 stride=1 保留逐格占用 → 膨胀卷积 dilation 2/3（感受野约 15 格）"],
                 ["优先级经验池", "SumTree · α=%.2f" % config.ALPHA],
                 ["折扣因子 gamma", "%.3f（有效视野 %d 步）" % (config.GAMMA, int(1 / (1 - config.GAMMA)))],
                 ["奖励塑形", "势函数 Φ=%.1f×曼哈顿距离，策略不变形" % config.SHAPE],

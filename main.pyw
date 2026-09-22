@@ -29,6 +29,7 @@ except Exception:
 
 import config
 import env
+import network
 import snake
 from agent import Agent, Counter, EnvWorker, EvalWorker
 from buffer import PrioritizedReplayBuffer
@@ -86,7 +87,29 @@ def draw_scene(screen, g, scene_px):
 
 def load_partial(module, state):
     own = module.state_dict()
-    kept = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape}
+    kept = {}
+    skip = []
+    for k, v in state.items():
+        if k.startswith(network.FRESH_KEYS):
+            skip.append(k)
+            continue
+        if k in own and tuple(own[k].shape) == tuple(v.shape):
+            kept[k] = v
+    left_own = [k for k in own if k not in kept]
+    left_src = [k for k in state if k not in kept and k not in skip]
+    by_shape = {}
+    for k in left_own:
+        by_shape.setdefault(tuple(own[k].shape), []).append(k)
+    moved = 0
+    for k in left_src:
+        cand = by_shape.get(tuple(state[k].shape))
+        if cand:
+            kept[cand.pop(0)] = state[k]
+            moved += 1
+    if moved:
+        log.info("按形状兜底迁移 %d 个张量（网络层顺序变了，名字对不上）", moved)
+    if skip:
+        log.info("感知层输出已改为全分辨率逐格特征，%d 个全连接输入层参数重新初始化", len(skip))
     own.update(kept)
     module.load_state_dict(own)
     return len(kept), len(own)
