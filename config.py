@@ -2,7 +2,7 @@ import os
 
 AGENTS = min(max(2, os.cpu_count() or 4), 8)
 GAMMA = 0.99
-LR = 1e-3
+LR = 5e-4
 BATCH = 128
 REPLAY_CAP = 200000
 HIDDEN = 128
@@ -10,7 +10,7 @@ TARGET_SYNC = 2000
 SAVE_EVERY = 5000
 CHECKPOINT_INTERVAL = 60
 EPS_START = 1.0
-EPS_END = 0.02
-EPS_DECAY = 800000
+EPS_END = 0.03
+EPS_DECAY = 3000000
 CHECKPOINT = "checkpoint.pth"
 LOG = "train.log"

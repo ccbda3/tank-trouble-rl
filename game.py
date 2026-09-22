@@ -14,7 +14,7 @@ BRICK_GAP = 1
 BRICK_TOP = 54
 BRICK_LEFT = (W - COLS * (BRICK_W + BRICK_GAP)) // 2
 PADDLE_Y = H - 46
-BALL_SPEED = 9.0
+BALL_SPEED = 7.5
 COLORS = [(230, 80, 80), (230, 150, 70), (230, 210, 80), (110, 200, 100), (90, 160, 230), (170, 110, 230)]
 
 
@@ -106,10 +106,12 @@ class Breakout:
 
         if by > H + BALL_R:
             done = True
-            reward -= 1.0
+            reward -= 3.0
         elif not any(any(row) for row in self.bricks):
             done = True
-            reward += 10.0
+            reward += 40.0
+        else:
+            reward += 0.02
 
         self.ball_x = bx
         self.ball_y = by

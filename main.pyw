@@ -48,22 +48,24 @@ def max_score(stats):
         return max(stats["recent"]) if stats["recent"] else 0
 
 
-def draw_game(screen, g):
-    screen.fill((16, 20, 30))
+def draw_game(screen, g, canvas, scale):
+    canvas.fill((16, 20, 30))
     for r in range(game.ROWS):
         for c in range(game.COLS):
             if not g.bricks[r][c]:
                 continue
             x = game.BRICK_LEFT + c * (game.BRICK_W + game.BRICK_GAP)
             y = game.BRICK_TOP + r * (game.BRICK_H + game.BRICK_GAP)
-            pygame.draw.rect(screen, game.COLORS[r % len(game.COLORS)], (x, y, game.BRICK_W, game.BRICK_H))
-            pygame.draw.rect(screen, (10, 12, 18), (x, y, game.BRICK_W, game.BRICK_H), 2)
+            pygame.draw.rect(canvas, game.COLORS[r % len(game.COLORS)], (x, y, game.BRICK_W, game.BRICK_H))
+            pygame.draw.rect(canvas, (10, 12, 18), (x, y, game.BRICK_W, game.BRICK_H), 2)
     px = int(g.paddle_x - game.PADDLE_W / 2)
-    pygame.draw.rect(screen, (150, 190, 255), (px, game.PADDLE_Y, game.PADDLE_W, game.PADDLE_H))
-    pygame.draw.rect(screen, (10, 12, 18), (px, game.PADDLE_Y, game.PADDLE_W, game.PADDLE_H), 2)
-    pygame.draw.circle(screen, (255, 235, 160), (int(g.ball_x), int(g.ball_y)), game.BALL_R)
-    pygame.draw.circle(screen, (10, 12, 18), (int(g.ball_x), int(g.ball_y)), game.BALL_R, 1)
-    pygame.draw.rect(screen, (60, 70, 90), (0, 0, game.W, game.H), 2)
+    pygame.draw.rect(canvas, (150, 190, 255), (px, game.PADDLE_Y, game.PADDLE_W, game.PADDLE_H))
+    pygame.draw.rect(canvas, (10, 12, 18), (px, game.PADDLE_Y, game.PADDLE_W, game.PADDLE_H), 2)
+    pygame.draw.circle(canvas, (255, 235, 160), (int(g.ball_x), int(g.ball_y)), game.BALL_R)
+    pygame.draw.circle(canvas, (10, 12, 18), (int(g.ball_x), int(g.ball_y)), game.BALL_R, 1)
+    pygame.draw.rect(canvas, (60, 70, 90), (0, 0, game.W, game.H), 2)
+    scaled = pygame.transform.smoothscale(canvas, (int(game.W * scale), int(game.H * scale)))
+    screen.blit(scaled, (0, 0))
 
 
 def draw_plot(screen, font_small, stats, x, y, w, h):
@@ -95,9 +97,9 @@ def draw_plot(screen, font_small, stats, x, y, w, h):
     screen.blit(text, (x + 6, y + 6))
 
 
-def draw(screen, fonts, g, stats, counter, agent, buffer, trainer):
+def draw(screen, fonts, g, stats, counter, agent, buffer, trainer, scale):
     font_title, font, font_small = fonts
-    panel_x = game.W
+    panel_x = int(game.W * scale)
     panel_w = screen.get_width() - panel_x
 
     lines = [
@@ -154,8 +156,13 @@ def main():
         threading.Thread(target=ag.loop, args=(stop_event,), daemon=True).start()
 
     pygame.init()
+    info = pygame.display.Info()
+    scale = min(1.0, (info.current_w - 340) / game.W, (info.current_h - 90) / game.H)
     panel_w = 300
-    screen = pygame.display.set_mode((game.W + panel_w, game.H))
+    win_w = int(game.W * scale) + panel_w
+    win_h = int(game.H * scale)
+    canvas = pygame.Surface((game.W, game.H))
+    screen = pygame.display.set_mode((win_w, win_h))
     pygame.display.set_caption("打砖块 - DQN 强化学习")
     clock = pygame.time.Clock()
     font_title = pygame.font.SysFont("microsoftyahei", 20)
@@ -192,8 +199,8 @@ def main():
                 stats["episodes"] += 1
             s = r_env.reset()
 
-        draw_game(screen, r_env.g)
-        draw(screen, fonts, r_env.g, stats, counter, r_agent, buffer, trainer)
+        draw_game(screen, r_env.g, canvas, scale)
+        draw(screen, fonts, r_env.g, stats, counter, r_agent, buffer, trainer, scale)
         pygame.display.flip()
         clock.tick(60)
 
