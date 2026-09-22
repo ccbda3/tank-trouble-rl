@@ -232,6 +232,34 @@ class SnakeMonitor:
         with self.stats["lock"]:
             return self.stats["eval_avg"] if self.stats["eval_episodes"] else None
 
+    def _eval_median(self):
+        with self.stats["lock"]:
+            rec = list(self.stats["eval_recent"])
+        if not rec:
+            return None
+        return float(np.median(rec))
+
+    def _eval_p75(self):
+        with self.stats["lock"]:
+            rec = list(self.stats["eval_recent"])
+        if len(rec) < 4:
+            return None
+        return float(np.percentile(rec, 75))
+
+    def _eval_collapse(self):
+        with self.stats["lock"]:
+            rec = list(self.stats["eval_recent"])
+        if len(rec) < 8:
+            return None
+        return 100.0 * sum(1 for v in rec if v <= 5) / len(rec)
+
+    def _eval_rate30(self):
+        with self.stats["lock"]:
+            rec = list(self.stats["eval_recent"])
+        if len(rec) < 8:
+            return None
+        return 100.0 * sum(1 for v in rec if v >= 30) / len(rec)
+
     def _eval_best(self):
         with self.stats["lock"]:
             return self.stats["eval_best"] if self.stats["eval_episodes"] else None
@@ -321,7 +349,7 @@ class SnakeMonitor:
                 ["批大小 / 梯度累积", "%d / %d" % (config.BATCH, config.ACCUM)],
                 ["目标网络同步", "%d 步" % config.TARGET_SYNC],
                 ["经验池容量", "%d" % config.REPLAY_CAP],
-                ["探索率区间", "%.2f → %.2f" % (config.EPS_START, config.EPS_END)],
+                ["探索率区间", "%.3f → %.3f" % (config.EPS_START, config.EPS_END)],
                 ["探索衰减更新数", "%d" % config.EPS_DECAY],
                 ["贪心评估", "每 %.0f 秒 %d 局（ε=0，不写入经验池）" % (config.EVAL_INTERVAL, config.EVAL_EPISODES)],
                 ["当前梯度更新", "%d" % self.trainer.train_steps],
@@ -353,6 +381,8 @@ class SnakeMonitor:
         mon.metric("avg_score", self._avg, label="训练均值(带探索)", fmt="f2", color="#3ddc84")
         mon.metric("best_score", self._best, label="训练最高(带探索)", fmt="int", color="#ffd36a")
         mon.metric("eval_avg", self._eval_avg, label="贪心评估均值(无探索)", fmt="f2", color="#5fd0a0")
+        mon.metric("eval_median", self._eval_median, label="贪心中位数(抗噪)", fmt="f1", color="#7fe0b8")
+        mon.metric("eval_collapse", self._eval_collapse, label="崩局率(≤5 苹果)", fmt="f1", color="#e08f7f")
         mon.metric("eval_best", self._eval_best, label="贪心评估最高", fmt="int", color="#9fe6bf")
         mon.metric("train_steps", lambda: self.trainer.train_steps, label="梯度更新", fmt="int")
         mon.metric("q_mean", lambda: self.stats["q_mean"], label="平均 Q 值", fmt="f3", color="#c39a5c")
@@ -373,6 +403,8 @@ class SnakeMonitor:
                    label="可训练参数", fmt="int")
         mon.health("gamma", lambda: config.GAMMA, label="折扣因子 γ", fmt="f3")
         mon.health("eval_gap", self._eval_steps_per_apple, label="贪心每苹果步数", fmt="f1")
+        mon.health("eval_p75", self._eval_p75, label="贪心 P75 分位", fmt="f1")
+        mon.health("eval_rate30", self._eval_rate30, label="≥30 苹果占比 %", fmt="f1")
         mon.health("eval_count", lambda: self.stats["eval_episodes"], label="已贪心评估局数", fmt="int")
 
         mon.graph(self._graph)
