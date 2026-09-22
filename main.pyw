@@ -96,7 +96,7 @@ def main():
     target_net = DQN(config.FRAME_STACK, config.GRID, config.ACTIONS).to(DEVICE)
     target_net.load_state_dict(net.state_dict())
 
-    buffer = PrioritizedReplayBuffer(config.REPLAY_CAP)
+    buffer = PrioritizedReplayBuffer(config.REPLAY_CAP, config.FRAME_STACK, config.GRID)
     optimizer = torch.optim.Adam(net.parameters(), lr=config.LR)
     counter = Counter()
     stats = {"lock": threading.Lock(), "recent": deque(maxlen=200), "episodes": 0, "loss": 0.0}

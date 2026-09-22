@@ -1,7 +1,6 @@
 import threading
 import time
 
-import numpy as np
 import torch
 
 from network import DEVICE, DQN
@@ -45,13 +44,14 @@ class Trainer:
             if len(self.buffer) < self.config.BATCH:
                 time.sleep(0.05)
                 continue
-            batch, weights, idxs = self.buffer.sample(self.config.BATCH)
-            s = torch.tensor(np.stack([x[0] for x in batch]), dtype=torch.float32, device=DEVICE)
-            a = torch.tensor(np.array([x[1] for x in batch]), dtype=torch.long, device=DEVICE).unsqueeze(1)
-            r = torch.tensor(np.array([x[2] for x in batch]), dtype=torch.float32, device=DEVICE).unsqueeze(1)
-            s2 = torch.tensor(np.stack([x[3] for x in batch]), dtype=torch.float32, device=DEVICE)
-            d = torch.tensor(np.array([x[4] for x in batch]), dtype=torch.float32, device=DEVICE).unsqueeze(1)
-            w = torch.tensor(weights, dtype=torch.float32, device=DEVICE).unsqueeze(1)
+            batch = self.buffer.sample(self.config.BATCH)
+            pos, obs, acts, rews, nobs, dones, wts = batch
+            s = torch.from_numpy(obs).to(DEVICE)
+            a = torch.from_numpy(acts).to(DEVICE).unsqueeze(1)
+            r = torch.from_numpy(rews).to(DEVICE).unsqueeze(1)
+            s2 = torch.from_numpy(nobs).to(DEVICE)
+            d = torch.from_numpy(dones).to(DEVICE).unsqueeze(1)
+            w = torch.from_numpy(wts).to(DEVICE).unsqueeze(1)
 
             with torch.no_grad():
                 a_argmax = self.net(s2).max(1, keepdim=True).indices
@@ -59,7 +59,7 @@ class Trainer:
             q = self.net(s).gather(1, a)
             td = (q - target).abs()
             loss = (w * torch.nn.functional.smooth_l1_loss(q, target, reduction="none")).mean()
-            self.buffer.update_priorities(idxs, td.squeeze(1).cpu().tolist())
+            self.buffer.update_priorities(pos, td.detach().squeeze(1).cpu().numpy())
 
             loss = loss / self.config.ACCUM
             loss.backward()
@@ -131,12 +131,12 @@ class LandscapeProbe:
     def _freeze(self):
         if self.fixed is not None or len(self.buffer) < self.probe_batch:
             return
-        batch, _, _ = self.buffer.sample(self.probe_batch)
-        s = torch.tensor(np.stack([x[0] for x in batch]), dtype=torch.float32, device=DEVICE)
-        a = torch.tensor(np.array([x[1] for x in batch]), dtype=torch.long, device=DEVICE).unsqueeze(1)
-        r = torch.tensor(np.array([x[2] for x in batch]), dtype=torch.float32, device=DEVICE).unsqueeze(1)
-        s2 = torch.tensor(np.stack([x[3] for x in batch]), dtype=torch.float32, device=DEVICE)
-        d = torch.tensor(np.array([x[4] for x in batch]), dtype=torch.float32, device=DEVICE).unsqueeze(1)
+        pos, obs, acts, rews, nobs, dones, _ = self.buffer.sample(self.probe_batch)
+        s = torch.from_numpy(obs).float().to(DEVICE) / 255.0
+        a = torch.from_numpy(acts).to(DEVICE).unsqueeze(1)
+        r = torch.from_numpy(rews).to(DEVICE).unsqueeze(1)
+        s2 = torch.from_numpy(nobs).float().to(DEVICE) / 255.0
+        d = torch.from_numpy(dones).to(DEVICE).unsqueeze(1)
         with torch.no_grad():
             am = self.net(s2).max(1, keepdim=True).indices
             tgt = r + self.config.GAMMA * (1 - d) * self.target_net(s2).gather(1, am)

@@ -74,7 +74,7 @@ class EnvWorker:
         if random.random() < eps:
             return [random.randrange(self.actions) for _ in range(n)]
         with torch.no_grad():
-            x = torch.tensor(np.stack(states), dtype=torch.float32, device=DEVICE)
+            x = torch.from_numpy(np.stack(states)).to(DEVICE)
             return self.net(x).argmax(1).cpu().tolist()
 
     def loop(self, stop_event):
