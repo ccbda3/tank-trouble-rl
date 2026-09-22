@@ -156,7 +156,25 @@ def main():
     target_net = DQN(config.FRAME_STACK, config.SIZE, actions).to(DEVICE)
     target_net.load_state_dict(net.state_dict())
     checkpoint = "mario_checkpoint.pth"
-    if os.path.exists(checkpoint):
+
+    buffer = PrioritizedReplayBuffer(config.REPLAY_CAP)
+    optimizer = torch.optim.Adam(net.parameters(), lr=config.LR)
+    counter = Counter()
+    stats = {"lock": threading.Lock(), "recent": deque(maxlen=200), "episodes": 0, "loss": 0.0}
+
+    resumed = False
+    if os.path.exists(config.FULL_STATE):
+        try:
+            d = torch.load(config.FULL_STATE, map_location=DEVICE)
+            net.load_state_dict(d["net"])
+            target_net.load_state_dict(d["target"])
+            optimizer.load_state_dict(d["opt"])
+            counter.set(int(d.get("steps", 0)))
+            log.info("完整续训成功：加载 %s，已累计步伐 %d", config.FULL_STATE, counter.get())
+            resumed = True
+        except Exception as e:
+            log.warning("完整续训失败，回退普通恢复: %s", e)
+    if not resumed and os.path.exists(checkpoint):
         try:
             net.load_state_dict(torch.load(checkpoint, map_location="cpu"))
             target_net.load_state_dict(net.state_dict())
@@ -164,10 +182,6 @@ def main():
         except Exception as e:
             log.warning("load failed: %s", e)
 
-    buffer = PrioritizedReplayBuffer(config.REPLAY_CAP)
-    optimizer = torch.optim.Adam(net.parameters(), lr=config.LR)
-    counter = Counter()
-    stats = {"lock": threading.Lock(), "recent": deque(maxlen=200), "episodes": 0, "loss": 0.0}
     log.info("device: %s actions=%d size=%d", DEVICE, actions, config.SIZE)
 
     log_dir = os.path.abspath("runs")
@@ -290,8 +304,10 @@ def main():
 
     stop_event.set()
     torch.save(net.state_dict(), checkpoint)
+    trainer.save_full()
     writer.close()
-    log.info("saved %s, total steps=%d", checkpoint, counter.get())
+    log.info("已保存（下次自动完整续训）。权重=%s 完整状态=%s，总步法=%d",
+             checkpoint, config.FULL_STATE, counter.get())
     pygame.quit()
 
 

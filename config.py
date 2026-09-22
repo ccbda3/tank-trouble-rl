@@ -19,4 +19,5 @@ ALPHA = 0.6
 BETA_START = 0.4
 BETA_FRAMES = 400000
 CHECKPOINT = "checkpoint.pth"
+FULL_STATE = "state_full.pth"
 LOG = "train.log"

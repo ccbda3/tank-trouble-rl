@@ -26,6 +26,17 @@ class Trainer:
             if p.grad is not None:
                 self.writer.add_histogram(f"{world}/{name}_grad", p.grad.detach().cpu(), step)
 
+    def save_full(self):
+        torch.save({
+            "net": self.net.state_dict(),
+            "target": self.target_net.state_dict(),
+            "opt": self.optimizer.state_dict(),
+            "steps": self.counter.get(),
+            "train_steps": self.train_steps,
+            "updates": self.updates,
+            "loss": self.loss,
+        }, self.config.FULL_STATE)
+
     def loop(self, stop_event):
         last_save = time.time()
         self.optimizer.zero_grad()
@@ -73,3 +84,4 @@ class Trainer:
                 if time.time() - last_save > self.config.CHECKPOINT_INTERVAL:
                     last_save = time.time()
                     torch.save(self.net.state_dict(), self.config.CHECKPOINT)
+                    self.save_full()

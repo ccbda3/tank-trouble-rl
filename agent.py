@@ -21,6 +21,10 @@ class Counter:
         with self.lock:
             return self.value
 
+    def set(self, value):
+        with self.lock:
+            self.value = value
+
 
 class Agent:
     def __init__(self, net, buffer, env, counter, config, stats):
