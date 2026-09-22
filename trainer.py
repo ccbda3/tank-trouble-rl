@@ -19,6 +19,7 @@ class Trainer:
 
     def loop(self, stop_event):
         last_save = time.time()
+        self.optimizer.zero_grad()
         while not stop_event.is_set():
             if len(self.buffer) < self.config.BATCH:
                 time.sleep(0.05)
@@ -39,17 +40,19 @@ class Trainer:
             loss = (w * torch.nn.functional.smooth_l1_loss(q, target, reduction="none")).mean()
             self.buffer.update_priorities(idxs, td.squeeze(1).cpu().tolist())
 
-            self.optimizer.zero_grad()
+            loss = loss / self.config.ACCUM
             loss.backward()
-            self.optimizer.step()
             self.train_steps += 1
             with self.stats["lock"]:
-                self.stats["loss"] = float(loss.item())
+                self.stats["loss"] = float(loss.item() * self.config.ACCUM)
 
-            if self.train_steps % self.config.TARGET_SYNC == 0:
-                self.target_net.load_state_dict(self.net.state_dict())
-            if self.train_steps % self.config.SAVE_EVERY == 0:
-                torch.save(self.net.state_dict(), self.config.CHECKPOINT)
-            if time.time() - last_save > self.config.CHECKPOINT_INTERVAL:
-                last_save = time.time()
-                torch.save(self.net.state_dict(), self.config.CHECKPOINT)
+            if self.train_steps % self.config.ACCUM == 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                if self.train_steps % self.config.TARGET_SYNC == 0:
+                    self.target_net.load_state_dict(self.net.state_dict())
+                if self.train_steps % self.config.SAVE_EVERY == 0:
+                    torch.save(self.net.state_dict(), self.config.CHECKPOINT)
+                if time.time() - last_save > self.config.CHECKPOINT_INTERVAL:
+                    last_save = time.time()
+                    torch.save(self.net.state_dict(), self.config.CHECKPOINT)

@@ -16,6 +16,21 @@ if not ctypes.windll.kernel32.GetModuleHandleW("msvcp140.dll"):
 
 import torch
 
+try:
+    import pynvml
+
+    _nvml_ok = pynvml.nvmlInit() == 0
+except Exception:
+    _nvml_ok = False
+
+if _nvml_ok:
+    try:
+        _gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    except Exception:
+        _gpu_handle = None
+else:
+    _gpu_handle = None
+
 import config
 import env
 import game
@@ -23,8 +38,6 @@ from agent import Agent, Counter
 from buffer import PrioritizedReplayBuffer
 from network import DQN, DEVICE
 from trainer import Trainer
-
-torch.set_num_threads(1)
 
 logging.basicConfig(
     filename=config.LOG,
@@ -46,6 +59,15 @@ def avg(stats):
 def max_score(stats):
     with stats["lock"]:
         return max(stats["recent"]) if stats["recent"] else 0
+
+
+def gpu_util():
+    if _gpu_handle is None:
+        return None
+    try:
+        return pynvml.nvmlDeviceGetUtilizationRates(_gpu_handle).gpu
+    except Exception:
+        return None
 
 
 def draw_game(screen, g, canvas, scale):
@@ -106,6 +128,7 @@ def draw(screen, fonts, g, stats, counter, agent, buffer, trainer, scale):
         ("打砖块 · DQN 强化学习", font_title, (255, 255, 255)),
         (f"后台智能体  {config.AGENTS} 个（共用一张网络）", font_small, (170, 200, 255)),
         (f"计算设备  {'CUDA (GPU)' if DEVICE.type == 'cuda' else 'CPU'}", font_small, (170, 200, 255)),
+        (f"训练吞吐  {counter.get():,} 步 / 有效批量 {config.BATCH * config.ACCUM:,}", font_small, (170, 200, 255)),
         (f"全局步数  {counter.get():,}", font, (230, 235, 245)),
         (f"探索率 ε  {agent.epsilon():.3f}", font, (230, 235, 245)),
         (f"经验池  {len(buffer):,} / {config.REPLAY_CAP:,}", font, (230, 235, 245)),
@@ -115,6 +138,11 @@ def draw(screen, fonts, g, stats, counter, agent, buffer, trainer, scale):
         (f"最高得分  {max_score(stats)}", font, (255, 220, 120)),
         (f"Loss  {trainer.loss:.4f}", font, (230, 235, 245)),
     ]
+
+    if DEVICE.type == "cuda":
+        u = gpu_util()
+        if u is not None:
+            lines.append((f"GPU 利用率  {u}%", font, (120, 255, 160)))
 
     y = 12
     for text, f, color in lines:
