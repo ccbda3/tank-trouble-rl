@@ -20,7 +20,7 @@ import config
 import env
 import game
 from agent import Agent, Counter
-from buffer import ReplayBuffer
+from buffer import PrioritizedReplayBuffer
 from network import DQN, DEVICE
 from trainer import Trainer
 
@@ -141,7 +141,7 @@ def main():
         except Exception as e:
             log.warning("load failed: %s", e)
 
-    buffer = ReplayBuffer(config.REPLAY_CAP)
+    buffer = PrioritizedReplayBuffer(config.REPLAY_CAP)
     optimizer = torch.optim.Adam(net.parameters(), lr=config.LR)
     counter = Counter()
     stats = {"lock": threading.Lock(), "recent": deque(maxlen=200), "episodes": 0, "loss": 0.0}
