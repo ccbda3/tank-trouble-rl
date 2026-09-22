@@ -226,6 +226,33 @@ class SnakeMonitor:
         with self.stats["lock"]:
             return max(self.stats["recent"]) if self.stats["recent"] else 0
 
+    def _eval_avg(self):
+        with self.stats["lock"]:
+            return self.stats["eval_avg"] if self.stats["eval_episodes"] else None
+
+    def _eval_best(self):
+        with self.stats["lock"]:
+            return self.stats["eval_best"] if self.stats["eval_episodes"] else None
+
+    def _eval_dist(self):
+        with self.stats["lock"]:
+            return list(self.stats["eval_all"])
+
+    def _eval_steps_per_apple(self):
+        with self.stats["lock"]:
+            steps = list(self.stats["eval_recent_steps"])
+            apples = list(self.stats["eval_recent"])
+        total = sum(apples)
+        if total <= 0:
+            return None
+        return sum(steps) / total
+
+    def _deaths(self):
+        with self.stats["lock"]:
+            d = dict(self.stats["deaths"])
+        names = {"self": "自撞", "wall": "撞墙", "超时": "到达步数上限"}
+        return [[names.get(k, k), v] for k, v in d.items()]
+
     def _params(self):
         net = self.net
         k1, k2, k3 = self._chans
@@ -236,13 +263,16 @@ class SnakeMonitor:
             {"title": "DQN 超参数", "rows": [
                 ["Double DQN", "<b>启用</b>"],
                 ["优先级经验池", "SumTree · α=%.2f" % config.ALPHA],
-                ["折扣因子 gamma", "%.3f" % config.GAMMA],
+                ["折扣因子 gamma", "%.3f（有效视野 %d 步）" % (config.GAMMA, int(1 / (1 - config.GAMMA)))],
+                ["奖励塑形", "势函数 Φ=%.1f×曼哈顿距离，策略不变形" % config.SHAPE],
+                ["死亡惩罚", "−(10 + 0.5×已吃苹果)"],
                 ["学习率 lr", "%.1e" % config.LR],
                 ["批大小 / 梯度累积", "%d / %d" % (config.BATCH, config.ACCUM)],
                 ["目标网络同步", "%d 步" % config.TARGET_SYNC],
                 ["经验池容量", "%d" % config.REPLAY_CAP],
                 ["探索率区间", "%.2f → %.2f" % (config.EPS_START, config.EPS_END)],
                 ["探索衰减更新数", "%d" % config.EPS_DECAY],
+                ["贪心评估", "每 %.0f 秒 %d 局（ε=0，不写入经验池）" % (config.EVAL_INTERVAL, config.EVAL_EPISODES)],
                 ["当前梯度更新", "%d" % self.trainer.train_steps],
             ]},
             {"title": "运行配置", "rows": [
@@ -269,8 +299,10 @@ class SnakeMonitor:
         mon.metric("steps", self.counter.get, label="总步数", fmt="int")
         mon.metric("eps", self.eps_fn, label="探索率 ε", fmt="f3", color="#8fb9ff")
         mon.metric("loss", lambda: self.stats["loss"], label="Loss", fmt="f4", color="#ff8f5a")
-        mon.metric("avg_score", self._avg, label="平均吃苹果", fmt="f2", color="#3ddc84")
-        mon.metric("best_score", self._best, label="最长蛇身", fmt="int", color="#ffd36a")
+        mon.metric("avg_score", self._avg, label="训练均值(带探索)", fmt="f2", color="#3ddc84")
+        mon.metric("best_score", self._best, label="训练最高(带探索)", fmt="int", color="#ffd36a")
+        mon.metric("eval_avg", self._eval_avg, label="贪心评估均值(无探索)", fmt="f2", color="#5fd0a0")
+        mon.metric("eval_best", self._eval_best, label="贪心评估最高", fmt="int", color="#9fe6bf")
         mon.metric("train_steps", lambda: self.trainer.train_steps, label="梯度更新", fmt="int")
         mon.metric("buffer", lambda: len(self.buffer), label="经验池", fmt="int")
         mon.metric("dps", self._dps, label="决策/秒", fmt="int", color="#7fd0e0")
@@ -286,6 +318,9 @@ class SnakeMonitor:
                    label="训练/采样比", unit="×", fmt="f2")
         mon.health("params", lambda: sum(p.numel() for p in self.net.parameters()),
                    label="可训练参数", fmt="int")
+        mon.health("gamma", lambda: config.GAMMA, label="折扣因子 γ", fmt="f3")
+        mon.health("eval_gap", self._eval_steps_per_apple, label="贪心每苹果步数", fmt="f1")
+        mon.health("eval_count", lambda: self.stats["eval_episodes"], label="已贪心评估局数", fmt="int")
 
         mon.graph(self._graph)
         mon.surface(lambda: self.probe.snapshot())
@@ -302,6 +337,8 @@ class SnakeMonitor:
             mon.histogram(key, (lambda k: (lambda: self._hist_values(k)))(key), label=label, bins=48)
 
         mon.bars("grad_norm", self._layer_grad_norm, label="逐层梯度范数（真实值）")
+        mon.bars("deaths", self._deaths, label="死亡原因（贪心评估累计）")
+        mon.histogram("eval_dist", self._eval_dist, label="贪心单局吃苹果数分布", bins=30, refresh=5.0)
         mon.table("layer_stats", self._layer_stats, label="逐层权重与梯度统计",
                   columns=["层", "参数名", "形状", "参数量", "权重均值", "权重标准差", "梯度范数"])
         mon.attach_logger(logging.getLogger("snake"), key="train_log", label="训练日志（实时镜像）")

@@ -30,7 +30,7 @@ except Exception:
 import config
 import env
 import snake
-from agent import Agent, Counter, EnvWorker
+from agent import Agent, Counter, EnvWorker, EvalWorker
 from buffer import PrioritizedReplayBuffer
 from network import DQN, DEVICE
 from snake_monitor import SnakeMonitor
@@ -100,7 +100,19 @@ def main():
     buffer = PrioritizedReplayBuffer(config.REPLAY_CAP, config.FRAME_STACK, config.GRID)
     optimizer = torch.optim.Adam(net.parameters(), lr=config.LR)
     counter = Counter()
-    stats = {"lock": threading.Lock(), "recent": deque(maxlen=200), "episodes": 0, "loss": 0.0}
+    stats = {
+        "lock": threading.Lock(),
+        "recent": deque(maxlen=200),
+        "episodes": 0,
+        "loss": 0.0,
+        "eval_recent": deque(maxlen=64),
+        "eval_recent_steps": deque(maxlen=64),
+        "eval_all": deque(maxlen=400),
+        "eval_avg": 0.0,
+        "eval_best": 0,
+        "eval_episodes": 0,
+        "deaths": {},
+    }
 
     resumed = False
     saved = {"train_steps": 0, "updates": 0}
@@ -166,11 +178,13 @@ def main():
             envs = [env.Env(config.GRID, config.FRAME_STACK) for _ in range(per_worker)]
             worker = EnvWorker(net, buffer, envs, counter, config, stats, trainer)
             threads.append(threading.Thread(target=worker.loop, args=(ev,), daemon=True))
+        threads.append(threading.Thread(
+            target=EvalWorker(net, config, stats).loop, args=(ev,), daemon=True))
         for t in threads:
             t.start()
         run["stop"] = ev
         run["threads"] = threads
-        log.info("训练已启动：%d 个采集线程 + 训练线程 + 曲面探针", config.WORKERS)
+        log.info("训练已启动：%d 个采集线程 + 训练线程 + 曲面探针 + 贪心评估", config.WORKERS)
         return True
 
     def stop_training(save=True):
