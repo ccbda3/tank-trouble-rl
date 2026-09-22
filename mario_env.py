@@ -11,13 +11,14 @@ JUMP_ACTIONS = {2, 4, 5}
 
 
 class MarioEnv:
-    def __init__(self, frames=4, size=84):
+    def __init__(self, frames=4, size=84, accel=4):
         self.gymenv = JoypadSpace(
             gym_super_mario_bros.make("SuperMarioBros-v0", apply_api_compatibility=True),
             SIMPLE_MOVEMENT,
         )
         self.frames = frames
         self.size = size
+        self.accel = accel
         self.history = deque(maxlen=frames)
         self.raw = None
         self._score = 0.0
@@ -72,6 +73,17 @@ class MarioEnv:
         return self._stack()
 
     def step(self, action):
+        total = 0.0
+        done = False
+        for _ in range(self.accel):
+            r, d = self._step1(action)
+            total += r
+            if d:
+                done = True
+                break
+        return self._stack(), total, done
+
+    def _step1(self, action):
         out = self.gymenv.step(action)
         if len(out) == 5:
             obs, reward_raw, terminated, truncated, info = out
@@ -115,4 +127,4 @@ class MarioEnv:
         self._prev_score = score
         self._prev_enemy = cur_enemy
         self.history.append(self._pre(self.raw))
-        return self._stack(), reward, done_
+        return reward, done_

@@ -172,7 +172,7 @@ def main():
     threading.Thread(target=trainer.loop, args=(stop_event,), daemon=True).start()
 
     for _ in range(config.AGENTS - 1):
-        ag = Agent(net, buffer, MarioEnv(config.FRAME_STACK, config.SIZE), counter, config, stats)
+        ag = Agent(net, buffer, MarioEnv(config.FRAME_STACK, config.SIZE, config.MARIO_ACCEL), counter, config, stats)
         threading.Thread(target=ag.loop, args=(stop_event,), daemon=True).start()
 
     pygame.init()
@@ -188,7 +188,7 @@ def main():
     font_small = pygame.font.SysFont("microsoftyahei", 13)
     fonts = (font_title, font, font_small)
 
-    r_env = MarioEnv(config.FRAME_STACK, config.SIZE)
+    r_env = MarioEnv(config.FRAME_STACK, config.SIZE, config.MARIO_ACCEL)
     r_agent = Agent(net, buffer, r_env, counter, config, stats)
 
     mon_port = [0]
