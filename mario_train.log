@@ -1,4 +1,5 @@
-08:58:24 loaded mario_checkpoint.pth
-08:58:25 device: cuda actions=7 size=96
-08:58:25 tensorboard: http://127.0.0.1:6006
-08:58:37 steps=9612 eps=0.997 buffer=9612 loss=0.9204 episodes=2 avg=672 best=678
+08:59:47 loaded mario_checkpoint.pth
+08:59:47 device: cuda actions=7 size=96
+08:59:47 tensorboard: http://127.0.0.1:6006
+09:00:00 steps=9469 eps=0.997 buffer=9469 loss=0.9067 episodes=6 avg=727 best=1500
+09:00:05 steps=12336 eps=0.996 buffer=12336 loss=1.0059 episodes=7 avg=724 best=1500

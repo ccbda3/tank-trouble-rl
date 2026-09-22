@@ -203,7 +203,7 @@ def main():
     font_small = pygame.font.SysFont("microsoftyahei", 13)
     fonts = (font_title, font, font_small)
 
-    r_env = MarioEnv(config.FRAME_STACK, config.SIZE, config.MARIO_ACCEL)
+    r_env = MarioEnv(config.FRAME_STACK, config.SIZE, 1)
     r_agent = Agent(net, buffer, r_env, counter, config, stats)
     s = r_env.reset()
     state = {"running": True}
