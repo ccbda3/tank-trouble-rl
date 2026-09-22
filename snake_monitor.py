@@ -1,3 +1,4 @@
+import logging
 import time
 
 import numpy as np
@@ -59,6 +60,7 @@ class SnakeMonitor:
         self._hists = {"t": 0.0, "v": []}
         self._rate = {"steps": None, "t": None, "v": 0.0}
         self._gs = {"t": 0.0, "v": (0.0, 0.0, 0.0)}
+        self._gn = {"t": 0.0, "v": []}
         self._maps = None
 
         zero = np.zeros((config.FRAME_STACK, config.GRID, config.GRID), np.uint8)
@@ -149,6 +151,35 @@ class SnakeMonitor:
                 g_max = m
         self._gs = {"t": now, "v": (g_sq ** 0.5, w_sq ** 0.5, g_max)}
         return self._gs["v"]
+
+    def _layer_grad_norm(self):
+        now = time.time()
+        if self._gn["v"] and now - self._gn["t"] < 2.0:
+            return self._gn["v"]
+        out = []
+        for name, g in self.trainer.grad_snapshot.items():
+            gf = g.float()
+            out.append([name, float(torch.sqrt(torch.sum(gf * gf)))])
+        self._gn = {"t": now, "v": out}
+        return out
+
+    def _layer_stats(self):
+        wsnap = self.trainer.weight_snapshot
+        gsnap = self.trainer.grad_snapshot
+        rows = []
+        for name, w in wsnap.items():
+            wf = w.float()
+            g = gsnap.get(name)
+            rows.append([
+                ".".join(name.split(".")[:2]),
+                name,
+                "×".join(str(int(s)) for s in tuple(w.shape)),
+                int(w.numel()),
+                float(wf.mean()),
+                float(wf.std()) if wf.numel() > 1 else 0.0,
+                float(torch.sqrt(torch.sum(g.float() * g.float()))) if g is not None else 0.0,
+            ])
+        return rows
 
     def _graph(self):
         obs = self.r_env._stack()
@@ -269,6 +300,11 @@ class SnakeMonitor:
 
         for key, label in self._hist_regs:
             mon.histogram(key, (lambda k: (lambda: self._hist_values(k)))(key), label=label, bins=48)
+
+        mon.bars("grad_norm", self._layer_grad_norm, label="逐层梯度范数（真实值）")
+        mon.table("layer_stats", self._layer_stats, label="逐层权重与梯度统计",
+                  columns=["层", "参数名", "形状", "参数量", "权重均值", "权重标准差", "梯度范数"])
+        mon.attach_logger(logging.getLogger("snake"), key="train_log", label="训练日志（实时镜像）")
 
         mon.params(self._params)
         mon.control(start=self.start_fn, stop=self.stop_fn)

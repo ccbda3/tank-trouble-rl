@@ -15,7 +15,14 @@
 | 真实图片 | 网络输入输出按原始像素显示 |
 | 权重/梯度直方图 | 每个张量的**完整**分布（800 万个数也是全量统计），用于判断梯度消失/爆炸 |
 | 损失曲面 3D | 在参数空间沿两个固定随机方向扰动采样，高度是**实测**损失，叠加真实优化器轨迹 |
+| 指标明细表 | 任意表格：每类精确率/召回率/F1、top-k 预测、数据集统计，全量数值不四舍五入 |
+| 矩阵热力图 | 混淆矩阵、注意力权重、相关性矩阵；颜色按真实值映射，悬停读单格 |
+| 散点投影 | 嵌入降维（PCA/t-SNE）、预测-真值分布、PR 曲线，按类别着色 + 图例 |
+| 对比条图 | 逐层梯度范数、各类准确率、任意分组对比，自动按绝对值排序 |
+| 训练日志 | 实时日志流，`attach_logger()` 一行把 `logging` 接进来（自动标红 ERROR / 标黄 WARN） |
 | 训练控制 | 网页上直接"启动训练 / 结束训练并保存" |
+
+面板是**注册制**的：注册了就显示，没注册的区块自动隐藏。所以同一套前端既能当强化学习面板，也能当分类/NLP/检测的训练面板。
 
 ## 目录结构
 
@@ -28,6 +35,8 @@ aimonitor/              监控系统（可复用包）
     index.html
     style.css
     app.js
+examples/
+  classify_demo.py      示例：图像分类（混淆矩阵 / 每类指标 / 特征投影 / 梯度范数 / 日志）
 snake_monitor.py        示例：把贪吃蛇 DQN 项目接入 SDK
 main.pyw                示例：训练主程序
 config.py / network.py / env.py / snake.py / agent.py / buffer.py / trainer.py
@@ -37,10 +46,14 @@ config.py / network.py / env.py / snake.py / agent.py / buffer.py / trainer.py
 
 ```bash
 pip install numpy torch        # 另外需要 pygame（仅示例游戏窗口用）
-pythonw main.pyw               # 无控制台启动（Windows）
+
+python examples/classify_demo.py   # 例1：分类任务，端口 8080
+pythonw main.pyw                   # 例2：贪吃蛇 DQN，端口 80（无控制台启动）
 ```
 
-浏览器打开 <http://127.0.0.1:80>。
+浏览器打开 <http://127.0.0.1:8080> 或 <http://127.0.0.1:80>。
+
+示例里的数据、模型、张量全部现场真实计算（合成数据现场生成、每个数字现场前向），不是录制的假数据。
 
 端口在 `config.py` 的 `MONITOR_PORT` 里改；被占用时会自动顺延并在启动日志里写出实际端口。
 
@@ -98,9 +111,43 @@ mon.params(lambda: [{"title": "结构", "layers": [...], "rows": [["设备", "CU
 # 10) 网页上的启停按钮（可选）
 mon.control(start=start_training, stop=stop_training)
 
+# 11) 表格：每类精确率/召回率/F1（返回行列表，或 {"columns": [...], "rows": [...]}）
+mon.table("report", lambda: [["cat", 0.91, 120], ["dog", 0.88, 96]],
+          label="每类指标", columns=["类别", "精确率", "样本数"])
+
+# 12) 矩阵热力图：混淆矩阵 / 注意力 / 相关性（xlabels、ylabels 可传列表，也可传函数）
+mon.matrix("confusion", lambda: confusion_matrix(y_true, y_pred, labels=range(10)),
+           label="混淆矩阵（行=真实 列=预测）", xlabels=class_names, ylabels=class_names, fmt="int")
+
+# 13) 散点：嵌入投影（点 = [x, y, 类别]，类别可以是字符串）
+mon.scatter("emb", lambda: [[float(p[0]), float(p[1]), CLASSES[int(y[i])]]
+                            for i, p in enumerate(project(features))],
+            label="倒数第二层特征 PCA 投影", xlabel="主成分 1", ylabel="主成分 2")
+
+# 14) 对比条图：逐层梯度范数（判断梯度消失/爆炸）
+mon.bars("grad_norm", lambda: [[n, float(p.grad.norm())] for n, p in model.named_parameters()],
+         label="逐层梯度范数")
+
+# 15) 日志流：一行接管 logging（返回的 LogBuffer 也可以自己 write）
+buf = mon.attach_logger(logger, key="train_log", label="训练日志", limit=400)
+buf.write("这一行会出现在网页上")
+
 port = mon.start()
 print("监控面板 http://127.0.0.1:%d" % port)
 ```
+
+## 其他 AI 领域怎么用
+
+同一套面板换几个注册项就是另一种训练监控，参考 [classify_demo.py](examples/classify_demo.py)：
+
+| 领域 | 组合 |
+|---|---|
+| 图像分类 | `matrix` 混淆矩阵 + `table` 每类 P/R/F1 + `scatter` 特征 PCA 投影 + `bars` 逐层梯度范数 + `image` 决策边界 |
+| 目标检测 / 分割 | `image` 原图叠预测框 + `table` 每类 AP + `scatter` PR 曲线（点 = [recall, precision]）+ `log` |
+| NLP / Transformer | `matrix` 注意力矩阵（`cmap="viridis"`）+ `table` top-k 预测 + `scatter` token 嵌入投影 + `log` 生成样例 |
+| LLM 预训练 | `metric` loss/lr/吞吐 + `log` 实时日志 + `bars` 各层梯度范数 + `histogram` 权重分布 |
+| 表格 / 回归 | `scatter` 预测值-真值散点 + `bars` 特征重要度 + `matrix` 特征相关性（自动用发散色图） |
+| 强化学习 | 见 [snake_monitor.py](snake_monitor.py)：奖励曲线 + 损失曲面 + 神经元全量图 + 逐层梯度 |
 
 ## SDK API
 
@@ -112,6 +159,12 @@ print("监控面板 http://127.0.0.1:%d" % port)
 | `health(key, fn, label, unit, fmt)` | 健康度卡片 |
 | `image(key, fn, label, cmap, scale, group)` | 真实图片；`cmap` 为空按灰度/原色，`group` 决定归到"特征图"还是"图片" |
 | `histogram(key, fn, label, bins, refresh)` | 直方图；`refresh` 是重算间隔秒（大张量建议 ≥5） |
+| `table(key, fn, label, columns)` | 表格；`fn()` 返回行列表 `[[...], ...]` 或 `{"columns": [...], "rows": [...]}`，行不足自动补空 |
+| `matrix(key, fn, label, cmap, xlabels, ylabels, fmt, refresh)` | 二维矩阵热力图；`fn()` 返回 2D 数组（numpy/list 均可）。`cmap` 为空时含负数自动用发散色图 |
+| `scatter(key, fn, label, xlabel, ylabel)` | 散点图；`fn()` 返回 `[[x, y, 类别], ...]` 或 `{"groups": [...], "points": [...]}`，上限 4 万点 |
+| `bars(key, fn, label)` | 条图；`fn()` 返回 `[[标签, 数值], ...]` / `[数值, ...]` / `[{"label":.., "value":..}, ...]` |
+| `log(key, fn, label, limit)` | 日志流；`fn()` 返回字符串列表或 `LogBuffer.get()` |
+| `attach_logger(logger, key, label, level, limit)` | 把某个 `logging.Logger` 的输出实时镜像到网页，返回可继续 `write()` 的 `LogBuffer` |
 | `graph(fn)` | 返回 `{"layers": [...], "edges": [...]}`；`edges[i]` 形状必须是 `(目标层节点数, 源层节点数)` |
 | `surface(fn)` | 损失曲面数据 |
 | `params(fn)` | 底部参数表，返回 `[{"title": ..., "layers": [...], "rows": [[键, 值]]}]` |
@@ -121,7 +174,9 @@ print("监控面板 http://127.0.0.1:%d" % port)
 
 `fmt` 可选：`auto` / `int` / `f1`~`f6` / `pct` / `sci`。
 
-辅助函数：`montage(maps, cols, pad)` 铺图、`normalize(a, lo, hi)` 归一化、`colormap(u8, name)` 上色（内置 viridis / magma / blue / red / diverging / gray）、`encode_png(arr)` 无依赖编码 PNG。
+辅助函数：`montage(maps, cols, pad)` 铺图、`normalize(a, lo, hi)` 归一化、`colormap(u8, name)` 上色（内置 viridis / magma / blue / red / diverging / gray）、`encode_png(arr)` 无依赖编码 PNG、`LogBuffer(capacity)` 环形日志缓冲。
+
+约定：`key` 相同的面板会被视为同一个；所有 `fn` 都在采样线程里调用，异常会被吞掉（页面保持上一帧），不影响训练。
 
 ## 数据协议
 
@@ -138,6 +193,13 @@ print("监控面板 http://127.0.0.1:%d" % port)
   "health":    [{"key":"grad_norm","label":"梯度范数","value":0.19,"unit":"","fmt":"sci"}],
   "images":    [{"key":"input","label":"输入","png":"data:image/png;base64,...","w":32,"h":32,"scale":6,"group":"图片","lo":0,"hi":255}],
   "histograms":[{"key":"fc.weight","label":"fc.weight 权重","counts":[...],"edges":[...],"min":-0.1,"max":0.1,"mean":0.0,"std":0.02,"n":8388608}],
+  "tables":    [{"key":"report","label":"每类指标","columns":["类别","精确率"],"rows":[["cat",0.91]],"n":1}],
+  "matrices":  [{"key":"cm","label":"混淆矩阵","h":10,"w":10,"data":[[205,37],[51,186]],"min":2,"max":208,
+                 "xlabels":["cat","dog"],"ylabels":["cat","dog"],"cmap":null,"fmt":"int"}],
+  "scatters":  [{"key":"emb","label":"特征投影","xlabel":"主成分 1","ylabel":"主成分 2",
+                 "points":[[2.02,-0.36,0]],"groups":["螺旋 A","螺旋 B"],"n":1}],
+  "bars":      [{"key":"grad","label":"逐层梯度范数","bars":[{"label":"body.0.weight","value":0.42}],"n":1}],
+  "logs":      [{"key":"train_log","label":"训练日志","lines":[{"i":10,"t":1712345678.1,"text":"step 100 loss 0.8"}],"n":1}],
   "surface":   {"ready":1,"res":15,"ext":0.05,"zmin":0.3,"zmax":0.6,"values":[...],"path":[{"a":..,"b":..,"z":..}]},
   "params":    [{"title":"网络结构","layers":[{"name":"FC","detail":"512","params":8389120,"realCount":512}],"rows":[["设备","CUDA"]]}],
   "graph":     {"version": 3790918552, "summary": "680 神经元 / 41088 连线"},

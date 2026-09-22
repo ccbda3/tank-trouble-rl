@@ -208,6 +208,8 @@ function renderImages(d) {
   el("images").innerHTML = block(groups["图片"] || []) || '<div class="imgbox"><div class="it"><em>无图片数据</em></div></div>';
   setT("featSub", fInt((groups["特征图"] || []).length) + " 张特征图拼图");
   setT("imgSub", fInt((groups["图片"] || []).length) + " 张图片");
+  setSec("secFeature", (groups["特征图"] || []).length > 0);
+  setSec("secImages", (groups["图片"] || []).length > 0);
 }
 
 function renderHists(d) {
@@ -224,6 +226,7 @@ function renderHists(d) {
     drawHist(boxes[i].querySelector("canvas"), hs[i]);
   }
   setT("histSub", fInt(hs.length) + " 个张量");
+  setSec("secHist", hs.length > 0);
 }
 
 function drawHist(cv, h) {
@@ -266,8 +269,337 @@ function drawHist(cv, h) {
   ctx.fillText(fSmart(h.max), w - 2, hh - 2);
 }
 
+function setSec(id, on) {
+  var e = el(id);
+  if (e) e.className = on ? "card" : "card off";
+}
+
+function tsShort(t) {
+  var n = Number(t);
+  if (!isFinite(n) || n <= 0) return "";
+  var d = new Date(n * 1000);
+  function p(x) { return (x < 10 ? "0" : "") + x; }
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function renderTables(d) {
+  var ts = d.tables || [], h = "", i;
+  for (i = 0; i < ts.length; i++) {
+    var t = ts[i], cols = t.columns || [], rows = t.rows || [];
+    var show = rows.slice(0, 300);
+    h += '<div class="tbx"><div class="tbt">' + esc(t.label) + '<em>' + fInt(t.n) + ' 行</em></div><div class="tbw"><table><thead><tr>';
+    for (var c = 0; c < cols.length; c++) h += '<th>' + esc(cols[c]) + '</th>';
+    h += '</tr></thead><tbody>';
+    for (var r = 0; r < show.length; r++) {
+      h += '<tr>';
+      for (var c2 = 0; c2 < show[r].length; c2++) {
+        var v = show[r][c2];
+        if (typeof v === "number") h += '<td class="num">' + fSmart(v) + '</td>';
+        else h += '<td>' + esc(v) + '</td>';
+      }
+      h += '</tr>';
+    }
+    h += '</tbody></table></div>';
+    if (rows.length > show.length) h += '<div class="tbf">仅显示前 ' + fInt(show.length) + ' 行，共 ' + fInt(t.n) + ' 行</div>';
+    h += '</div>';
+  }
+  el("tables").innerHTML = h;
+  setT("tableSub", ts.length ? fInt(ts.length) + " 张表" : "未注册表格");
+  setSec("secTable", ts.length > 0);
+}
+
+var CMAPS = {
+  viridis: [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]],
+  magma: [[0, 0, 4], [81, 18, 124], [183, 55, 121], [252, 137, 97], [252, 253, 191]],
+  blue: [[16, 30, 42], [47, 111, 151], [140, 224, 250]],
+  red: [[20, 8, 8], [140, 40, 30], [255, 210, 120]],
+  diverging: [[40, 90, 200], [30, 32, 40], [220, 70, 60]],
+  gray: [[0, 0, 0], [255, 255, 255]]
+};
+
+function cmapRGB(name, t) {
+  var pts = CMAPS[name] || CMAPS.viridis;
+  t = Math.max(0, Math.min(1, t));
+  var x = t * (pts.length - 1);
+  var i = Math.min(Math.floor(x), pts.length - 2);
+  var f = x - i, a = pts[i], b = pts[i + 1];
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * f),
+    Math.round(a[1] + (b[1] - a[1]) * f),
+    Math.round(a[2] + (b[2] - a[2]) * f)
+  ];
+}
+
+function renderMatrices(d) {
+  var ms = d.matrices || [], host = el("matrices"), h = "", i;
+  setT("matrixSub", ms.length ? fInt(ms.length) + " 个矩阵" : "未注册矩阵");
+  setSec("secMatrix", ms.length > 0);
+  for (i = 0; i < ms.length; i++) {
+    h += '<div class="mat"><div class="matt">' + esc(ms[i].label) + '<em>' + ms[i].h + ' × ' + ms[i].w
+      + ' · 值域 ' + fSmart(ms[i].min) + ' ~ ' + fSmart(ms[i].max) + '</em></div>'
+      + '<canvas class="matcv" data-i="' + i + '"></canvas>'
+      + '<div class="mhint" data-i="' + i + '">悬停查看单格数值</div></div>';
+  }
+  host.innerHTML = h;
+  var cvs = host.querySelectorAll(".matcv");
+  for (i = 0; i < cvs.length && i < ms.length; i++) drawMatrix(cvs[i], ms[i]);
+}
+
+function drawMatrix(cv, m) {
+  var data = m.data || [];
+  if (!data.length) return;
+  var rows = data.length, cols = data[0].length;
+  var yl = m.ylabels || null, xl = m.xlabels || null;
+  var yw = 0, i, F = 9;
+  if (yl) {
+    for (i = 0; i < yl.length; i++) yw = Math.max(yw, textW(yl[i], F));
+    yw = Math.min(yw + 6, 92);
+  }
+  if (cv.style.width !== "100%") cv.style.width = "100%";
+  var w = cv.clientWidth | 0;
+  if (w < 60) return;
+  var avail = w - yw - 2;
+  var cell = Math.max(3, Math.min(48, avail / cols));
+  var cw = cell * cols;
+  var showX = (xl && cell >= 13);
+  var xh = showX ? 22 : 4;
+  var hh = cell * rows + xh + 2;
+  var vw = yw + cw + 2;
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  var nw = Math.round(vw * dpr), nh = Math.round(hh * dpr);
+  if (cv.width !== nw || cv.height !== nh) { cv.width = nw; cv.height = nh; }
+  if (cv.style.width !== vw + "px") cv.style.width = vw + "px";
+  if (cv.style.height !== hh + "px") cv.style.height = hh + "px";
+  var ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.font = '9px "Microsoft YaHei UI","Segoe UI",sans-serif';
+  ctx.clearRect(0, 0, yw + cw + 2, hh);
+  var lo = m.min, hi = m.max;
+  var div = (m.cmap === "diverging") || (!m.cmap && lo < 0 && hi > 0);
+  if (div) {
+    var a = Math.max(Math.abs(lo), Math.abs(hi)) || 1;
+    lo = -a; hi = a;
+  }
+  var name = m.cmap || (div ? "diverging" : "viridis");
+  var span = (hi - lo) || 1;
+  for (var r = 0; r < rows; r++) {
+    for (var c = 0; c < cols; c++) {
+      var v = Number(data[r][c]);
+      if (!isFinite(v)) v = 0;
+      var t = (v - lo) / span;
+      var rgb = cmapRGB(name, t);
+      ctx.fillStyle = "rgb(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + ")";
+      ctx.fillRect(yw + c * cell, r * cell, Math.ceil(cell) + 0.4, Math.ceil(cell) + 0.4);
+      if (cell >= 23) {
+        var lum = (rgb[0] * 0.299 + rgb[1] * 0.587 + rgb[2] * 0.114) / 255;
+        ctx.fillStyle = lum > 0.6 ? "rgba(10,14,18,.85)" : "rgba(240,246,252,.88)";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(fmt(m.fmt || "f3", v), yw + c * cell + cell / 2, r * cell + cell / 2 + 0.5);
+      }
+    }
+  }
+  ctx.textBaseline = "middle";
+  if (yw > 0) {
+    ctx.fillStyle = "#8b95a3";
+    ctx.textAlign = "right";
+    for (r = 0; r < rows && r < yl.length; r++) {
+      if (cell >= 11) ctx.fillText(clipText(yl[r], yw - 6, F), yw - 4, r * cell + cell / 2 + 0.5);
+    }
+  }
+  if (showX) {
+    ctx.fillStyle = "#8b95a3";
+    ctx.textAlign = "center";
+    for (c = 0; c < cols && c < xl.length; c++) {
+      var tx = yw + c * cell + cell / 2;
+      if (cell >= 20 && xl.length <= 24) {
+        ctx.fillText(clipText(xl[c], cell + 8, F), tx, cell * rows + 11);
+      } else {
+        ctx.save();
+        ctx.translate(tx, cell * rows + 3);
+        ctx.rotate(-Math.PI / 4);
+        ctx.textAlign = "right";
+        ctx.fillText(clipText(xl[c], 60, F), 0, 0);
+        ctx.restore();
+      }
+    }
+  }
+  cv.__mat = { m: m, yw: yw, cell: cell, rows: rows, cols: cols };
+}
+
+function textW(s, px) {
+  return String(s).length * px * 0.56;
+}
+
+function clipText(s, maxw, px) {
+  var n = Math.max(1, Math.floor(maxw / (px * 0.56)));
+  s = String(s);
+  return s.length > n ? s.slice(0, Math.max(1, n - 1)) + "…" : s;
+}
+
+function bindMatrixHover() {
+  var host = el("matrices");
+  if (!host || host.__bound) return;
+  host.__bound = true;
+  host.addEventListener("mousemove", function (ev) {
+    var cv = ev.target;
+    if (!cv || !cv.__mat) return;
+    var m = cv.__mat, rect = cv.getBoundingClientRect();
+    var x = ev.clientX - rect.left - m.yw, y = ev.clientY - rect.top;
+    var hint = host.querySelector('.mhint[data-i="' + cv.getAttribute("data-i") + '"]');
+    if (!hint) return;
+    var c = Math.floor(x / m.cell), r = Math.floor(y / m.cell);
+    if (x < 0 || y < 0 || c < 0 || r < 0 || c >= m.cols || r >= m.rows) {
+      hint.textContent = "悬停查看单格数值";
+      return;
+    }
+    var mt = m.m, rl = (mt.ylabels && mt.ylabels[r]) || ("行 " + r);
+    var cl = (mt.xlabels && mt.xlabels[c]) || ("列 " + c);
+    hint.innerHTML = "行 <b>" + esc(rl) + "</b> · 列 <b>" + esc(cl) + "</b> = <b>"
+      + fmt(mt.fmt || "f3", mt.data[r][c]) + "</b>";
+  });
+  host.addEventListener("mouseleave", function () {
+    var hs = host.querySelectorAll(".mhint");
+    for (var i = 0; i < hs.length; i++) hs[i].textContent = "悬停查看单格数值";
+  });
+}
+
+function renderScatters(d) {
+  var ss = d.scatters || [], host = el("scatters"), h = "", i;
+  setT("scatterSub", ss.length ? fInt(ss.length) + " 组投影" : "未注册散点");
+  setSec("secScatter", ss.length > 0);
+  for (i = 0; i < ss.length; i++) {
+    var s = ss[i], leg = "";
+    for (var g = 0; g < s.groups.length; g++) {
+      leg += '<span><i style="background:' + pickColor(s.key + ":" + g, g) + '"></i>' + esc(s.groups[g]) + '</span>';
+    }
+    h += '<div class="scx"><div class="sct">' + esc(s.label) + '<em>' + fInt(s.n) + ' 点 · '
+      + esc(s.xlabel) + ' / ' + esc(s.ylabel) + '</em></div>'
+      + '<canvas class="sccv" data-i="' + i + '"></canvas>'
+      + '<div class="sclegend">' + leg + '</div></div>';
+  }
+  host.innerHTML = h;
+  var cvs = host.querySelectorAll(".sccv");
+  for (i = 0; i < cvs.length && i < ss.length; i++) drawScatter(cvs[i], ss[i]);
+}
+
+function drawScatter(cv, s) {
+  var pts = s.points || [];
+  if (!pts.length) return;
+  var w = cv.clientWidth | 0, h = cv.clientHeight | 0;
+  if (w < 40 || h < 40) return;
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  var nw = Math.round(w * dpr), nh = Math.round(h * dpr);
+  if (cv.width !== nw || cv.height !== nh) { cv.width = nw; cv.height = nh; }
+  var ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  var L = 34, R = w - 8, T = 8, B = h - 18, i;
+  var x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (i = 0; i < pts.length; i++) {
+    var p = pts[i];
+    if (p[0] < x0) x0 = p[0];
+    if (p[0] > x1) x1 = p[0];
+    if (p[1] < y0) y0 = p[1];
+    if (p[1] > y1) y1 = p[1];
+  }
+  if (x1 - x0 < 1e-12) { x0 -= 0.5; x1 += 0.5; }
+  if (y1 - y0 < 1e-12) { y0 -= 0.5; y1 += 0.5; }
+  var px = (v) => L + (v - x0) / (x1 - x0) * (R - L);
+  var py = (v) => B - (v - y0) / (y1 - y0) * (B - T);
+  ctx.strokeStyle = "rgba(255,255,255,.055)";
+  ctx.lineWidth = 1;
+  for (i = 0; i <= 4; i++) {
+    var gy = T + (B - T) * i / 4, gx = L + (R - L) * i / 4;
+    ctx.beginPath(); ctx.moveTo(L, Math.round(gy) + .5); ctx.lineTo(R, Math.round(gy) + .5); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(Math.round(gx) + .5, T); ctx.lineTo(Math.round(gx) + .5, B); ctx.stroke();
+  }
+  ctx.fillStyle = "#66707d";
+  ctx.font = '9px "Microsoft YaHei UI","Segoe UI",sans-serif';
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  ctx.fillText(fSmart(y1), L - 4, T + 4);
+  ctx.fillText(fSmart(y0), L - 4, B - 4);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillText(fSmart(x0), L, B + 4);
+  ctx.fillText(fSmart(x1), R, B + 4);
+  var stride = pts.length > 20000 ? Math.ceil(pts.length / 20000) : 1;
+  for (i = 0; i < pts.length; i += stride) {
+    var q = pts[i];
+    ctx.beginPath();
+    ctx.arc(px(q[0]), py(q[1]), 1.8, 0, Math.PI * 2);
+    ctx.fillStyle = pickColor(s.key + ":" + q[2], q[2]);
+    ctx.globalAlpha = stride > 1 ? 0.45 : 0.8;
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function renderBars(d) {
+  var bs = d.bars || [], h = "", i, j;
+  for (i = 0; i < bs.length; i++) {
+    var b = bs[i], list = b.bars.slice();
+    list.sort(function (x, y) { return Math.abs(y.value) - Math.abs(x.value); });
+    var mx = 0;
+    for (j = 0; j < list.length; j++) mx = Math.max(mx, Math.abs(list[j].value));
+    mx = mx || 1;
+    h += '<div class="barx"><div class="bart">' + esc(b.label) + '<em>' + fInt(b.n) + ' 项 · 最大 '
+      + fSmart(mx) + '</em></div>';
+    for (j = 0; j < list.length; j++) {
+      var v = Number(list[j].value), pct = Math.abs(v) / mx * 50;
+      var neg = v < 0;
+      h += '<div class="brow"><span class="brl" title="' + esc(list[j].label) + '">' + esc(list[j].label) + '</span>'
+        + '<span class="brt"><i style="width:' + pct.toFixed(2) + '%;' + (neg ? 'left:' + (50 - pct).toFixed(2) + '%;' : '')
+        + 'background:' + (neg ? "#c9924f" : "#5f9fd6") + '"></i></span>'
+        + '<span class="brv">' + fSmart(v) + '</span></div>';
+    }
+    h += '</div>';
+  }
+  el("bars").innerHTML = h;
+  setT("barSub", bs.length ? fInt(bs.length) + " 组条图" : "未注册条图");
+  setSec("secBar", bs.length > 0);
+}
+
+var LOGSCROLL = {};
+
+function renderLogs(d) {
+  var ls = d.logs || [], host = el("logs"), h = "", i, j;
+  var wraps = host.querySelectorAll(".lgw");
+  for (i = 0; i < wraps.length; i++) {
+    LOGSCROLL[i] = {
+      top: wraps[i].scrollTop,
+      follow: wraps[i].scrollHeight - wraps[i].clientHeight - wraps[i].scrollTop < 24
+    };
+  }
+  for (i = 0; i < ls.length; i++) {
+    var g = ls[i];
+    h += '<div class="lgx"><div class="lgt">' + esc(g.label) + '<em>最新 ' + fInt(g.n) + ' 行</em></div><div class="lgw">';
+    for (j = 0; j < g.lines.length; j++) {
+      var ln = g.lines[j], txt = ln.text || "";
+      var cls = /error|错误|异常|traceback|failed/i.test(txt) ? "er"
+        : (/warn|警告|warnning/i.test(txt) ? "wn" : "");
+      h += '<div class="lgl ' + cls + '"><span class="lgi">' + fInt(ln.i) + '</span>'
+        + '<span class="lgtm">' + tsShort(ln.t) + '</span>'
+        + '<span class="lgtx">' + esc(txt) + '</span></div>';
+    }
+    h += '</div></div>';
+  }
+  host.innerHTML = h;
+  wraps = host.querySelectorAll(".lgw");
+  for (i = 0; i < wraps.length; i++) {
+    var st = LOGSCROLL[i];
+    if (!st || st.follow) wraps[i].scrollTop = wraps[i].scrollHeight;
+    else wraps[i].scrollTop = st.top;
+    LOGSCROLL[i] = { top: wraps[i].scrollTop, follow: !st || st.follow };
+  }
+  setT("logSub", ls.length ? fInt(ls.length) + " 路日志流" : "未注册日志");
+  setSec("secLog", ls.length > 0);
+}
+
 function renderParams(d) {
   var p = d.params;
+  setSec("secParams", !!p);
   if (!p) { el("panels").innerHTML = '<div class="pnl"><div class="pnlh">参数</div><div class="row"><span class="rk">状态</span><span class="rv">暂无</span></div></div>'; return; }
   var h = "";
   for (var i = 0; i < p.length; i++) {
@@ -1015,6 +1347,7 @@ function renderSurface(d) {
   } else {
     setT("gdSub", "等待首次测量…");
   }
+  setSec("secSurface", !!GD.land);
   requestGD();
 }
 
@@ -1062,6 +1395,11 @@ function poll() {
       renderHealth(d);
       renderImages(d);
       renderHists(d);
+      renderTables(d);
+      renderMatrices(d);
+      renderScatters(d);
+      renderBars(d);
+      renderLogs(d);
       renderParams(d);
       renderSurface(d);
       var gv = d.graph ? d.graph.version : 0;
@@ -1074,6 +1412,7 @@ function poll() {
     })
     .then(function () {
       prepNet();
+      setSec("secNet", !!(GRAPH && (GRAPH.layers || []).length >= 2));
       if (GRAPH) {
         setT("netSub", "神经元 " + fInt(GRAPH.totalNodes) + " 个（全部显示）· 连线已绘 "
           + fInt(NET.pick.length) + " / 共 " + fInt(GRAPH.totalEdges) + " 条");
@@ -1094,11 +1433,15 @@ function init() {
   GD.ctx = GD.cv.getContext("2d");
   bindNet();
   bindGD();
+  bindMatrixHover();
   setNetMode("3d");
   var bs = el("h-start"), bt = el("h-stop");
   if (bs) bs.addEventListener("click", function () { ctlSend("start"); });
   if (bt) bt.addEventListener("click", function () { ctlSend("stop"); });
-  window.addEventListener("resize", function () { requestNet(); requestGD(); });
+  window.addEventListener("resize", function () {
+    requestNet(); requestGD();
+    if (STATE) { renderMatrices(STATE); renderScatters(STATE); }
+  });
   drawGD();
   poll();
 }

@@ -67,6 +67,26 @@
 <span><i style="background:#3ddc84"></i>绿点 = 当前权重位置</span>
 </div>
 </section>
+<section class="card off" id="secTable">
+<div class="chead"><span class="ctitle">指标明细表</span><span class="csub" id="tableSub">等待数据…</span><span class="chint">内容来自 monitor.table() 注册的真实计算值</span></div>
+<div class="tables" id="tables"></div>
+</section>
+<section class="card off" id="secMatrix">
+<div class="chead"><span class="ctitle">矩阵热力图</span><span class="csub" id="matrixSub">等待数据…</span><span class="chint">混淆矩阵 / 注意力 / 相关性矩阵，颜色与数值都是真实值 · 鼠标悬停读单格</span></div>
+<div class="matgrid" id="matrices"></div>
+</section>
+<section class="card off" id="secScatter">
+<div class="chead"><span class="ctitle">散点投影</span><span class="csub" id="scatterSub">等待数据…</span><span class="chint">嵌入降维 / 预测-真值分布，坐标为你提供的真实数值</span></div>
+<div class="scgrid" id="scatters"></div>
+</section>
+<section class="card off" id="secBar">
+<div class="chead"><span class="ctitle">对比条图</span><span class="csub" id="barSub">等待数据…</span><span class="chint">逐层梯度范数 / 各类准确率 / 任意分组对比</span></div>
+<div class="bargrid" id="bars"></div>
+</section>
+<section class="card off" id="secLog">
+<div class="chead"><span class="ctitle">训练日志</span><span class="csub" id="logSub">等待数据…</span><span class="chint">实时日志流 · monitor.attach_logger() 可把 logging 直接接进来</span></div>
+<div class="loggrid" id="logs"></div>
+</section>
 <section class="card" id="secParams">
 <div class="chead"><span class="ctitle">详细参数</span><span class="csub" id="paramSub">等待数据…</span></div>
 <div class="panels" id="panels"></div>

@@ -1,5 +1,7 @@
+import collections
 import hashlib
 import json
+import logging
 import math
 import threading
 import time
@@ -14,6 +16,10 @@ def _safe(fn, default=None):
         return fn()
     except Exception:
         return default
+
+
+def _resolve(v):
+    return _safe(v) if callable(v) else v
 
 
 def json_default(v):
@@ -61,6 +67,48 @@ def _num(v):
     return None
 
 
+class LogBuffer:
+    def __init__(self, capacity=400):
+        self._lines = collections.deque(maxlen=int(capacity))
+        self._lock = threading.Lock()
+        self._seq = 0
+
+    def write(self, *parts):
+        text = " ".join(str(p) for p in parts)
+        with self._lock:
+            self._seq += 1
+            self._lines.append({"i": self._seq, "t": time.time(), "text": text})
+        return self
+
+    def __call__(self, *parts):
+        return self.write(*parts)
+
+    def clear(self):
+        with self._lock:
+            self._lines.clear()
+
+    def get(self):
+        with self._lock:
+            return list(self._lines)
+
+    def __len__(self):
+        with self._lock:
+            return len(self._lines)
+
+
+class _LogHandler(logging.Handler):
+    def __init__(self, buffer, fmt="%(asctime)s %(message)s", datefmt="%H:%M:%S"):
+        logging.Handler.__init__(self)
+        self.buffer = buffer
+        self.setFormatter(logging.Formatter(fmt, datefmt))
+
+    def emit(self, record):
+        try:
+            self.buffer.write(self.format(record))
+        except Exception:
+            pass
+
+
 class Monitor:
     def __init__(self, title="AI 训练监控", host="127.0.0.1", port=80, interval=1.0, history=600):
         self.title = title
@@ -72,6 +120,11 @@ class Monitor:
         self._health = []
         self._images = []
         self._hists = []
+        self._tables = []
+        self._matrices = []
+        self._scatters = []
+        self._bars = []
+        self._logs = []
         self._graph_fn = None
         self._surface_fn = None
         self._params_fn = None
@@ -111,6 +164,46 @@ class Monitor:
             "key": key, "label": label or key, "fn": fn, "bins": bins, "refresh": refresh,
         })
         return self
+
+    def table(self, key, fn, label=None, columns=None):
+        self._tables.append({
+            "key": key, "label": label or key, "fn": fn, "columns": columns,
+        })
+        return self
+
+    def matrix(self, key, fn, label=None, cmap=None, xlabels=None, ylabels=None,
+               fmt="f3", refresh=2.0):
+        self._matrices.append({
+            "key": key, "label": label or key, "fn": fn, "cmap": cmap,
+            "xlabels": xlabels, "ylabels": ylabels, "fmt": fmt, "refresh": refresh,
+        })
+        return self
+
+    def scatter(self, key, fn, label=None, xlabel="x", ylabel="y"):
+        self._scatters.append({
+            "key": key, "label": label or key, "fn": fn,
+            "xlabel": xlabel, "ylabel": ylabel,
+        })
+        return self
+
+    def bars(self, key, fn, label=None):
+        self._bars.append({"key": key, "label": label or key, "fn": fn})
+        return self
+
+    def log(self, key, fn, label=None, limit=400):
+        self._logs.append({
+            "key": key, "label": label or key, "fn": fn, "limit": int(limit),
+        })
+        return self
+
+    def attach_logger(self, logger, key="log", label="训练日志", level=logging.INFO, limit=400,
+                      fmt="%(asctime)s %(message)s", datefmt="%H:%M:%S"):
+        buf = LogBuffer(capacity=max(100, limit))
+        handler = _LogHandler(buf, fmt=fmt, datefmt=datefmt)
+        handler.setLevel(level)
+        logger.addHandler(handler)
+        self.log(key, buf.get, label=label, limit=limit)
+        return buf
 
     def graph(self, fn):
         self._graph_fn = fn
@@ -216,19 +309,33 @@ class Monitor:
                 continue
         return out
 
+    def _cache_get(self, kind, key, refresh):
+        c = self._hcache.get((kind, key))
+        if c is not None and time.time() - c["t"] < refresh:
+            return c["v"]
+        return None
+
+    def _cache_old(self, kind, key):
+        c = self._hcache.get((kind, key))
+        return None if c is None else c["v"]
+
+    def _cache_put(self, kind, key, v):
+        self._hcache[(kind, key)] = {"t": time.time(), "v": v}
+        return v
+
     def _hists_payload(self):
-        now = time.time()
         out = []
         for hs in self._hists:
             key = hs["key"]
-            c = self._hcache.get(key)
-            if c is not None and now - c["t"] < hs.get("refresh", 5.0):
-                out.append(c["v"])
+            hit = self._cache_get("hist", key, hs.get("refresh", 5.0))
+            if hit is not None:
+                out.append(hit)
                 continue
             raw = _safe(hs["fn"])
             if raw is None:
-                if c is not None:
-                    out.append(c["v"])
+                old = self._cache_old("hist", key)
+                if old is not None:
+                    out.append(old)
                 continue
             try:
                 v = np.asarray(raw, np.float64).ravel()
@@ -244,8 +351,177 @@ class Monitor:
                     "mean": float(v.mean()), "std": float(v.std()),
                     "n": int(v.size),
                 }
-                self._hcache[key] = {"t": now, "v": item}
-                out.append(item)
+                out.append(self._cache_put("hist", key, item))
+            except Exception:
+                continue
+        return out
+
+    def _tables_payload(self):
+        out = []
+        for t in self._tables:
+            raw = _safe(t["fn"])
+            if raw is None:
+                continue
+            try:
+                if isinstance(raw, dict):
+                    rows = raw.get("rows") or []
+                    cols = _resolve(raw.get("columns")) or _resolve(t["columns"])
+                else:
+                    rows = list(raw)
+                    cols = _resolve(t["columns"])
+                rows = [list(r) if isinstance(r, (list, tuple, np.ndarray)) else [r] for r in rows]
+                width = max([len(r) for r in rows] or [0])
+                if width == 0:
+                    continue
+                for r in rows:
+                    while len(r) < width:
+                        r.append(None)
+                if not cols:
+                    cols = ["列 %d" % (i + 1) for i in range(width)]
+                cols = [str(c) for c in list(cols)[:width]]
+                while len(cols) < width:
+                    cols.append("列 %d" % (len(cols) + 1))
+                out.append({
+                    "key": t["key"], "label": t["label"],
+                    "columns": cols, "rows": rows, "n": len(rows),
+                })
+            except Exception:
+                continue
+        return out
+
+    def _matrices_payload(self):
+        out = []
+        for mt in self._matrices:
+            key = mt["key"]
+            hit = self._cache_get("matrix", key, mt.get("refresh", 2.0))
+            if hit is not None:
+                out.append(hit)
+                continue
+            raw = _safe(mt["fn"])
+            if raw is None:
+                old = self._cache_old("matrix", key)
+                if old is not None:
+                    out.append(old)
+                continue
+            try:
+                a = np.asarray(raw, np.float64)
+                if a.ndim != 2 or a.size == 0:
+                    continue
+                a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+                xs = _resolve(mt["xlabels"])
+                ys = _resolve(mt["ylabels"])
+                item = {
+                    "key": key, "label": mt["label"],
+                    "h": int(a.shape[0]), "w": int(a.shape[1]),
+                    "data": np.round(a, 6).tolist(),
+                    "min": float(a.min()), "max": float(a.max()),
+                    "xlabels": None if xs is None else [str(v) for v in xs],
+                    "ylabels": None if ys is None else [str(v) for v in ys],
+                    "cmap": mt["cmap"], "fmt": mt["fmt"],
+                }
+                out.append(self._cache_put("matrix", key, item))
+            except Exception:
+                continue
+        return out
+
+    def _scatters_payload(self):
+        out = []
+        for sc in self._scatters:
+            raw = _safe(sc["fn"])
+            if raw is None:
+                continue
+            try:
+                groups = []
+                if isinstance(raw, dict):
+                    groups = [str(g) for g in (raw.get("groups") or [])]
+                    src = raw.get("points") or []
+                else:
+                    src = raw
+                points = []
+                for p in src:
+                    if isinstance(p, dict):
+                        x = _num(p.get("x"))
+                        y = _num(p.get("y"))
+                        g = p.get("group")
+                    else:
+                        p = list(p)
+                        x = _num(p[0]) if len(p) > 0 else None
+                        y = _num(p[1]) if len(p) > 1 else None
+                        g = p[2] if len(p) > 2 else 0
+                    if x is None or y is None:
+                        continue
+                    if isinstance(g, str):
+                        if g not in groups:
+                            groups.append(g)
+                        gi = groups.index(g)
+                    else:
+                        gi = int(g or 0)
+                    points.append([x, y, gi])
+                    if len(points) >= 40000:
+                        break
+                if not points:
+                    continue
+                if not groups:
+                    groups = ["点"]
+                out.append({
+                    "key": sc["key"], "label": sc["label"],
+                    "xlabel": sc["xlabel"], "ylabel": sc["ylabel"],
+                    "points": points, "groups": groups, "n": len(points),
+                })
+            except Exception:
+                continue
+        return out
+
+    def _bars_payload(self):
+        out = []
+        for b in self._bars:
+            raw = _safe(b["fn"])
+            if raw is None:
+                continue
+            try:
+                items = raw.get("bars") if isinstance(raw, dict) else list(raw)
+                bars = []
+                for k, it in enumerate(items or []):
+                    if isinstance(it, dict):
+                        lab = it.get("label")
+                        val = _num(it.get("value"))
+                    elif isinstance(it, (list, tuple, np.ndarray)) and len(it) >= 2:
+                        lab = it[0]
+                        val = _num(it[1])
+                    else:
+                        lab = k
+                        val = _num(it)
+                    if val is None:
+                        continue
+                    bars.append({"label": str(lab), "value": val})
+                if not bars:
+                    continue
+                out.append({"key": b["key"], "label": b["label"], "bars": bars, "n": len(bars)})
+            except Exception:
+                continue
+        return out
+
+    def _logs_payload(self):
+        out = []
+        for lg in self._logs:
+            raw = _safe(lg["fn"])
+            if raw is None:
+                continue
+            try:
+                lines = []
+                for it in list(raw)[-lg["limit"]:]:
+                    if isinstance(it, dict):
+                        lines.append({
+                            "i": int(it.get("i", 0)),
+                            "t": float(it.get("t", 0.0)),
+                            "text": str(it.get("text", "")),
+                        })
+                    else:
+                        lines.append({"i": 0, "t": 0.0, "text": str(it)})
+                out.append({
+                    "key": lg["key"], "label": lg["label"],
+                    "lines": lines, "n": len(lines),
+                })
             except Exception:
                 continue
         return out
@@ -283,6 +559,11 @@ class Monitor:
             ],
             "images": self._images_payload(),
             "histograms": self._hists_payload(),
+            "tables": self._tables_payload(),
+            "matrices": self._matrices_payload(),
+            "scatters": self._scatters_payload(),
+            "bars": self._bars_payload(),
+            "logs": self._logs_payload(),
             "surface": _safe(self._surface_fn) if self._surface_fn else None,
             "params": _safe(self._params_fn) if self._params_fn else None,
             "graph": {"version": g["version"], "summary": g["summary"]},
