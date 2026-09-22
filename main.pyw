@@ -88,33 +88,6 @@ def draw_scene(screen, g, scene_px):
     surf = pygame.surfarray.make_surface(arr)
     scaled = pygame.transform.scale(surf, (scene_px, scene_px))
     screen.blit(scaled, (0, 0))
-
-
-def draw_panel(screen, fonts, stats, counter, agent, buffer, trainer, scene_px, current_len):
-    font_title, font, font_small = fonts
-    panel_x = scene_px
-    lines = [
-        ("贪吃蛇 · 大地图 DQN 强化学习", font_title, (255, 255, 255)),
-        ("棋盘 " + str(config.GRID) + "×" + str(config.GRID), font_small, (170, 200, 255)),
-        ("并行智能体 " + str(config.AGENTS) + " 个（共用一张网络）", font_small, (170, 200, 255)),
-        ("设备 " + ("CUDA GPU" if DEVICE.type == "cuda" else "CPU"), font_small, (170, 200, 255)),
-        ("全局步数 " + f"{counter.get():,}", font, (230, 235, 245)),
-        ("探索率 ε " + f"{agent.epsilon():.3f}", font, (230, 235, 245)),
-        ("训练步数 " + f"{trainer.train_steps:,}", font, (230, 235, 245)),
-        ("本局蛇长 " + str(current_len), font, (255, 220, 120)),
-        ("平均蛇长 " + f"{avg(stats):.1f}", font, (255, 220, 120)),
-        ("最长蛇身 " + f"{int(max_score(stats))}", font, (255, 220, 120)),
-        ("Loss " + f"{trainer.loss:.4f}", font, (230, 235, 245)),
-    ]
-    if DEVICE.type == "cuda":
-        u = gpu_util()
-        if u is not None:
-            lines.append((f"GPU 利用率 {u}%", font, (120, 255, 160)))
-    y = 12
-    for text, f, color in lines:
-        surf = f.render(text, True, color)
-        screen.blit(surf, (panel_x + 12, y))
-        y += f.get_height() + 10
     pygame.draw.rect(screen, (60, 70, 90), (0, 0, scene_px, scene_px), 2)
 
 
@@ -173,15 +146,11 @@ def main():
 
     pygame.init()
     info = pygame.display.Info()
-    panel_w = 300
-    scene_px = min(info.current_h - 90, info.current_w - 360)
-    screen = pygame.display.set_mode((scene_px + panel_w, scene_px))
-    pygame.display.set_caption("贪吃蛇 - 大地图 DQN 强化学习")
+    cell = min(12, max(6, (info.current_h - 120) // config.GRID))
+    scene_px = cell * config.GRID
+    screen = pygame.display.set_mode((scene_px, scene_px))
+    pygame.display.set_caption("贪吃蛇 - DQN 强化学习")
     clock = pygame.time.Clock()
-    font_title = pygame.font.SysFont("microsoftyahei", 20)
-    font = pygame.font.SysFont("microsoftyahei", 16)
-    font_small = pygame.font.SysFont("microsoftyahei", 13)
-    fonts = (font_title, font, font_small)
 
     r_env = env.Env(config.GRID, config.FRAME_STACK)
     r_agent = Agent(net, buffer, r_env, counter, config, stats)
@@ -241,7 +210,6 @@ def main():
             s = r_env.reset()
 
         draw_scene(screen, r_env.g, scene_px)
-        draw_panel(screen, fonts, stats, counter, r_agent, buffer, trainer, scene_px, r_env.score)
         pygame.display.flip()
         clock.tick(60)
 
