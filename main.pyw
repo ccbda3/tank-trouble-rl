@@ -42,7 +42,7 @@ from buffer import PrioritizedReplayBuffer
 from monitor import Monitor, act_stats
 from network import DQN, DEVICE
 from torch.utils.tensorboard import SummaryWriter
-from trainer import Trainer
+from trainer import LandscapeProbe, Trainer
 
 logging.basicConfig(
     filename=config.LOG,
@@ -102,6 +102,7 @@ def main():
     stats = {"lock": threading.Lock(), "recent": deque(maxlen=200), "episodes": 0, "loss": 0.0}
 
     resumed = False
+    saved = {"train_steps": 0, "updates": 0}
     if os.path.exists(config.FULL_STATE):
         try:
             d = torch.load(config.FULL_STATE, map_location=DEVICE)
@@ -109,7 +110,10 @@ def main():
             target_net.load_state_dict(d["target"])
             optimizer.load_state_dict(d["opt"])
             counter.set(int(d.get("steps", 0)))
-            log.info("完整续训成功：加载 %s，已累计步伐 %d", config.FULL_STATE, counter.get())
+            saved["train_steps"] = int(d.get("train_steps", 0))
+            saved["updates"] = int(d.get("updates", 0))
+            log.info("完整续训成功：加载 %s，已累计步伐 %d、梯度更新 %d",
+                     config.FULL_STATE, counter.get(), saved["train_steps"])
             resumed = True
         except Exception as e:
             log.warning("完整续训失败，回退普通恢复: %s", e)
@@ -138,7 +142,12 @@ def main():
 
     stop_event = threading.Event()
     trainer = Trainer(net, target_net, buffer, optimizer, counter, config, stats, writer=writer)
+    trainer.train_steps = saved["train_steps"]
+    trainer.updates = saved["updates"]
     threading.Thread(target=trainer.loop, args=(stop_event,), daemon=True).start()
+
+    probe = LandscapeProbe(net, target_net, buffer, config)
+    threading.Thread(target=probe.loop, args=(stop_event,), daemon=True).start()
 
     per_worker = max(1, config.AGENTS // config.WORKERS)
     for _ in range(config.WORKERS):
@@ -174,6 +183,7 @@ def main():
             "episodes": stats["episodes"],
             "agents": config.AGENTS,
             "acts": self_acts(),
+            "landscape": probe.snapshot(),
         }
 
     def self_acts():

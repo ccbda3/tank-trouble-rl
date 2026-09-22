@@ -262,11 +262,12 @@ main{display:flex;flex-direction:column;gap:10px;padding:10px;min-width:0}
 <div class="panels" id="panels"><div class="pnl"><div class="pnlh">参数</div><div class="row"><span class="rk">状态</span><span class="rv">等待数据…</span></div></div></div>
 </section>
 <section class="card">
-<div class="chead"><span class="ctitle">损失曲面 · 3D 视图</span><span class="csub">Double DQN 训练轨迹示意</span><span class="chint">拖动旋转 · 滚轮缩放 · 小球沿梯度向谷底滚动</span></div>
+<div class="chead"><span class="ctitle">损失曲面 3D · 真实测量</span><span class="csub" id="gdSub">等待首次测量…</span><span class="chint">每 20 秒在真实权重周围扰动采样一次网格 · 拖动旋转 · 滚轮缩放</span></div>
 <div class="gdwrap" id="gdwrap"><canvas id="gdcv"></canvas></div>
 <div class="hint">
-<span><i style="background:#ff8f5a"></i>小球 = 当前 Loss，沿梯度下降向谷底滚动</span>
-<span><i style="background:linear-gradient(90deg,#182c48,#4a96c6,#a6e0f6)"></i>曲面高度 = 损失值，低暗高亮</span>
+<span><i style="background:linear-gradient(90deg,#182c48,#4a96c6,#a6e0f6)"></i>曲面高度 = 在固定评估批上实测的 TD 损失，低暗高亮</span>
+<span><i style="background:#ffb020"></i>橙色轨迹 = 真实优化器走过的权重位移，投影到这两个固定随机方向上</span>
+<span><i style="background:#3ddc84"></i>绿点 = 当前权重位置</span>
 </div>
 </section>
 <section class="card">
@@ -602,30 +603,120 @@ function bindNet(){
  cv.addEventListener("mouseleave",function(){if(!NET.hoverKey)return;NET.hoverKey="";NET.hover=null;if(tip){tip.className="nettip";tip.innerHTML="";}requestNet();});
 }
 function bindNetView(){var list=document.querySelectorAll("[data-view]"),i;for(i=0;i<list.length;i++){list[i].addEventListener("click",function(){setNetMode(this.getAttribute("data-view"));});}}
-var GD={yaw:-0.72,pitch:0.60,dist:3.5,drag:false,lx:0,ly:0,cv:null,ctx:null,raf:0};
+var GD={yaw:-0.72,pitch:0.62,dist:3.1,drag:false,lx:0,ly:0,cv:null,ctx:null,raf:0,land:null,MESH:34};
 function gdProj(c,x,y,z){var vx=x-c.ox,vy=y-c.oy,vz=z-c.oz;var cz=vx*c.fx+vy*c.fy+vz*c.fz;if(cz<0.08)cz=0.08;var cx=vx*c.rx+vy*c.ry+vz*c.rz,cyv=vx*c.ux+vy*c.uy+vz*c.uz;return[cx/cz,cyv/cz,cz];}
 function gdCam(){var cy=Math.cos(GD.yaw),sy=Math.sin(GD.yaw),cp=Math.cos(GD.pitch),sp=Math.sin(GD.pitch);var ex=cp*cy,ey=cp*sy,ez=sp,d=GD.dist;return{ox:ex*d,oy:ey*d,oz:ez*d,fx:-ex,fy:-ey,fz:-ez,rx:-sy,ry:cy,rz:0,ux:-cy*sp,uy:-sy*sp,uz:cp};}
 function gdColor(t){t=t<0?0:(t>1?1:t);var r,g,b;if(t<0.35){var u=t/0.35;r=20+(42-20)*u;g=40+(100-40)*u;b=66+(150-66)*u;}else if(t<0.7){var u2=(t-0.35)/0.35;r=42+(86-42)*u2;g=100+(170-100)*u2;b=150+(210-150)*u2;}else{var u3=(t-0.7)/0.3;r=86+(190-86)*u3;g=170+(230-170)*u3;b=210+(252-210)*u3;}return[r|0,g|0,b|0];}
+function gdSample(L,ti,tj){
+ var res=L.res,fi=ti*(res-1),fj=tj*(res-1);
+ var i0=Math.min(res-1,Math.max(0,Math.floor(fi))),j0=Math.min(res-1,Math.max(0,Math.floor(fj)));
+ var i1=Math.min(res-1,i0+1),j1=Math.min(res-1,j0+1),tx=fi-i0,ty=fj-j0;
+ function g(i,j){var v=Number(L.values[i*res+j]);return isFinite(v)?v:L.zmin;}
+ var a=g(i0,j0),b=g(i1,j0),cc=g(i1,j1),dd=g(i0,j1);
+ return (a*(1-tx)+b*tx)*(1-ty)+(dd*(1-tx)+cc*tx)*ty;
+}
+function gdEmpty(ctx,w,h,msg,sub){
+ ctx.save();ctx.setLineDash([6,5]);ctx.strokeStyle="rgba(120,140,168,.24)";ctx.lineWidth=1;ctx.strokeRect(15.5,15.5,w-31,h-31);ctx.restore();
+ ctx.textAlign="center";ctx.textBaseline="middle";ctx.font='13px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="#5f6a78";ctx.fillText(msg,w*0.5,h*0.5-11);
+ ctx.font='11px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="#4a545f";ctx.fillText(sub,w*0.5,h*0.5+11);ctx.textBaseline="alphabetic";
+}
 function drawGD(t){
  var cv=GD.cv,ctx=GD.ctx;if(!cv||!ctx)return;
  var w=cv.clientWidth|0,h=cv.clientHeight|0;if(w<40||h<40)return;
  var dpr=Math.min(window.devicePixelRatio||1,2),nw=Math.round(w*dpr),nh=Math.round(h*dpr);
  if(cv.width!==nw||cv.height!==nh){cv.width=nw;cv.height=nh;}
  ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
- var c=gdCam(),FOCAL=Math.min(w,h)*1.1,ox=w*0.5,oy=h*0.54;
- var ZH=0.75,res=22,i,j,k;
- var sx=new Float64Array(res*res),sy=new Float64Array(res*res),sd=new Float64Array(res*res),zn=new Float64Array(res*res),wx=new Float64Array(res*res),wy=new Float64Array(res*res),wz=new Float64Array(res*res);
- for(i=0;i<res;i++)for(j=0;j<res;j++){var u=-1+2*i/(res-1),v=-1+2*j/(res-1),z=0.35*(u*u+v*v);var p=gdProj(c,u,v,z);var idx=i*res+j;sx[idx]=ox+p[0]*FOCAL;sy[idx]=oy-p[1]*FOCAL;sd[idx]=p[2];zn[idx]=z/(2*0.35);wx[idx]=u;wy[idx]=v;wz[idx]=z;}
- var quads=[];for(i=0;i<res-1;i++)for(j=0;j<res-1;j++){var a0=i*res+j,b0=(i+1)*res+j,cc=(i+1)*res+j+1,dd=i*res+j+1;quads.push([a0,b0,cc,dd,(sd[a0]+sd[b0]+sd[cc]+sd[dd])*0.25,(zn[a0]+zn[b0]+zn[cc]+zn[dd])*0.25]);}
+ var L=GD.land;
+ if(!L){gdEmpty(ctx,w,h,"正在测量损失曲面…","每隔一段时间会在真实权重周围采样网格点，首次需要稍等");return;}
+ var res=L.res,ext=Number(L.ext)||1,zmin=Number(L.zmin),zmax=Number(L.zmax);
+ var range=(zmax-zmin)||1,dcnt=Number(L.probeCount)||0;
+ var zh=0.34;
+ var c=gdCam(),FOCAL=Math.min(w,h)*1.02,ox=w*0.5,oy=h*0.56;
+ var M=GD.MESH,i,j,tx,ty;
+ var sx=new Float64Array(M*M),sy=new Float64Array(M*M),sd=new Float64Array(M*M),zn=new Float64Array(M*M),wx=new Float64Array(M*M),wy=new Float64Array(M*M),wz=new Float64Array(M*M);
+ for(i=0;i<M;i++){
+  tx=i/(M-1);var uu=-1+2*tx;
+  for(j=0;j<M;j++){
+   ty=j/(M-1);var vv=-1+2*ty;
+   var loss=gdSample(L,tx,ty);
+   var nt=(loss-zmin)/range;if(nt<0)nt=0;if(nt>1)nt=1;
+   var z=nt*zh-zh*0.5;
+   var p=gdProj(c,uu,vv,z),idx=i*M+j;
+   sx[idx]=ox+p[0]*FOCAL;sy[idx]=oy-p[1]*FOCAL;sd[idx]=p[2];
+   zn[idx]=nt;wx[idx]=uu;wy[idx]=vv;wz[idx]=z;
+  }
+ }
+ var axisC="rgba(158,190,220,.30)";
+ ctx.strokeStyle=axisC;ctx.lineWidth=1;
+ var bp=[];
+ for(i=0;i<8;i++)bp.push(gdProj(c,-1+2*i/7,-1,-zh*0.5));
+ for(i=1;i<8;i++)bp.push(gdProj(c,-1,-1+2*i/7,-zh*0.5));
+ bp.push(gdProj(c,-1,-1,-zh*0.5-0.12));
+ ctx.beginPath();ctx.moveTo(ox+bp[0][0]*FOCAL,oy-bp[0][1]*FOCAL);
+ for(i=1;i<8;i++)ctx.lineTo(ox+bp[i][0]*FOCAL,oy-bp[i][1]*FOCAL);
+ for(i=7;i<14;i++)ctx.lineTo(ox+bp[i][0]*FOCAL,oy-bp[i][1]*FOCAL);
+ ctx.stroke();
+ ctx.beginPath();ctx.moveTo(ox+bp[0][0]*FOCAL,oy-bp[0][1]*FOCAL);ctx.lineTo(ox+bp[14][0]*FOCAL,oy-bp[14][1]*FOCAL);ctx.stroke();
+ var quads=[];
+ for(i=0;i<M-1;i++)for(j=0;j<M-1;j++){var a0=i*M+j,b0=(i+1)*M+j,cc=(i+1)*M+j+1,dd=i*M+j+1;quads.push([a0,b0,cc,dd,(sd[a0]+sd[b0]+sd[cc]+sd[dd])*0.25,(zn[a0]+zn[b0]+zn[cc]+zn[dd])*0.25]);}
  quads.sort(function(p,q){return q[4]-p[4];});
  var light=[0.45,0.25,0.86];
- for(k=0;k<quads.length;k++){var q=quads[k],a=q[0],b=q[1],cc2=q[2],dd=q[3];var e1x=wx[b]-wx[a],e1y=wy[b]-wy[a],e1z=wz[b]-wz[a],e2x=wx[dd]-wx[a],e2y=wy[dd]-wy[a],e2z=wz[dd]-wz[a];var nxv=e1y*e2z-e1z*e2y,nyv=e1z*e2x-e1x*e2z,nzv=e1x*e2y-e1y*e2x;var nl=Math.sqrt(nxv*nxv+nyv*nyv+nzv*nzv)||1,dot=(nxv*light[0]+nyv*light[1]+nzv*light[2])/nl;if(dot<0)dot=-dot;var sh=0.72+0.38*dot,rgb=gdColor(q[5]);ctx.beginPath();ctx.moveTo(sx[a],sy[a]);ctx.lineTo(sx[b],sy[b]);ctx.lineTo(sx[cc2],sy[cc2]);ctx.lineTo(sx[dd],sy[dd]);ctx.closePath();ctx.fillStyle="rgb("+(rgb[0]*sh|0)+","+(rgb[1]*sh|0)+","+(rgb[2]*sh|0)+")";ctx.fill();ctx.strokeStyle="rgba(200,226,250,.07)";ctx.lineWidth=0.6;ctx.stroke();}
- var th=(t/3400)%1,bu=Math.cos(th*2)*0.30,ba=Math.sin(th*2)*0.30,bh=0.35*(bu*bu+ba*ba);
- var bp=gdProj(c,bu,ba,bh);var bx=ox+bp[0]*FOCAL,by=oy-bp[1]*FOCAL;
- ctx.save();ctx.strokeStyle="#ff8f5a";ctx.lineWidth=2.4;ctx.lineJoin="round";ctx.lineCap="round";ctx.shadowColor="rgba(255,143,90,.75)";ctx.shadowBlur=10;ctx.beginPath();var started=false;for(i=0;i<=46;i++){var tt=Math.max(0,th-i*0.009),u0=Math.cos(tt*2)*0.30,v0=Math.sin(tt*2)*0.30,zz=0.35*(u0*u0+v0*v0)+0.004,lp=gdProj(c,u0,v0,zz),lx=ox+lp[0]*FOCAL,ly=oy-lp[1]*FOCAL;if(i===0)ctx.moveTo(lx,ly);else ctx.lineTo(lx,ly);}ctx.stroke();ctx.restore();
- ctx.beginPath();ctx.arc(bx,by,9,0,Math.PI*2);ctx.fillStyle="#ff8f5a";ctx.shadowColor="#ff8f5a";ctx.shadowBlur=16;ctx.fill();ctx.shadowBlur=0;ctx.strokeStyle="rgba(20,16,8,.85)";ctx.lineWidth=1.4;ctx.stroke();
- var cbx=w-14,cby=16,cbh=90,cbw=8;for(i=0;i<32;i++){var t2=1-i/31,rgb2=gdColor(t2);ctx.fillStyle="rgb("+rgb2[0]+","+rgb2[1]+","+rgb2[2]+")";ctx.fillRect(cbx,cby+cbh*i/32,cbw,cbh/32+1);}ctx.strokeStyle="rgba(220,235,250,.2)";ctx.strokeRect(cbx+.5,cby+.5,cbw,cbh);
- ctx.font='10px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.textAlign="left";ctx.fillStyle="#79828f";ctx.fillText("低",cbx+cbw+5,cby+8);ctx.fillText("高",cbx+cbw+5,cby+cbh);ctx.fillStyle="#5f6a78";ctx.fillText("损失",cbx+cbw+5,cby-6);
+  for(var k=0;k<quads.length;k++){
+   var q=quads[k],a=q[0],b=q[1],cc2=q[2],dd=q[3];
+   var e1x=wx[b]-wx[a],e1y=wy[b]-wy[a],e1z=wz[b]-wz[a],e2x=wx[dd]-wx[a],e2y=wy[dd]-wy[a],e2z=wz[dd]-wz[a];
+   var nxv=e1y*e2z-e1z*e2y,nyv=e1z*e2x-e1x*e2z,nzv=e1x*e2y-e1y*e2x;
+   var nl=Math.sqrt(nxv*nxv+nyv*nyv+nzv*nzv)||1,dot=(nxv*light[0]+nyv*light[1]+nzv*light[2])/nl;
+   if(dot<0)dot=-dot;
+   var sh=0.70+0.42*dot,rgb=gdColor(q[5]);
+   ctx.beginPath();ctx.moveTo(sx[a],sy[a]);ctx.lineTo(sx[b],sy[b]);ctx.lineTo(sx[cc2],sy[cc2]);ctx.lineTo(sx[dd],sy[dd]);ctx.closePath();
+   ctx.fillStyle="rgb("+Math.min(255,rgb[0]*sh|0)+","+Math.min(255,rgb[1]*sh|0)+","+Math.min(255,rgb[2]*sh|0)+")";
+   ctx.fill();
+   ctx.strokeStyle="rgba(200,226,250,.06)";ctx.lineWidth=0.5;ctx.stroke();
+  }
+ var path=L.path||[],pn=path.length;
+  var spanU=0,spanV=0;
+  if(pn>0){
+   var last=path[pn-1],ca=Number(last.a)||0,cb=Number(last.b)||0;
+   for(i=0;i<pn;i++){var da=Math.abs((Number(path[i].a)||0)-ca),db=Math.abs((Number(path[i].b)||0)-cb);if(da>spanU)spanU=da;if(db>spanV)spanV=db;}
+   var scl=0.86/Math.max(spanU,spanV,1e-12);
+   function toWorld(pp){
+    var du=((Number(pp.a)||0)-ca)*scl,dv=((Number(pp.b)||0)-cb)*scl;
+    du=du<-0.98?-0.98:(du>0.98?0.98:du);dv=dv<-0.98?-0.98:(dv>0.98?0.98:dv);
+    var nt=(Number(pp.z)-zmin)/range;if(nt<0)nt=0;if(nt>1)nt=1;
+    return [du,dv,nt*zh-zh*0.5+0.02];
+   }
+   var pts=[];
+   for(i=0;i<pn;i++){var wpt=toWorld(path[i]),sp=gdProj(c,wpt[0],wpt[1],wpt[2]);
+    pts.push({x:ox+sp[0]*FOCAL,y:oy-sp[1]*FOCAL,z:Number(path[i].z)});}
+   ctx.save();ctx.strokeStyle="#ffb020";ctx.lineWidth=2.2;ctx.lineJoin="round";ctx.lineCap="round";ctx.shadowColor="rgba(255,176,32,.7)";ctx.shadowBlur=9;
+   ctx.beginPath();
+   for(i=0;i<pts.length;i++){if(i===0)ctx.moveTo(pts[i].x,pts[i].y);else ctx.lineTo(pts[i].x,pts[i].y);}
+   ctx.stroke();ctx.restore();
+   var every=Math.max(1,Math.floor(pts.length/40));
+   for(i=0;i<pts.length-1;i++){
+    if(i%every!==0)continue;
+    ctx.beginPath();ctx.arc(pts[i].x,pts[i].y,2.6,0,Math.PI*2);ctx.fillStyle="rgba(255,211,106,.85)";ctx.fill();
+   }
+   var lp=pts[pts.length-1];
+   ctx.beginPath();ctx.arc(lp.x,lp.y,7,0,Math.PI*2);ctx.strokeStyle="#3ddc84";ctx.lineWidth=2;ctx.stroke();
+   ctx.beginPath();ctx.arc(lp.x,lp.y,3.4,0,Math.PI*2);ctx.fillStyle="#3ddc84";ctx.fill();
+   ctx.font='10px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.textAlign="left";ctx.fillStyle="#8fe0b2";
+   ctx.fillText("当前权重",lp.x+11,lp.y+10);
+   ctx.textAlign="right";ctx.fillStyle="#ffd58a";
+   ctx.fillText("损失 "+fSmart(Number(last.z)),w-16,16);
+   ctx.fillStyle="rgba(120,140,168,.75)";
+   ctx.fillText("轨迹跨度 u "+fSmart(spanU)+" · v "+fSmart(spanV)+"（已等比缩放填满窗口）",w-16,30);
+  }
+ ctx.textAlign="left";ctx.font='10px "Microsoft YaHei UI","Segoe UI",sans-serif';
+ ctx.fillStyle="rgba(170,208,240,.75)";
+ ctx.fillText("真实测量损失曲面 · 网格 "+res+"×"+res+" · 窗口 ±"+fFix(ext,2)+" · 已测 "+fInt(dcnt)+" 次 · 轨迹 "+fInt(pn)+" 点",8,14);
+ ctx.fillStyle="rgba(120,140,168,.65)";
+ ctx.fillText("拖动旋转 · 滚轮缩放 · 高度=固定评估批上的真实 TD 损失",8,h-8);
+ var cbx=w-14,cby=34,cbh=84,cbw=8;
+ for(i=0;i<32;i++){var t2=1-i/31,rgb2=gdColor(t2);ctx.fillStyle="rgb("+rgb2[0]+","+rgb2[1]+","+rgb2[2]+")";ctx.fillRect(cbx,cby+cbh*i/32,cbw,cbh/32+1);}
+ ctx.strokeStyle="rgba(220,235,250,.2)";ctx.lineWidth=1;ctx.strokeRect(cbx+.5,cby+.5,cbw,cbh);
+ ctx.textAlign="right";ctx.fillStyle="#8794a3";ctx.fillText(fSmart(zmax),cbx-5,cby+8);ctx.fillText(fSmart(zmin),cbx-5,cby+cbh);
+ ctx.fillStyle="#5f6a78";ctx.fillText("损失",cbx-5,cby-8);
 }
 function gdFrame(t){GD.raf=requestAnimationFrame(gdFrame);drawGD(t);}
 function bindGD(){
@@ -650,6 +741,10 @@ async function poll(){
   pushHistory(d);
   renderCharts();
   renderNetwork(d.acts||null);
+  var ld=d.landscape||null;
+  GD.land=(ld&&Number(ld.ready)===1&&ld.values&&ld.values.length>=4)?ld:null;
+  var lsub=el("gdSub");
+  if(lsub)lsub.textContent=GD.land?("网格 "+GD.land.res+"×"+GD.land.res+" · 窗口 ±"+fFix(GD.land.ext,2)+" · 已测 "+fInt(GD.land.probeCount)+" 次 · 轨迹 "+fInt((GD.land.path||[]).length)+" 点"):"等待首次测量…";
   var sig=(d.config||{});var sigS=JSON.stringify(sig)+"|"+((d.acts&&d.acts.layers||[]).map(function(l){return l.params+"/"+l.trueDim;})).join(",");
   if(sigS!==panelSig){panelSig=sigS;buildPanels(d);}
   updatePanels(d);
