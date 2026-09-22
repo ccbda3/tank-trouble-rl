@@ -1,32 +1,34 @@
 import math
 import random
 
-CELL = 32
-COLS = 21
-ROWS = 15
-WIDTH = COLS * CELL
-HEIGHT = ROWS * CELL
+WALL_W = 7.0
+CORR_W = 31.0
+PITCH = WALL_W + CORR_W
+NC = 19
+NR = 13
+WIDTH = WALL_W + NC * PITCH
+HEIGHT = WALL_W + NR * PITCH
 
 TANK_R = 10.0
-TANK_SPEED = 128.0
-TANK_BACK = 82.0
+TANK_SPEED = 152.0
+TANK_BACK = 97.0
 TANK_TURN = 3.1
 BULLET_R = 3.5
-BULLET_SPEED = 340.0
+BULLET_SPEED = 404.0
 BULLET_LIFE = 4.0
 BOUNCE_LIMIT = 6
 FIRE_COOLDOWN = 0.34
 MAX_BULLETS = 5
 
 POWERUP_KINDS = ("laser", "bomb", "speed", "shield")
-POWERUP_R = 10.0
+POWERUP_R = 12.0
 POWERUP_TTL = 14.0
 POWERUP_EVERY = 6.5
 POWERUP_MAX = 2
 BOOST_TIME = 9.0
 BOOST_MUL = 1.75
 AMMO_SHOTS = 3
-BLAST_R = 46.0
+BLAST_R = 55.0
 BLAST_TTL = 0.45
 
 KIND_LIFE = {"normal": BULLET_LIFE, "laser": 1.1, "bomb": 1.4}
@@ -81,29 +83,56 @@ def read_ctrl(down, keys):
 
 def generate(seed=None, braid=0.35):
     rng = random.Random(seed)
-    g = [["#"] * COLS for _ in range(ROWS)]
-    g[1][1] = "."
-    stack = [(1, 1)]
+    vwall = [[True] * NR for _ in range(NC + 1)]
+    hwall = [[True] * NC for _ in range(NR + 1)]
+    seen = [[False] * NC for _ in range(NR)]
+    seen[0][0] = True
+    stack = [(0, 0)]
     while stack:
-        r, c = stack[-1]
+        i, j = stack[-1]
         nbrs = []
-        for dr, dc in ((-2, 0), (2, 0), (0, -2), (0, 2)):
-            nr = r + dr
-            nc = c + dc
-            if 1 <= nr <= ROWS - 2 and 1 <= nc <= COLS - 2 and g[nr][nc] == "#":
-                nbrs.append((nr, nc, r + dr // 2, c + dc // 2))
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ni = i + di
+            nj = j + dj
+            if 0 <= ni < NC and 0 <= nj < NR and not seen[nj][ni]:
+                nbrs.append((ni, nj, di, dj))
         if not nbrs:
             stack.pop()
             continue
-        nr, nc, mr, mc = rng.choice(nbrs)
-        g[mr][mc] = "."
-        g[nr][nc] = "."
-        stack.append((nr, nc))
-    for r in range(1, ROWS - 1):
-        for c in range(1, COLS - 1):
-            if g[r][c] == "#" and ((r % 2 == 1) != (c % 2 == 1)) and rng.random() < braid:
-                g[r][c] = "."
-    return tuple("".join(row) for row in g)
+        ni, nj, di, dj = rng.choice(nbrs)
+        if di:
+            vwall[max(i, ni)][j] = False
+        else:
+            hwall[max(j, nj)][i] = False
+        seen[nj][ni] = True
+        stack.append((ni, nj))
+    for j in range(NR):
+        for i in range(NC):
+            if i + 1 < NC and vwall[i + 1][j] and rng.random() < braid:
+                vwall[i + 1][j] = False
+            if j + 1 < NR and hwall[j + 1][i] and rng.random() < braid:
+                hwall[j + 1][i] = False
+    return vwall, hwall
+
+
+SPAN = CORR_W + 2.0 * WALL_W
+
+
+def wall_rects(vwall, hwall):
+    out = []
+    for i in range(NC + 1):
+        for j in range(NR):
+            if vwall[i][j]:
+                out.append((i * PITCH, j * PITCH, WALL_W, SPAN))
+    for j in range(NR + 1):
+        for i in range(NC):
+            if hwall[j][i]:
+                out.append((i * PITCH, j * PITCH, SPAN, WALL_W))
+    return out
+
+
+def cell_center(i, j):
+    return (WALL_W + i * PITCH + CORR_W * 0.5, WALL_W + j * PITCH + CORR_W * 0.5)
 
 
 class Tank:
@@ -144,7 +173,6 @@ class Bullet:
 
 class World:
     def __init__(self, seed=None):
-        self.grid = generate(seed)
         self.tanks = []
         self.bullets = []
         self.time = 0.0
@@ -157,27 +185,24 @@ class World:
         if seed is None:
             seed = random.randrange(1 << 30)
         self.seed = seed
-        self.grid = generate(seed)
+        self.vwall, self.hwall = generate(seed)
+        self.walls = wall_rects(self.vwall, self.hwall)
+        self.index = {}
+        for rect in self.walls:
+            x, y, w, h = rect
+            for bc in range(int(x // PITCH), int((x + w) // PITCH) + 1):
+                for br in range(int(y // PITCH), int((y + h) // PITCH) + 1):
+                    self.index.setdefault((bc, br), []).append(rect)
         rng = random.Random(seed)
-        cells = [
-            (r, c)
-            for r in range(1, ROWS - 1)
-            for c in range(1, COLS - 1)
-            if self.grid[r][c] == "."
-        ]
         if rng.random() < 0.5:
-            corners = ((1, 1), (ROWS - 2, COLS - 2))
+            corners = ((0, 0), (NC - 1, NR - 1))
         else:
-            corners = ((1, COLS - 2), (ROWS - 2, 1))
-        picks = []
-        for cr, cc in corners:
-            picks.append(min(cells, key=lambda rc: (rc[0] - cr) ** 2 + (rc[1] - cc) ** 2))
-        a, b = picks
+            corners = ((NC - 1, 0), (0, NR - 1))
         self.rng = rng
-        self.tanks = [
-            Tank((a[1] + 0.5) * CELL, (a[0] + 0.5) * CELL, 0.0),
-            Tank((b[1] + 0.5) * CELL, (b[0] + 0.5) * CELL, 0.0),
-        ]
+        self.tanks = []
+        for i, j in corners:
+            x, y = cell_center(i, j)
+            self.tanks.append(Tank(x, y, 0.0))
         for i, t in enumerate(self.tanks):
             o = self.tanks[1 - i]
             t.angle = math.atan2(o.y - t.y, o.x - t.x)
@@ -190,66 +215,56 @@ class World:
         self.winner = None
         return self
 
-    def _solid(self, r, c):
-        if r < 0 or r >= ROWS or c < 0 or c >= COLS:
-            return True
-        return self.grid[r][c] == "#"
+    def _near(self, x, y, rad):
+        out = []
+        for bc in range(int((x - rad) // PITCH), int((x + rad) // PITCH) + 1):
+            for br in range(int((y - rad) // PITCH), int((y + rad) // PITCH) + 1):
+                b = self.index.get((bc, br))
+                if b:
+                    out.extend(b)
+        return out
 
     def _circle_hit(self, x, y, rad):
-        c0 = int((x - rad) // CELL)
-        c1 = int((x + rad) // CELL)
-        r0 = int((y - rad) // CELL)
-        r1 = int((y + rad) // CELL)
-        for r in range(r0, r1 + 1):
-            for c in range(c0, c1 + 1):
-                if not self._solid(r, c):
-                    continue
-                nx = min(max(x, c * CELL), c * CELL + CELL)
-                ny = min(max(y, r * CELL), r * CELL + CELL)
-                if (x - nx) ** 2 + (y - ny) ** 2 < rad * rad:
-                    return True
+        r2 = rad * rad
+        for x0, y0, w, h in self._near(x, y, rad):
+            nx = min(max(x, x0), x0 + w)
+            ny = min(max(y, y0), y0 + h)
+            if (x - nx) ** 2 + (y - ny) ** 2 < r2:
+                return True
         return False
 
     def _push_out(self, x, y, rad):
-        for _ in range(4):
+        r2 = rad * rad
+        for _ in range(8):
             moved = False
-            c0 = int((x - rad) // CELL)
-            c1 = int((x + rad) // CELL)
-            r0 = int((y - rad) // CELL)
-            r1 = int((y + rad) // CELL)
-            for r in range(r0, r1 + 1):
-                for c in range(c0, c1 + 1):
-                    if not self._solid(r, c):
-                        continue
-                    rx = c * CELL
-                    ry = r * CELL
-                    nx = min(max(x, rx), rx + CELL)
-                    ny = min(max(y, ry), ry + CELL)
-                    dx = x - nx
-                    dy = y - ny
-                    d2 = dx * dx + dy * dy
-                    if d2 >= rad * rad:
-                        continue
-                    moved = True
-                    if d2 > 1e-8:
-                        d = math.sqrt(d2)
-                        k = (rad - d) / d
-                        x += dx * k
-                        y += dy * k
+            for x0, y0, w, h in self._near(x, y, rad):
+                nx = min(max(x, x0), x0 + w)
+                ny = min(max(y, y0), y0 + h)
+                dx = x - nx
+                dy = y - ny
+                d2 = dx * dx + dy * dy
+                if d2 >= r2:
+                    continue
+                moved = True
+                if d2 > 1e-9:
+                    d = math.sqrt(d2)
+                    k = (rad - d) / d
+                    x += dx * k
+                    y += dy * k
+                else:
+                    left = x - x0
+                    right = x0 + w - x
+                    top = y - y0
+                    bottom = y0 + h - y
+                    m = min(left, right, top, bottom)
+                    if m == left:
+                        x = x0 - rad
+                    elif m == right:
+                        x = x0 + w + rad
+                    elif m == top:
+                        y = y0 - rad
                     else:
-                        left = x - rx
-                        right = rx + CELL - x
-                        top = y - ry
-                        bottom = ry + CELL - y
-                        m = min(left, right, top, bottom)
-                        if m == left:
-                            x = rx - rad
-                        elif m == right:
-                            x = rx + CELL + rad
-                        elif m == top:
-                            y = ry - rad
-                        else:
-                            y = ry + CELL + rad
+                        y = y0 + h + rad
             if not moved:
                 break
         return x, y
@@ -330,14 +345,6 @@ class World:
         b.life -= dt
         return b.life > 0.0
 
-    def clear_ahead(self, x, y, angle, limit):
-        d = TANK_R + BULLET_R + 1.0
-        while d < limit:
-            if self._circle_hit(x + math.cos(angle) * d, y + math.sin(angle) * d, BULLET_R):
-                return d
-            d += 4.0
-        return limit
-
     def _kill(self, t, killer):
         t.alive = False
         other = self.tanks[1] if t is self.tanks[0] else self.tanks[0]
@@ -373,19 +380,13 @@ class World:
             t.ammo_left = AMMO_SHOTS
 
     def _spawn_powerup(self):
-        cells = [
-            (r, c)
-            for r in range(1, ROWS - 1)
-            for c in range(1, COLS - 1)
-            if self.grid[r][c] == "."
-        ]
         for _ in range(40):
-            r, c = self.rng.choice(cells)
-            x = (c + 0.5) * CELL
-            y = (r + 0.5) * CELL
+            i = self.rng.randrange(NC)
+            j = self.rng.randrange(NR)
+            x, y = cell_center(i, j)
             near = False
             for t in self.tanks:
-                if (t.x - x) ** 2 + (t.y - y) ** 2 < (CELL * 3.0) ** 2:
+                if (t.x - x) ** 2 + (t.y - y) ** 2 < (PITCH * 3.0) ** 2:
                     near = True
                     break
             if not near:
@@ -461,109 +462,3 @@ class World:
     def step_actions(self, dt, a0, a1):
         self.step(dt, ACTION_CTRL[a0], ACTION_CTRL[a1])
 
-
-class Bot:
-    def __init__(self, skill=0.6, seed=None):
-        self.rng = random.Random(seed)
-        self.skill = float(skill)
-        self.think = 0.0
-        self.way = None
-        self.ready = 0.0
-        self.detour = 0.0
-        self.detour_dir = 1
-
-    def _los(self, world, me, foe):
-        d = math.hypot(foe.x - me.x, foe.y - me.y)
-        n = int(d // 6) + 1
-        for i in range(1, n):
-            x = me.x + (foe.x - me.x) * i / n
-            y = me.y + (foe.y - me.y) * i / n
-            if world._solid(int(y // CELL), int(x // CELL)):
-                return False
-        return True
-
-    def _next_cell(self, world, me, tx, ty):
-        start = (int(me.y // CELL), int(me.x // CELL))
-        goal = (int(ty // CELL), int(tx // CELL))
-        if world._solid(*start) or world._solid(*goal):
-            return None
-        prev = {start: None}
-        queue = [start]
-        head = 0
-        while head < len(queue):
-            cur = queue[head]
-            head += 1
-            if cur == goal:
-                break
-            r, c = cur
-            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                n = (r + dr, c + dc)
-                if n in prev or world._solid(*n):
-                    continue
-                prev[n] = cur
-                queue.append(n)
-        if goal not in prev:
-            return None
-        node = goal
-        while prev[node] is not None and prev[prev[node]] is not None:
-            node = prev[node]
-        return ((node[1] + 0.5) * CELL, (node[0] + 0.5) * CELL)
-
-    def act(self, world, me, foe, dt):
-        if not me.alive or not foe.alive:
-            return (0, 0, 0)
-        seen = self._los(world, me, foe)
-        dist = math.hypot(foe.x - me.x, foe.y - me.y)
-        self.think -= dt
-        if self.think <= 0.0:
-            self.think = self.rng.uniform(0.10, 0.22)
-            gx = foe.x
-            gy = foe.y
-            if not seen and world.powerups:
-                best = None
-                for p in world.powerups:
-                    d = (p.x - me.x) ** 2 + (p.y - me.y) ** 2
-                    if best is None or d < best[0]:
-                        best = (d, p)
-                if best is not None and best[0] < (CELL * 9.0) ** 2:
-                    gx = best[1].x
-                    gy = best[1].y
-            self.way = self._next_cell(world, me, gx, gy)
-        if seen:
-            tx = foe.x
-            ty = foe.y
-        elif self.way is not None:
-            tx, ty = self.way
-            if math.hypot(tx - me.x, ty - me.y) < 8.0:
-                self.think = 0.0
-        else:
-            tx = me.x + math.cos(me.angle) * 64.0
-            ty = me.y + math.sin(me.angle) * 64.0
-        diff = (math.atan2(ty - me.y, tx - me.x) - me.angle + math.pi) % (2 * math.pi) - math.pi
-        probe_x = me.x + math.cos(me.angle) * 26.0
-        probe_y = me.y + math.sin(me.angle) * 26.0
-        blocked = world._circle_hit(probe_x, probe_y, TANK_R)
-        if self.detour > 0.0:
-            self.detour -= dt
-            turn = self.detour_dir
-            thrust = 1
-        elif blocked and abs(diff) < 0.6:
-            self.detour = self.rng.uniform(0.35, 0.9)
-            self.detour_dir = self.rng.choice((-1, 1))
-            turn = self.detour_dir
-            thrust = 1
-        else:
-            turn = 0 if abs(diff) < 0.05 else (1 if diff > 0 else -1)
-            thrust = 1 if (not blocked and abs(diff) < 1.5) else 0
-        fire = 0
-        self.ready -= dt
-        if seen:
-            tol = math.atan2(TANK_R * (1.0 + 3.0 * (1.0 - self.skill)), max(1.0, dist))
-            safe = world.clear_ahead(me.x, me.y, me.angle, 54.0) >= 54.0
-            if abs(diff) < tol and safe and self.ready <= 0.0:
-                if self.rng.random() < 0.45 + 0.5 * self.skill:
-                    fire = 1
-                    self.ready = self.rng.uniform(0.0, 0.7 * (1.0 - self.skill))
-        else:
-            self.ready = 0.0
-        return (turn, thrust, fire)
