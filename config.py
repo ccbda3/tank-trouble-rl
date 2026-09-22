@@ -1,0 +1,23 @@
+import os
+
+GRID = 64
+FRAME_STACK = 4
+ACTIONS = 4
+AGENTS = max(2, (os.cpu_count() or 6) * 2 // 3)
+GAMMA = 0.99
+LR = 5e-4
+BATCH = 1024
+ACCUM = 4
+REPLAY_CAP = 20000
+TARGET_SYNC = 2000
+SAVE_EVERY = 5000
+CHECKPOINT_INTERVAL = 60
+EPS_START = 1.0
+EPS_END = 0.03
+EPS_DECAY = 2000000
+ALPHA = 0.6
+BETA_START = 0.4
+BETA_FRAMES = 400000
+CHECKPOINT = "snake_checkpoint.pth"
+FULL_STATE = "snake_state.pth"
+LOG = "snake_train.log"
