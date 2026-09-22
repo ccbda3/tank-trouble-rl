@@ -1,11 +1,14 @@
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 import torch
 
 import config
+
+_EDGE_CACHE = {"t": 0.0, "v": None}
 
 
 def group_avg(a, n):
@@ -16,27 +19,18 @@ def group_avg(a, n):
     return [float(a[idx[i]:idx[i + 1]].mean()) for i in range(n)]
 
 
-def net_map_bucket(b, n, conn):
-    v = int((b + 0.5) * conn / n)
-    return 0 if v < 0 else (conn - 1 if v > conn - 1 else v)
-
-
 def bucket_edges(weight, conn, n_src, n_dst):
     w = torch.abs(weight)
     while w.dim() > 2:
         w = w.mean(-1)
-    W = w.detach().cpu().numpy()
+    W = w.detach().cpu().numpy().astype(np.float32)
     t_n, s_n = W.shape
-    acc = np.zeros(conn * conn)
-    cnt = np.zeros(conn * conn)
-    for s in range(s_n):
-        gs = net_map_bucket(s, n_src, conn)
-        for t in range(t_n):
-            gt = net_map_bucket(t, n_dst, conn)
-            i = gt * conn + gs
-            acc[i] += float(W[t, s])
-            cnt[i] += 1
-    out = np.zeros(conn * conn)
+    gs = np.clip(((np.arange(s_n) + 0.5) * conn / n_src).astype(np.int64), 0, conn - 1)
+    gt = np.clip(((np.arange(t_n) + 0.5) * conn / n_dst).astype(np.int64), 0, conn - 1)
+    idx = (gt[:, None] * conn + gs[None, :]).ravel()
+    acc = np.bincount(idx, weights=W.ravel(), minlength=conn * conn)
+    cnt = np.bincount(idx, minlength=conn * conn)
+    out = np.zeros(conn * conn, np.float32)
     np.divide(acc, cnt, out=out, where=cnt > 0)
     return out
 
@@ -105,13 +99,17 @@ def act_stats(net, obs):
               "上 / 下 / 左 / 右"),
     ]
 
-    edges = [
-        [float(net.net[0].weight.abs().mean().item())] * (conn * conn),
-        bucket_edges(net.net[2].weight, conn, 24, 24).tolist(),
-        bucket_edges(net.net[4].weight, conn, 24, 24).tolist(),
-        bucket_edges(net.fc[0].weight, conn, 24, 24).tolist(),
-        bucket_edges(net.fc[2].weight, conn, 24, 24).tolist(),
-    ]
+    now = time.time()
+    if _EDGE_CACHE["v"] is None or now - _EDGE_CACHE["t"] > 5.0:
+        _EDGE_CACHE["v"] = [
+            [float(net.net[0].weight.abs().mean().item())] * (conn * conn),
+            bucket_edges(net.net[2].weight, conn, 24, 24).tolist(),
+            bucket_edges(net.net[4].weight, conn, 24, 24).tolist(),
+            bucket_edges(net.fc[0].weight, conn, 24, 24).tolist(),
+            bucket_edges(net.fc[2].weight, conn, 24, 24).tolist(),
+        ]
+        _EDGE_CACHE["t"] = now
+    edges = _EDGE_CACHE["v"]
 
     return {
         "ready": 1,
@@ -127,6 +125,8 @@ CFG = {
     "frames": config.FRAME_STACK,
     "actions": config.ACTIONS,
     "agents": config.AGENTS,
+    "workers": config.WORKERS,
+    "tickInterval": config.TICK_INTERVAL,
     "gamma": config.GAMMA,
     "lr": config.LR,
     "batch": config.BATCH,
@@ -350,7 +350,7 @@ function renderStats(d){
   var k=KEYS[i][0];h+='<div class="cd"><div class="ck">'+KEYS[i][1]+'</div><div class="cv '+KEYS[i][2]+'">'+fmt(k,d)+'</div></div>';
  }
  el("cards").innerHTML=h;
- el("cardSub").textContent="第 "+fInt(d.episodes)+" 局 · 总步数 "+fInt(d.steps)+" · 后台并行 "+fInt(d.agents)+" 路";
+ el("cardSub").textContent="第 "+fInt(d.episodes)+" 局 · 总步数 "+fInt(d.steps)+" · 并行 "+fInt(d.agents)+" 局 / "+fInt((d.config||{}).workers||0)+" 线程";
  el("help").innerHTML=[
   ["Loss（损失）","网络猜错的程度，越低越会玩；训练就是让小球往谷底滚把 Loss 压低。"],
   ["探索率 ε","从 1 慢慢降到接近 0。前期疯狂乱走试错，后期主要靠学到的策略。"],
@@ -398,7 +398,7 @@ function buildPanels(d){
  h+=row("目标网络同步",fInt(c.targetSync)+" 步");
  h+=row("经验池容量",fInt(c.replay));
  h+=row("探索率区间",fFix(c.epsStart,2)+" → "+fFix(c.epsEnd,2));
- h+=row("探索衰减总步数",fInt(c.epsDecay));
+ h+=row("探索衰减总更新数",fInt(c.epsDecay)+" 次梯度更新");
  h+=row("当前探索率",'<b id="p-eps">-</b>');
  h+=row("当前经验池",'<b id="p-buf">-</b>');
  h+='</div>';
@@ -406,12 +406,14 @@ function buildPanels(d){
  h+=row("棋盘 GRID",fInt(c.grid)+" × "+fInt(c.grid));
  h+=row("堆叠帧",fInt(c.frames)+" 帧");
  h+=row("动作数",fInt(c.actions));
- h+=row("后台并行 agent",fInt(c.agents-1)+" + 1 显示");
+ h+=row("并行环境 × 采集线程",fInt(c.agents)+" 局 × "+fInt(c.workers)+" 线程");
+ h+=row("采集节流",(Number(c.tickInterval)*1000).toFixed(1)+" ms/批 · 约 "+fInt(Number(c.agents)/Math.max(Number(c.tickInterval),1e-6))+" 步/秒");
  h+=row("帧堆叠 / 采样率","DQN 每帧决策");
  h+=row("保存权重间隔",fInt(c.ckptEvery)+" 秒");
  h+=row("完整续训保存",fInt(c.saveEvery)+" 步 + 60 秒 + 关窗");
  h+=row("β 退火帧数",fInt(c.betaFrames));
  h+='<div class="row"><span class="rk">训练步数</span><span class="rv"><b id="p-train">-</b></span></div>';
+ h+='<div class="row"><span class="rk">训练/采样比</span><span class="rv"><b id="p-ratio">-</b></span></div>';
  h+='<div class="row"><span class="rk">Loss</span><span class="rv"><b id="p-loss">-</b></span></div>';
  h+='<div class="row"><span class="rk">GPU</span><span class="rv"><b id="p-gpu">-</b></span></div>';
  h+='</div>';
@@ -421,6 +423,8 @@ function updatePanels(d){
  setT("p-eps",fFix(d.eps,3));
  setT("p-buf",fInt(d.buffer));
  setT("p-train",fInt(d.trainSteps));
+ var cc=d.config||{},bs=Number(cc.batch)||1,st=Number(d.steps)||1;
+ setT("p-ratio",(Number(d.trainSteps)*bs/st).toFixed(2)+" ×");
  setT("p-loss",fFix(d.loss,4));
  setT("p-gpu",d.gpu>0?d.gpu+"%":"CPU 训练");
  el("paramSub").textContent="第 "+fInt(d.episodes)+" 局 · 步数 "+fInt(d.steps)+" · "+fFix(d.loss,4)+" Loss";

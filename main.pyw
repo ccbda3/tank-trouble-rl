@@ -37,7 +37,7 @@ else:
 import config
 import env
 import snake
-from agent import Agent, Counter
+from agent import Agent, Counter, EnvWorker
 from buffer import PrioritizedReplayBuffer
 from monitor import Monitor, act_stats
 from network import DQN, DEVICE
@@ -140,9 +140,11 @@ def main():
     trainer = Trainer(net, target_net, buffer, optimizer, counter, config, stats, writer=writer)
     threading.Thread(target=trainer.loop, args=(stop_event,), daemon=True).start()
 
-    for _ in range(config.AGENTS - 1):
-        ag = Agent(net, buffer, env.Env(config.GRID, config.FRAME_STACK), counter, config, stats)
-        threading.Thread(target=ag.loop, args=(stop_event,), daemon=True).start()
+    per_worker = max(1, config.AGENTS // config.WORKERS)
+    for _ in range(config.WORKERS):
+        envs = [env.Env(config.GRID, config.FRAME_STACK) for _ in range(per_worker)]
+        worker = EnvWorker(net, buffer, envs, counter, config, stats, trainer)
+        threading.Thread(target=worker.loop, args=(stop_event,), daemon=True).start()
 
     pygame.init()
     info = pygame.display.Info()
@@ -153,7 +155,7 @@ def main():
     clock = pygame.time.Clock()
 
     r_env = env.Env(config.GRID, config.FRAME_STACK)
-    r_agent = Agent(net, buffer, r_env, counter, config, stats)
+    r_agent = Agent(net, buffer, r_env, counter, config, stats, trainer)
 
     mon_port = [0]
 

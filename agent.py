@@ -2,6 +2,7 @@ import random
 import threading
 import time
 
+import numpy as np
 import torch
 
 from network import DEVICE
@@ -26,15 +27,25 @@ class Counter:
             self.value = value
 
 
+def epsilon_of(trainer, config):
+    ratio = min(1.0, trainer.train_steps / config.EPS_DECAY)
+    eps = config.EPS_START - (config.EPS_START - config.EPS_END) * ratio
+    return max(config.EPS_END, eps)
+
+
 class Agent:
-    def __init__(self, net, buffer, env, counter, config, stats):
+    def __init__(self, net, buffer, env, counter, config, stats, trainer):
         self.net = net
         self.buffer = buffer
         self.env = env
         self.counter = counter
         self.config = config
         self.stats = stats
+        self.trainer = trainer
         self.actions = net.fc[-1].out_features
+
+    def epsilon(self):
+        return epsilon_of(self.trainer, self.config)
 
     def act(self, s):
         if random.random() < self.epsilon():
@@ -43,27 +54,49 @@ class Agent:
             q = self.net(torch.tensor(s, dtype=torch.float32, device=DEVICE).unsqueeze(0))
             return int(q.argmax().item())
 
-    def epsilon(self):
-        steps = self.counter.get()
-        ratio = min(1.0, steps / self.config.EPS_DECAY)
-        eps = self.config.EPS_START - (self.config.EPS_START - self.config.EPS_END) * ratio
-        return max(self.config.EPS_END, eps)
 
-    def run_episode(self):
-        s = self.env.reset()
-        done = False
-        while not done:
-            a = self.act(s)
-            s2, r, done = self.env.step(a)
-            self.buffer.push(s, a, r, s2, done)
-            self.counter.add(1)
-            s = s2
-        return self.env.score
+class EnvWorker:
+    def __init__(self, net, buffer, envs, counter, config, stats, trainer):
+        self.net = net
+        self.buffer = buffer
+        self.envs = list(envs)
+        self.counter = counter
+        self.config = config
+        self.stats = stats
+        self.trainer = trainer
+        self.actions = net.fc[-1].out_features
+
+    def epsilon(self):
+        return epsilon_of(self.trainer, self.config)
+
+    def act_batch(self, states, eps):
+        n = len(states)
+        if random.random() < eps:
+            return [random.randrange(self.actions) for _ in range(n)]
+        with torch.no_grad():
+            x = torch.tensor(np.stack(states), dtype=torch.float32, device=DEVICE)
+            return self.net(x).argmax(1).cpu().tolist()
 
     def loop(self, stop_event):
+        n = len(self.envs)
+        states = [e.reset() for e in self.envs]
+        interval = getattr(self.config, "TICK_INTERVAL", 0.0)
         while not stop_event.is_set():
-            score = self.run_episode()
-            with self.stats["lock"]:
-                self.stats["recent"].append(score)
-                self.stats["episodes"] += 1
-            time.sleep(0.001)
+            t0 = time.perf_counter()
+            acts = self.act_batch(states, self.epsilon())
+            for i in range(n):
+                s = states[i]
+                s2, r, done = self.envs[i].step(acts[i])
+                self.buffer.push(s, acts[i], r, s2, done)
+                self.counter.add(1)
+                if done:
+                    with self.stats["lock"]:
+                        self.stats["recent"].append(self.envs[i].score)
+                        self.stats["episodes"] += 1
+                    states[i] = self.envs[i].reset()
+                else:
+                    states[i] = s2
+            if interval > 0:
+                rest = interval - (time.perf_counter() - t0)
+                if rest > 0:
+                    time.sleep(rest)
