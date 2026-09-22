@@ -5,10 +5,6 @@ import sys
 import time
 
 import numpy as np
-import torchfix
-
-torchfix.apply()
-
 import torch
 
 import buffer
