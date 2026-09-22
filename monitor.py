@@ -245,16 +245,16 @@ main{display:flex;flex-direction:column;gap:10px;padding:10px;min-width:0}
 <div class="charts" id="charts"></div>
 </section>
 <section class="card">
-<div class="chead"><span class="ctitle">神经网络前向传播</span><span class="csub" id="netSub">等待复杂数据…</span><span class="chint">收到新快照就按真实层序重放一次前向传播 · 3D 可拖拽旋转/滚轮缩放 · 悬停节点看细节</span><button class="vbtn on" id="v-3d" data-view="3d">3D 立体</button><button class="vbtn" id="v-2d" data-view="2d">2D 平面</button></div>
+<div class="chead"><span class="ctitle">神经网络连接强度</span><span class="csub" id="netSub">等待数据…</span><span class="chint">每秒取一次真实前向快照 · 连线亮度 = 权重 × 源激活 · 3D 可拖拽旋转/滚轮缩放 · 悬停节点看细节</span><button class="vbtn on" id="v-3d" data-view="3d">3D 立体</button><button class="vbtn" id="v-2d" data-view="2d">2D 平面</button></div>
 <div class="netwrap" id="netwrap">
 <canvas id="netcv"></canvas>
 <div class="nettip" id="nettip"></div>
 </div>
 <div class="netlegend">
 <span><i style="background:linear-gradient(90deg,#101e2a,#2f6f97,#8ce0fa)"></i>节点颜色 = 该层激活强度（按本层节点值 min~max 归一）</span>
-<span><i style="background:linear-gradient(90deg,rgba(126,170,216,.05),rgba(126,170,216,.9))"></i>连线透明度 = 归一权重 × 源节点激活</span>
-<span><i style="background:#b0e2ff"></i>脉冲沿连线由输入侧流向输出侧 · 亮度 = 连接强度</span>
-<span><i style="background:#ffb020"></i>最强通路（权重 × 源激活）</span>
+<span><i style="background:linear-gradient(90deg,rgba(126,170,216,.05),rgba(126,170,216,.9))"></i>连线明暗与粗细 = 权重 × 源节点激活，越强越亮</span>
+<span><i style="background:#ffb020"></i>最强通路</span>
+<span>每秒随训练快照刷新一次（拖动/缩放时即时重绘）</span>
 </div>
 </section>
 <section class="card">
@@ -430,8 +430,7 @@ function updatePanels(d){
  setT("p-gpu",d.gpu>0?d.gpu+"%":"CPU 训练");
  el("paramSub").textContent="第 "+fInt(d.episodes)+" 局 · 步数 "+fInt(d.steps)+" · "+fFix(d.loss,4)+" Loss";
 }
-var NET={raf:0,ready:false,layers:[],edges:[],conn:0,act:[],pick:[],anim:[],maxS:1,hover:null,hoverKey:"",view:null,mode:"3d",iter:0,samples:0,value:0,budget:480,brands:8,cv:null,ctx:null,t0:0,lastDraw:0,pairs:[[0,1],[1,2],[2,3],[3,4],[4,5]],cam:{yaw:-1.05,pitch:0.30,dist:40.0,drag:false,lx:0,ly:0}};
-var NET_HOP=205,NET_CYCLE=2500;
+var NET={ready:false,layers:[],edges:[],conn:0,act:[],pick:[],maxS:1,hover:null,hoverKey:"",view:null,mode:"3d",iter:0,samples:0,value:0,budget:480,cv:null,ctx:null,pairs:[[0,1],[1,2],[2,3],[3,4],[4,5]],cam:{yaw:-1.05,pitch:0.30,dist:40.0,drag:false,lx:0,ly:0}};
 var NET_FONT='10px "Microsoft YaHei UI","Segoe UI",sans-serif';
 function netBucket(b,n,conn){var v=Math.floor((b+0.5)*conn/n);return v<0?0:(v>conn-1?conn-1:v);}
 function netColorRange(ly){var cnt=Math.max(1,ly.nodeCount|0),raw=ly.nodes||[],lo=Infinity,hi=-Infinity,j,v;for(j=0;j<cnt;j++){v=Number(raw[j]);if(!isFinite(v))continue;if(v<lo)lo=v;if(v>hi)hi=v;}return isFinite(lo)&&isFinite(hi)?[lo,hi]:[0,0];}
@@ -464,18 +463,15 @@ function buildNetPick(){
  NET.strong=all.length?all[all.length-1]:null;
  NET.maxS=1e-9;
  for(i=0;i<all.length;i++)if(all[i].v>NET.maxS)NET.maxS=all[i].v;
- var animSub=[];
- for(i=0;i<all.length;i++)if(all[i].v/NET.maxS>=0.26)animSub.push(all[i]);
- NET.anim=animSub;
 }
 function prepNet(d){
- NET.ready=false;NET.layers=[];NET.edges=[];NET.conn=0;NET.act=[];NET.pick=[];NET.anim=[];NET.strong=null;
+ NET.ready=false;NET.layers=[];NET.edges=[];NET.conn=0;NET.act=[];NET.pick=[];NET.strong=null;
  if(!d||Number(d.ready)!==1)return;
  var L=d.layers||[],conn=Number(d.conn)|0;
  if(!L.length||conn<2)return;
  NET.layers=L;NET.edges=d.edges||[];NET.conn=conn;
  NET.iter=Number(d.iteration);NET.samples=Number(d.samples);NET.value=Number(d.value);
- NET.ready=true;buildNetPick();NET.t0=0;
+ NET.ready=true;buildNetPick();
 }
 function netEmptyFrame(ctx,w,h){
  ctx.save();ctx.setLineDash([6,5]);ctx.strokeStyle="rgba(120,140,168,.24)";ctx.lineWidth=1;ctx.strokeRect(15.5,15.5,w-31,h-31);ctx.restore();
@@ -487,14 +483,14 @@ function netProj(c,x,y,z){var vx=x-c.ox,vy=y-c.oy,vz=z-c.oz;var cz=vx*c.fx+vy*c.
 function netGrid(count){if(count<=1)return[1,1];var cols=Math.max(1,Math.ceil(Math.sqrt(count*1.9)));return[cols,Math.ceil(count/cols)];}
 function netLayout(){var L=NET.layers,n=L.length,i,j,gap=2.6,pitch=0.40,zSpan=(n-1)*gap,boxes=[];for(i=0;i<n;i++){var cnt=Math.max(1,L[i].nodeCount|0);var cr=netGrid(cnt),cols=cr[0],rows=cr[1];var x=i*gap-zSpan*0.5;var pts=[];for(j=0;j<cnt;j++){var g=Math.floor(j/cols),c=j%cols;pts.push([(c-(cols-1)*0.5)*pitch,((rows-1)*0.5-g)*pitch]);}boxes.push({x:x,cols:cols,rows:rows,pts:pts,cnt:cnt,halfY:(cols-1)*0.5*pitch,halfZ:(rows-1)*0.5*pitch});}return {boxes:boxes,gap:gap,zSpan:zSpan};}
 function netFitFocal(lay,w,h){var c=netCam(NET.cam.yaw,NET.cam.pitch,40.0);var mx=1e-4,my=1e-4,i,k;for(i=0;i<lay.boxes.length;i++){var b=lay.boxes[i],ey=b.halfY+0.30,ez=b.halfZ+0.30;var cand=[[b.x,ey,ez],[b.x,-ey,ez],[b.x,ey,-ez],[b.x,-ey,-ez]];for(k=0;k<4;k++){var p=netProj(c,cand[k][0],cand[k][1],cand[k][2]);if(Math.abs(p[0])>mx)mx=Math.abs(p[0]);if(Math.abs(p[1])>my)my=Math.abs(p[1]);}}return Math.min(w*0.46/mx,h*0.42/my);}
-function drawNet3D(ts){
+function drawNet3D(){
  var cv=NET.cv,ctx=NET.ctx;if(!cv||!ctx)return;
  var w=cv.clientWidth|0,h=cv.clientHeight|0;if(w<40||h<40)return;
  var dpr=Math.min(window.devicePixelRatio||1,2),nw=Math.round(w*dpr),nh=Math.round(h*dpr);
  if(cv.width!==nw||cv.height!==nh){cv.width=nw;cv.height=nh;}
  ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
  if(!NET.ready){NET.view=null;netEmptyFrame(ctx,w,h);return;}
- var L=NET.layers,n=L.length,i,j,k,lay=netLayout();
+ var L=NET.layers,n=L.length,i,j,lay=netLayout();
  var FOCAL=netFitFocal(lay,w,h),c=netCam(NET.cam.yaw,NET.cam.pitch,NET.cam.dist);
  var ox=w*0.5,oy=h*0.52,act=NET.act||[],scr=[],flat=[];
  for(i=0;i<n;i++){var b=lay.boxes[i],A=act[i]||netNodeAct(L[i]),col=[];
@@ -503,65 +499,71 @@ function drawNet3D(ts){
  NET.view={nodes:flat,cols:null};
  var zmin=Infinity,zmax=-Infinity;for(i=0;i<flat.length;i++){if(flat[i].z<zmin)zmin=flat[i].z;if(flat[i].z>zmax)zmax=flat[i].z;}var zspan=(zmax-zmin)||1;
  function depthF(z){var q=(z-zmin)/zspan;return q<0?0:(q>1?1:q);}
- var t=Number(ts)||0;if(!NET.t0)NET.t0=t;
- var wt=(t-NET.t0)%NET_CYCLE,pairs=NET.pairs,lastCol=n-1;
- function waveDepth(e){var d=(pairs[e]||[e,e+1])[0];return d<lastCol-1?d:lastCol-1;}
- var pick=NET.pick,edges=[];for(i=0;i<pick.length;i++){var q=pick[i],A2=scr[q.s]&&scr[q.s][q.j],B2=scr[q.t]&&scr[q.t][q.i];if(!A2||!B2)continue;var st=q.w*(0.22+0.78*q.a)<0?0:(q.w*(0.22+0.78*q.a)>1?1:q.w*(0.22+0.78*q.a));if(st<0.03)continue;edges.push({A:A2,B:B2,st:st,z:(A2.z+B2.z)*0.5});}
- edges.sort(function(p,q){return q.z-p.z;});
- var BANDS=5,bands=[];for(k=0;k<BANDS;k++)bands.push([]);
- for(i=0;i<edges.length;i++)bands[Math.min(BANDS-1,Math.floor(depthF(edges[i].z)*BANDS))].push(edges[i]);
- ctx.lineWidth=1;
- for(k=0;k<BANDS;k++){var band=bands[k];if(!band.length)continue;var fb=1-(k+0.5)/BANDS;ctx.strokeStyle="rgba(126,170,216,"+(0.10+0.30*fb).toFixed(3)+")";ctx.beginPath();for(i=0;i<band.length;i++){ctx.moveTo(band[i].A.x,band[i].A.y);ctx.lineTo(band[i].B.x,band[i].B.y);}ctx.stroke();}
- var anim=NET.anim,maxS=NET.maxS||1;ctx.lineCap="round";
- for(i=0;i<anim.length;i++){var pp=anim[i],u=(wt-waveDepth(pp.e)*NET_HOP)/NET_HOP;if(u<0||u>1)continue;var A3=scr[pp.s]&&scr[pp.s][pp.j],B3=scr[pp.t]&&scr[pp.t][pp.i];if(!A3||!B3)continue;var sn=pp.v/maxS,u0=u-0.34;if(u0<0)u0=0;var x1=A3.x+(B3.x-A3.x)*u,y1=A3.y+(B3.y-A3.y)*u;var fz=depthF((A3.z+B3.z)*0.5),fade=1-0.5*fz;ctx.strokeStyle="rgba(178,228,255,"+((0.18+0.82*sn)*fade).toFixed(3)+")";ctx.lineWidth=(1+1.8*sn)*fade<0.6?0.6:((1+1.8*sn)*fade>2.8?2.8:(1+1.8*sn)*fade);ctx.beginPath();ctx.moveTo(A3.x+(B3.x-A3.x)*u0,A3.y+(B3.y-A3.y)*u0);ctx.lineTo(x1,y1);ctx.stroke();if(sn>0.30){ctx.beginPath();ctx.arc(x1,y1,(0.056*FOCAL/((A3.z+B3.z)*0.5))<0.6?0.6:((0.056*FOCAL/((A3.z+B3.z)*0.5))>3.4?3.4:0.056*FOCAL/((A3.z+B3.z)*0.5))*(0.6+0.8*sn),0,Math.PI*2);ctx.fillStyle="rgba(238,250,255,"+((0.24+0.76*sn)*fade).toFixed(3)+")";ctx.fill();}}
+ var pick=NET.pick,edges=[];
+ for(i=0;i<pick.length;i++){var q=pick[i],A2=scr[q.s]&&scr[q.s][q.j],B2=scr[q.t]&&scr[q.t][q.i];if(!A2||!B2)continue;var st=q.v/(NET.maxS||1);if(st<0.03)continue;edges.push({A:A2,B:B2,st:st,z:(A2.z+B2.z)*0.5});}
+ edges.sort(function(p,q2){return q2.z-p.z;});
+ ctx.lineCap="round";
+ for(i=0;i<edges.length;i++){
+  var ed=edges[i],fz=depthF(ed.z),fade=1-0.55*fz;
+  ctx.strokeStyle="rgba(150,205,246,"+((0.06+0.68*ed.st)*fade).toFixed(3)+")";
+  ctx.lineWidth=0.5+1.7*ed.st;
+  ctx.beginPath();ctx.moveTo(ed.A.x,ed.A.y);ctx.lineTo(ed.B.x,ed.B.y);ctx.stroke();
+ }
  ctx.lineCap="butt";
  var order=[];for(i=0;i<flat.length;i++)order.push(i);
- order.sort(function(p,q){return flat[q].z-flat[p].z;});
- for(k=0;k<order.length;k++){var nd2=flat[order[k]],age=wt-Math.min(nd2.li,lastCol-1)*NET_HOP;var fl=1-Math.abs(age)/(NET_HOP*1.7);fl=fl<0?0:(fl>1?1:fl);fl=fl*fl*(3-2*fl);var fade2=1-0.45*depthF(nd2.z);if(fl>0.06){ctx.beginPath();ctx.arc(nd2.x,nd2.y,nd2.r+1.0+3.0*fl,0,Math.PI*2);ctx.fillStyle="rgba(150,214,255,"+((0.05+0.34*fl*(0.35+0.65*nd2.a))*fade2).toFixed(3)+")";ctx.fill();}ctx.beginPath();ctx.arc(nd2.x,nd2.y,nd2.r,0,Math.PI*2);ctx.fillStyle=netColor((nd2.a*0.72+fl*0.5)<0?0:((nd2.a*0.72+fl*0.5)>1?1:nd2.a*0.72+fl*0.5));ctx.fill();}
+ order.sort(function(p,q2){return flat[q2].z-flat[p].z;});
+ for(var k=0;k<order.length;k++){var nd2=flat[order[k]],fade2=1-0.45*depthF(nd2.z);
+  if(nd2.a>0.5){ctx.beginPath();ctx.arc(nd2.x,nd2.y,nd2.r+1.2+2.4*nd2.a,0,Math.PI*2);ctx.fillStyle="rgba(150,214,255,"+(0.05+0.24*nd2.a*fade2).toFixed(3)+")";ctx.fill();}
+  ctx.beginPath();ctx.arc(nd2.x,nd2.y,nd2.r,0,Math.PI*2);ctx.fillStyle=netColor(nd2.a);ctx.fill();}
  var st2=NET.strong;
  if(st2){var SA=scr[st2.s]&&scr[st2.s][st2.j],SB=scr[st2.t]&&scr[st2.t][st2.i];if(SA&&SB){ctx.save();ctx.strokeStyle="rgba(255,176,32,.85)";ctx.lineWidth=1.8;ctx.shadowColor="rgba(255,176,32,.8)";ctx.shadowBlur=9;ctx.beginPath();ctx.moveTo(SA.x,SA.y);ctx.lineTo(SB.x,SB.y);ctx.stroke();ctx.restore();}}
  ctx.textAlign="center";ctx.textBaseline="alphabetic";
  for(i=0;i<n;i++){var bb=lay.boxes[i],lyr=L[i],lp=netProj(c,bb.x,0,bb.halfZ+0.42);var lx=ox+lp[0]*FOCAL,ly=oy-lp[1]*FOCAL;var al2=0.55+0.45*(1-depthF(lp[2]));ctx.font='700 12px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="rgba(223,231,239,"+al2.toFixed(2)+")";ctx.fillText(String(lyr.name||""),lx,ly);ctx.font=NET_FONT;ctx.fillStyle="rgba(139,149,163,"+al2.toFixed(2)+")";ctx.fillText(String(lyr.detail||""),lx,ly+13);ctx.fillStyle="rgba(102,112,125,"+al2.toFixed(2)+")";ctx.fillText("激活均值 "+fSmart(Number(lyr.actMean)),lx,ly+25);}
  var hv=NET.hover;
  if(hv&&scr[hv.li]&&scr[hv.li][hv.bi]){var hn=scr[hv.li][hv.bi];ctx.strokeStyle="#e8eef5";ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(hn.x,hn.y,hn.r+3.4,0,Math.PI*2);ctx.stroke();}
- var dNow=Math.min(lastCol-1,Math.floor(wt/NET_HOP));
  ctx.font=NET_FONT;ctx.textAlign="left";ctx.fillStyle="rgba(170,208,240,.8)";
- ctx.fillText("3D 立体 · 前向传播重放 · 波前 "+(dNow+1)+"/"+lastCol+" 层 · 拖动旋转 · 滚轮缩放",8,14);
+ ctx.fillText("3D 立体 · 连线亮度 = 权重 × 源激活 · 每秒刷新 · 拖动旋转 · 滚轮缩放",8,14);
 }
-function drawNet2D(ts){
+function drawNet2D(){
  var cv=NET.cv,ctx=NET.ctx;if(!cv||!ctx)return;
  var w=cv.clientWidth|0,h=cv.clientHeight|0;if(w<40||h<40)return;
  var dpr=Math.min(window.devicePixelRatio||1,2),nw=Math.round(w*dpr),nh=Math.round(h*dpr);
  if(cv.width!==nw||cv.height!==nh){cv.width=nw;cv.height=nh;}
  ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
  if(!NET.ready){NET.view=null;netEmptyFrame(ctx,w,h);return;}
- var L=NET.layers,n=L.length,i,j,b;
+ var L=NET.layers,n=L.length,i,j;
  var padX=Math.max(34,Math.min(74,w*0.05));
  var step=n>1?(w-padX*2)/(n-1):0;
  var yTop=60,yBot=h-80;if(yBot-yTop<100){yTop=48;yBot=h-64;}
  var cols=[],nodes=[];
  for(i=0;i<n;i++){var ly=L[i],cnt=Math.max(1,ly.nodeCount|0),x=padX+step*i;var sp=cnt>1?(yBot-yTop)/(cnt-1):0;var rad=cnt>1?((sp*0.34)<1.5?1.5:(sp*0.34>5.2?5.2:sp*0.34)):6.5;var ys=[];for(j=0;j<cnt;j++)ys.push(cnt>1?yTop+sp*j:(yTop+yBot)*0.5);var col={x:x,ys:ys,r:rad,act:NET.act[i]||netNodeAct(ly),sc:netColorRange(ly),ly:ly};cols.push(col);for(j=0;j<ys.length;j++)nodes.push({x:x,y:ys[j],r:rad,li:i,bi:j,a:col.act[j]});}
  NET.view={nodes:nodes,cols:cols};
- var pairs=NET.pairs,lastCol=n-1;
- function waveDepth(e){var d=(pairs[e]||[e,e+1])[0];return d<lastCol-1?d:lastCol-1;}
- var LEVELS=5,bands=[],pick=NET.pick;for(b=0;b<LEVELS;b++)bands.push([]);
- for(i=0;i<pick.length;i++){var p=pick[i],al=p.w*(0.22+0.78*p.a);al=al<0?0:(al>1?1:al)*0.92;if(al<0.014)continue;bands[Math.min(LEVELS-1,Math.max(0,Math.round(al*LEVELS)-1))].push(p);}
- var t=Number(ts)||0;if(!NET.t0)NET.t0=t;var wt=(t-NET.t0)%NET_CYCLE;ctx.lineWidth=1;
- for(b=0;b<LEVELS;b++){var band=bands[b];if(!band.length)continue;ctx.strokeStyle="rgba(126,170,216,"+(((b+1)/LEVELS)*0.36).toFixed(3)+")";ctx.beginPath();for(i=0;i<band.length;i++){var q=band[i],qa=cols[q.s],qb=cols[q.t];ctx.moveTo(qa.x+qa.r,qa.ys[q.j]);ctx.lineTo(qb.x-qb.r,qb.ys[q.i]);}ctx.stroke();}
- var anim=NET.anim,maxS=NET.maxS||1;ctx.lineCap="round";
- for(i=0;i<anim.length;i++){var pp=anim[i],u=(wt-waveDepth(pp.e)*NET_HOP)/NET_HOP;if(u<0||u>1)continue;var sn=pp.v/maxS,ca=cols[pp.s],cb=cols[pp.t];if(!ca||!cb)continue;var x0=ca.x+ca.r,y0=ca.ys[pp.j],x1=cb.x-cb.r,y1=cb.ys[pp.i],u0=u-0.34;if(u0<0)u0=0;ctx.strokeStyle="rgba(178,228,255,"+(0.18+0.82*sn).toFixed(3)+")";ctx.lineWidth=1+1.7*sn;ctx.beginPath();ctx.moveTo(x0+(x1-x0)*u0,y0+(y1-y0)*u0);ctx.lineTo(x0+(x1-x0)*u,y0+(y1-y0)*u);ctx.stroke();if(sn>0.35){ctx.beginPath();ctx.arc(x0+(x1-x0)*u,y0+(y1-y0)*u,0.8+2.2*sn,0,Math.PI*2);ctx.fillStyle="rgba(238,250,255,"+(0.28+0.72*sn).toFixed(3)+")";ctx.fill();}}
+ var pick=NET.pick,maxS=NET.maxS||1;
+ ctx.lineCap="round";
+ for(i=0;i<pick.length;i++){
+  var q=pick[i],qa=cols[q.s],qb=cols[q.t];
+  if(!qa||!qb)continue;
+  var al=q.v/maxS;
+  if(al<0.03)continue;
+  ctx.strokeStyle="rgba(150,205,246,"+(0.06+0.70*al).toFixed(3)+")";
+  ctx.lineWidth=0.5+1.7*al;
+  ctx.beginPath();ctx.moveTo(qa.x+qa.r,qa.ys[q.j]);ctx.lineTo(qb.x-qb.r,qb.ys[q.i]);ctx.stroke();
+ }
  ctx.lineCap="butt";
- for(i=0;i<n;i++){var cc=cols[i],age=wt-Math.min(i,lastCol-1)*NET_HOP;var fl=1-Math.abs(age)/(NET_HOP*1.7);fl=fl<0?0:(fl>1?1:fl);fl=fl*fl*(3-2*fl);for(j=0;j<cc.ys.length;j++){var a=cc.act[j];if(fl>0.06){ctx.beginPath();ctx.arc(cc.x,cc.ys[j],cc.r+1.0+3.2*fl,0,Math.PI*2);ctx.fillStyle="rgba(150,214,255,"+(0.05+0.36*fl*(0.35+0.65*a)).toFixed(3)+")";ctx.fill();}ctx.beginPath();ctx.arc(cc.x,cc.ys[j],cc.r,0,Math.PI*2);ctx.fillStyle=netColor((a*0.72+fl*0.5)<0?0:((a*0.72+fl*0.5)>1?1:a*0.72+fl*0.5));ctx.fill();}}
+ for(i=0;i<n;i++){var cc=cols[i];
+  for(j=0;j<cc.ys.length;j++){var a=cc.act[j];
+   if(a>0.5){ctx.beginPath();ctx.arc(cc.x,cc.ys[j],cc.r+1.2+2.6*a,0,Math.PI*2);ctx.fillStyle="rgba(150,214,255,"+(0.05+0.26*a).toFixed(3)+")";ctx.fill();}
+   ctx.beginPath();ctx.arc(cc.x,cc.ys[j],cc.r,0,Math.PI*2);ctx.fillStyle=netColor(a);ctx.fill();}}
  var st=NET.strong;
- if(st){var sa=cols[st.s],sb=cols[st.t];var x0=sa.x+sa.r,y0=sa.ys[st.j],x1=sb.x-sb.r,y1=sb.ys[st.i];ctx.save();ctx.strokeStyle="#ffb020";ctx.lineWidth=2;ctx.shadowColor="rgba(255,176,32,.85)";ctx.shadowBlur=11;ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.stroke();ctx.restore();ctx.strokeStyle="rgba(255,213,138,.95)";ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(sa.x,y0,sa.r+3.4,0,Math.PI*2);ctx.stroke();ctx.beginPath();ctx.arc(sb.x,y1,sb.r+3.4,0,Math.PI*2);ctx.stroke();ctx.textAlign="left";ctx.textBaseline="middle";ctx.font=NET_FONT;ctx.fillStyle="#ffd58a";ctx.fillText("最强通路 权重 "+st.w.toFixed(3),"6",h-8);ctx.textBaseline="alphabetic";}
+ if(st){var sa=cols[st.s],sb=cols[st.t];var x0=sa.x+sa.r,y0=sa.ys[st.j],x1=sb.x-sb.r,y1=sb.ys[st.i];ctx.save();ctx.strokeStyle="#ffb020";ctx.lineWidth=2;ctx.shadowColor="rgba(255,176,32,.85)";ctx.shadowBlur=11;ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.stroke();ctx.restore();ctx.strokeStyle="rgba(255,213,138,.95)";ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(sa.x,y0,sa.r+3.4,0,Math.PI*2);ctx.stroke();ctx.beginPath();ctx.arc(sb.x,y1,sb.r+3.4,0,Math.PI*2);ctx.stroke();ctx.textAlign="left";ctx.textBaseline="middle";ctx.font=NET_FONT;ctx.fillStyle="#ffd58a";ctx.fillText("最强通路 强度 "+st.v.toFixed(3),"6",h-8);ctx.textBaseline="alphabetic";}
  ctx.textAlign="center";
  for(i=0;i<n;i++){var cl=cols[i],lyr=cl.ly;ctx.font='700 12px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="#dfe7ef";ctx.fillText(String(lyr.name||""),cl.x,16);ctx.font=NET_FONT;ctx.fillStyle="#8b95a3";ctx.fillText(String(lyr.detail||""),cl.x,30);ctx.font=NET_FONT;ctx.fillStyle="#66707d";ctx.textAlign="center";ctx.fillText("真实宽度 "+(lyr.trueDim|0),cl.x,43);var bw2=(step>0?step*0.62:90)<40?40:((step>0?step*0.62:90)>150?150:step>0?step*0.62:90);var gx=cl.x-bw2*0.5,gy=h-62;for(j=0;j<24;j++){ctx.fillStyle=netColor(j/23);ctx.fillRect(gx+bw2*j/24,gy,bw2/24+1,7);}ctx.strokeStyle="rgba(220,235,250,.2)";ctx.lineWidth=1;ctx.strokeRect(gx+.5,gy+.5,bw2,7);ctx.font=NET_FONT;ctx.fillStyle="#8794a3";ctx.textAlign="left";ctx.fillText(fSmart(cl.sc[0]),gx,gy+21);ctx.textAlign="right";ctx.fillText(fSmart(cl.sc[1]),gx+bw2,gy+21);ctx.textAlign="center";ctx.fillStyle="#79828f";ctx.fillText("均值 "+fSmart(Number(lyr.actMean)),cl.x,gy+36);ctx.fillStyle="#66707d";ctx.fillText("全层 "+fSmart(Number(lyr.actMin))+" ~ "+fSmart(Number(lyr.actMax)),cl.x,gy+48);}
  if(NET.hover&&cols[NET.hover.li]){var hc=cols[NET.hover.li],hy=hc.ys[NET.hover.bi];if(hy!==undefined){ctx.strokeStyle="#e8eef5";ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(hc.x,hy,hc.r+3.6,0,Math.PI*2);ctx.stroke();}}
- var dNow=Math.min(lastCol-1,Math.floor(wt/NET_HOP));ctx.font=NET_FONT;ctx.textAlign="left";ctx.textBaseline="alphabetic";ctx.fillStyle="rgba(170,208,240,.8)";ctx.fillText("前向传播重放 · 波前 "+(dNow+1)+"/"+lastCol+" 层",8,14);
+ ctx.font=NET_FONT;ctx.textAlign="left";ctx.textBaseline="alphabetic";ctx.fillStyle="rgba(170,208,240,.8)";ctx.fillText("2D 平面 · 连线亮度 = 权重 × 源激活 · 每秒刷新",8,14);
 }
-function drawNet(ts){if(NET.mode==="3d"){drawNet3D(ts);return;}drawNet2D(ts);}
-function netAnimFrame(ts){if(!NET.ready){NET.raf=0;return;}NET.raf=requestAnimationFrame(netAnimFrame);if(ts-NET.lastDraw<24)return;NET.lastDraw=ts;drawNet(ts);}
-function requestNet(){if(NET.ready){if(!NET.raf)NET.raf=requestAnimationFrame(netAnimFrame);return;}if(NET.raf){cancelAnimationFrame(NET.raf);NET.raf=0;}drawNet(0);}
+function drawNet(){if(NET.mode==="3d"){drawNet3D();return;}drawNet2D();}
+var netRaf=0;
+function requestNet(){if(netRaf)return;netRaf=requestAnimationFrame(function(){netRaf=0;drawNet();});}
 function netHit(mx,my){var v=NET.view;if(!v)return null;var best=null,bd=Infinity,i,nd,d,rr;for(i=0;i<v.nodes.length;i++){nd=v.nodes[i];d=(nd.x-mx)*(nd.x-mx)+(nd.y-my)*(nd.y-my);rr=nd.r+4;if(d<=rr*rr&&d<bd){bd=d;best=nd;}}return best;}
 function netTipHTML(hit){
  var L=NET.layers,ly=L[hit.li],j=hit.bi;
@@ -587,9 +589,9 @@ function netTipShow(hit,cx,cy){var tip=el("nettip"),wrap=el("netwrap");if(!tip||
 function setNetMode(v){NET.mode=(v==="2d")?"2d":"3d";var a=el("v-3d"),b=el("v-2d");
  if(a)a.className="vbtn"+(NET.mode==="3d"?" on":"");
  if(b)b.className="vbtn"+(NET.mode==="2d"?" on":"");
- if(NET.cv)NET.cv.style.cursor=(NET.mode==="3d")?"grab":"default";NET.t0=0;requestNet();}
+ if(NET.cv)NET.cv.style.cursor=(NET.mode==="3d")?"grab":"default";requestNet();}
 function renderNetwork(dd){prepNet(dd);var tip=el("nettip");if(NET.ready){NET.value=(dd&&Number(dd.value))||0;NET.iter=(dd&&Number(dd.iteration))||0;NET.samples=(dd&&Number(dd.samples))||0;
- el("netSub").textContent="第 "+fInt(NET.iter)+" 步快照 · "+fInt(NET.samples)+" 局 · 最优 Q "+fFix(NET.value,4)+" · 边缘矩阵 "+NET.conn+"×"+NET.conn+" · 可见连线 "+fInt(NET.pick.length)+" · 动态脉冲 "+fInt(NET.anim.length);
+ el("netSub").textContent="第 "+fInt(NET.iter)+" 步快照 · "+fInt(NET.samples)+" 局 · 最优 Q "+fFix(NET.value,4)+" · 边缘矩阵 "+NET.conn+"×"+NET.conn+" · 可见连线 "+fInt(NET.pick.length)+" · 最强强度 "+fFix(NET.maxS,3);
  }else{el("netSub").textContent="等待网络快照…";NET.hover=null;NET.hoverKey="";if(tip){tip.className="nettip";tip.innerHTML="";}}
  requestNet();}
 function bindNet(){

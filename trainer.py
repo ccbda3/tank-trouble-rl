@@ -12,8 +12,8 @@ log = logging.getLogger("snake")
 def load_optimizer(optimizer, state):
     own = {p.shape for g in optimizer.param_groups for p in g["params"]}
     for item in state["state"].values():
-        for v in item.values():
-            if hasattr(v, "shape") and v.shape not in own:
+        for k, v in item.items():
+            if k in ("exp_avg", "exp_avg_sq") and v.shape not in own:
                 return False
     optimizer.load_state_dict(state)
     return True
