@@ -1,5 +1,6 @@
 import time
 
+import numpy as np
 import torch
 
 from network import DEVICE
@@ -25,11 +26,11 @@ class Trainer:
                 time.sleep(0.05)
                 continue
             batch, weights, idxs = self.buffer.sample(self.config.BATCH)
-            s = torch.tensor([x[0] for x in batch], dtype=torch.float32, device=DEVICE)
-            a = torch.tensor([x[1] for x in batch], dtype=torch.long, device=DEVICE).unsqueeze(1)
-            r = torch.tensor([x[2] for x in batch], dtype=torch.float32, device=DEVICE).unsqueeze(1)
-            s2 = torch.tensor([x[3] for x in batch], dtype=torch.float32, device=DEVICE)
-            d = torch.tensor([x[4] for x in batch], dtype=torch.float32, device=DEVICE).unsqueeze(1)
+            s = torch.tensor(np.stack([x[0] for x in batch]), dtype=torch.float32, device=DEVICE)
+            a = torch.tensor(np.array([x[1] for x in batch]), dtype=torch.long, device=DEVICE).unsqueeze(1)
+            r = torch.tensor(np.array([x[2] for x in batch]), dtype=torch.float32, device=DEVICE).unsqueeze(1)
+            s2 = torch.tensor(np.stack([x[3] for x in batch]), dtype=torch.float32, device=DEVICE)
+            d = torch.tensor(np.array([x[4] for x in batch]), dtype=torch.float32, device=DEVICE).unsqueeze(1)
             w = torch.tensor(weights, dtype=torch.float32, device=DEVICE).unsqueeze(1)
 
             with torch.no_grad():

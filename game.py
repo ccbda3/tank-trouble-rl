@@ -1,6 +1,8 @@
 import math
 import random
 
+import numpy as np
+
 W = 720
 H = 920
 PADDLE_W = 110
@@ -116,3 +118,29 @@ class Breakout:
         self.ball_x = bx
         self.ball_y = by
         return reward, done
+
+
+def render_bw(g, size=96):
+    sx = size / W
+    sy = size / H
+    img = np.zeros((size, size), np.uint8)
+    for r in range(ROWS):
+        for c in range(COLS):
+            if not g.bricks[r][c]:
+                continue
+            x0 = BRICK_LEFT + c * (BRICK_W + BRICK_GAP)
+            y0 = BRICK_TOP + r * (BRICK_H + BRICK_GAP)
+            img[int(y0 * sy):int((y0 + BRICK_H) * sy) + 1, int(x0 * sx):int((x0 + BRICK_W) * sx) + 1] = 200
+    px = int((g.paddle_x - PADDLE_W / 2) * sx)
+    px2 = int((g.paddle_x + PADDLE_W / 2) * sx)
+    py = int(PADDLE_Y * sy)
+    py2 = int((PADDLE_Y + PADDLE_H) * sy)
+    img[py:py2 + 1, px:px2 + 1] = 150
+    bx = int(g.ball_x * sx)
+    by = int(g.ball_y * sy)
+    r0 = max(0, by - 1)
+    r1 = min(size, by + 2)
+    c0 = max(0, bx - 1)
+    c1 = min(size, bx + 2)
+    img[r0:r1, c0:c1] = 255
+    return img
