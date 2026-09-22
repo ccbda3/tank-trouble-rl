@@ -15,6 +15,10 @@ class Env:
     def _stack(self):
         return np.stack(self.history, axis=0)
 
+    @property
+    def score(self):
+        return self.g.score
+
     def reset(self):
         self.g.reset()
         f = game.render_bw(self.g, self.size)

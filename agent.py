@@ -30,10 +30,11 @@ class Agent:
         self.counter = counter
         self.config = config
         self.stats = stats
+        self.actions = net.fc[-1].out_features
 
     def act(self, s):
         if random.random() < self.epsilon():
-            return random.randrange(3)
+            return random.randrange(self.actions)
         with torch.no_grad():
             q = self.net(torch.tensor(s, dtype=torch.float32, device=DEVICE).unsqueeze(0))
             return int(q.argmax().item())
@@ -53,7 +54,7 @@ class Agent:
             self.buffer.push(s, a, r, s2, done)
             self.counter.add(1)
             s = s2
-        return self.env.g.score
+        return self.env.score
 
     def loop(self, stop_event):
         while not stop_event.is_set():

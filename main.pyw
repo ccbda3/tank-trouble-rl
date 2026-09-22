@@ -5,7 +5,6 @@ import threading
 import time
 from collections import deque
 
-import numpy as np
 import pygame
 
 if not ctypes.windll.kernel32.GetModuleHandleW("msvcp140.dll"):
@@ -71,11 +70,22 @@ def gpu_util():
         return None
 
 
-def draw_scene(screen, frame, size_px):
-    screen.fill((16, 20, 30))
-    arr = np.ascontiguousarray(np.stack([frame] * 3, axis=-1).transpose(1, 0, 2))
-    surf = pygame.surfarray.make_surface(arr)
-    scaled = pygame.transform.scale(surf, (size_px, size_px))
+def draw_game(screen, g, canvas, scene_w, scene_h):
+    canvas.fill((16, 20, 30))
+    for r in range(game.ROWS):
+        for c in range(game.COLS):
+            if not g.bricks[r][c]:
+                continue
+            x0 = game.BRICK_LEFT + c * (game.BRICK_W + game.BRICK_GAP)
+            y0 = game.BRICK_TOP + r * (game.BRICK_H + game.BRICK_GAP)
+            pygame.draw.rect(canvas, game.COLORS[r % len(game.COLORS)], (x0, y0, game.BRICK_W, game.BRICK_H))
+            pygame.draw.rect(canvas, (10, 12, 18), (x0, y0, game.BRICK_W, game.BRICK_H), 2)
+    px = int(g.paddle_x - game.PADDLE_W / 2)
+    pygame.draw.rect(canvas, (150, 190, 255), (px, game.PADDLE_Y, game.PADDLE_W, game.PADDLE_H))
+    pygame.draw.rect(canvas, (10, 12, 18), (px, game.PADDLE_Y, game.PADDLE_W, game.PADDLE_H), 2)
+    pygame.draw.circle(canvas, (255, 235, 160), (int(g.ball_x), int(g.ball_y)), game.BALL_R)
+    pygame.draw.circle(canvas, (10, 12, 18), (int(g.ball_x), int(g.ball_y)), game.BALL_R, 1)
+    scaled = pygame.transform.smoothscale(canvas, (scene_w, scene_h))
     screen.blit(scaled, (0, 0))
 
 
@@ -174,8 +184,10 @@ def main():
     pygame.init()
     info = pygame.display.Info()
     panel_w = 300
-    display_size = min(info.current_h - 90, info.current_w - 340)
-    screen = pygame.display.set_mode((display_size + panel_w, display_size))
+    scene_h = min(info.current_h - 90, info.current_w - 360)
+    scene_w = int(scene_h * game.W // game.H)
+    canvas = pygame.Surface((game.W, game.H))
+    screen = pygame.display.set_mode((scene_w + panel_w, scene_h))
     pygame.display.set_caption("打砖块 - 像素输入 CNN DQN 强化学习")
     clock = pygame.time.Clock()
     font_title = pygame.font.SysFont("microsoftyahei", 20)
@@ -212,8 +224,8 @@ def main():
                 stats["episodes"] += 1
             s = r_env.reset()
 
-        draw_scene(screen, r_env.history[-1], display_size)
-        draw(screen, fonts, stats, counter, r_agent, buffer, trainer, display_size, r_env.g.score)
+        draw_game(screen, r_env.g, canvas, scene_w, scene_h)
+        draw(screen, fonts, stats, counter, r_agent, buffer, trainer, scene_w, r_env.g.score)
         pygame.display.flip()
         clock.tick(60)
 
