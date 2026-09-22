@@ -1,3 +1,7 @@
+import torchfix
+
+torchfix.apply()
+
 import torch
 import torch.nn as nn
 

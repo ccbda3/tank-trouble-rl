@@ -1,9 +1,14 @@
 import argparse
 import logging
+import os
 import sys
 import time
 
 import numpy as np
+import torchfix
+
+torchfix.apply()
+
 import torch
 
 import buffer
@@ -125,6 +130,7 @@ def main():
     ap.add_argument("--envs", type=int, default=config.ENVS)
     ap.add_argument("--monitor", action="store_true")
     ap.add_argument("--view", action="store_true")
+    ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
@@ -155,6 +161,18 @@ def main():
     pfsp = [1.0]
 
     steps = 0
+    last_target = 0
+    last_snap = 0
+    last_eval = 0
+    if args.resume and os.path.exists(config.CHECKPOINT):
+        ck = torch.load(config.CHECKPOINT, map_location=network.DEVICE)
+        policy.load_state_dict(ck["model"])
+        target.load_state_dict(policy.state_dict())
+        snapshots = [Snapshot(policy.state_dict(), feat_dim)]
+        steps = int(ck.get("steps", 0))
+        last_target = last_snap = last_eval = steps
+        log.info("断点续训：载入 %s，从第 %d 步继续", config.CHECKPOINT, steps)
+
     it = 0
     rounds_total = 0
     rew_sum = rew_n = 0.0
@@ -258,10 +276,12 @@ def main():
                 replay.update_prio(slot, td.detach().cpu().numpy())
                 loss_sum += float(loss.item())
                 loss_n += 1
-            if steps % config.TARGET_EVERY < args.envs:
+            if steps - last_target >= config.TARGET_EVERY:
+                last_target = steps
                 target.load_state_dict(policy.state_dict())
 
-        if steps % config.POOL_SNAPSHOT_EVERY < args.envs:
+        if steps - last_snap >= config.POOL_SNAPSHOT_EVERY:
+            last_snap = steps
             snapshots.append(Snapshot(policy.state_dict(), feat_dim))
             pfsp.append(1.0)
             if len(snapshots) > config.POOL_MAX:
@@ -281,9 +301,11 @@ def main():
             win_sum = win_n = 0.0
             t_last = now
 
-        if steps % config.EVAL_EVERY < args.envs:
-            opps = {"随机": RandomBot(7), "脚本Lv1": ScriptedBot(64, 1, 3),
-                    "脚本Lv2": ScriptedBot(64, 2, 3), "脚本Lv3": ScriptedBot(64, 3, 3),
+        if steps - last_eval >= config.EVAL_EVERY:
+            last_eval = steps
+            opps = {"随机": RandomBot(7), "脚本Lv1": ScriptedBot(config.EVAL_ENVS, 1, 3),
+                    "脚本Lv2": ScriptedBot(config.EVAL_ENVS, 2, 3),
+                    "脚本Lv3": ScriptedBot(config.EVAL_ENVS, 3, 3),
                     "最早快照": snapshots[0]}
             res = run_eval(policy, opps, config.EVAL_ENVS, config.EVAL_FRAMES, 999)
             stats["eval"] = res

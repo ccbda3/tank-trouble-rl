@@ -36,12 +36,27 @@ STATS = np.dtype([
 ])
 
 
+def _attach_or_create(name, size):
+    from multiprocessing import shared_memory
+    try:
+        shm = shared_memory.SharedMemory(name=name)
+        if shm.size >= size:
+            return shm
+        shm.close()
+        shm.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        return shared_memory.SharedMemory(create=True, size=size, name=name)
+    except FileExistsError:
+        return shared_memory.SharedMemory(name=name)
+
+
 class Writer:
     def __init__(self, envs=VIEW_ENVS):
-        from multiprocessing import shared_memory
         self.envs = envs
-        self.state_shm = shared_memory.SharedMemory(create=True, size=DTYPE.itemsize * envs, name=SHM_NAME)
-        self.stats_shm = shared_memory.SharedMemory(create=True, size=STATS.itemsize, name=STATS_NAME)
+        self.state_shm = _attach_or_create(SHM_NAME, DTYPE.itemsize * envs)
+        self.stats_shm = _attach_or_create(STATS_NAME, STATS.itemsize)
         self.state = np.ndarray((envs,), dtype=DTYPE, buffer=self.state_shm.buf)
         self.stat = np.ndarray((1,), dtype=STATS, buffer=self.stats_shm.buf)
         self.state["round"] = -1
@@ -97,11 +112,6 @@ class Writer:
     def close(self):
         self.state_shm.close()
         self.stats_shm.close()
-        try:
-            self.state_shm.unlink()
-            self.stats_shm.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def viewer(env_index=0):
