@@ -84,12 +84,39 @@ function renderCards(d) {
   el("cards").innerHTML = h || '<div class="cd"><div class="ck">暂无指标</div><div class="cv">-</div></div>';
 }
 
+var CHART = { win: 60, smooth: false, data: [], hover: null };
+
+function chartSeries(d) {
+  var series = d.series || {}, out = [], i;
+  var now = Date.now() / 1000;
+  for (i = 0; i < d.metrics.length; i++) {
+    var m = d.metrics[i];
+    if (!m.chart) continue;
+    var raw = series[m.key] || [], win = [], j;
+    for (j = 0; j < raw.length; j++) {
+      var v = Number(raw[j][1]), t = Number(raw[j][0]);
+      if (!isFinite(v)) continue;
+      if (CHART.win > 0 && now - t > CHART.win) continue;
+      win.push([t, v]);
+    }
+    if (CHART.smooth && win.length > 2) {
+      var a = 0.25, out2 = [win[0]], prev = win[0][1];
+      for (j = 1; j < win.length; j++) {
+        prev = prev + a * (win[j][1] - prev);
+        out2.push([win[j][0], prev]);
+      }
+      win = out2;
+    }
+    out.push({ m: m, pts: win, color: m.color || colorOf[m.key] || pickColor(m.key, i) });
+  }
+  return out;
+}
+
 function renderCharts(d) {
-  var host = el("charts"), series = d.series || {}, h = "", i;
-  var list = [];
-  for (i = 0; i < d.metrics.length; i++) if (d.metrics[i].chart) list.push(d.metrics[i]);
+  var host = el("charts"), h = "", i;
+  var list = chartSeries(d);
   for (i = 0; i < list.length; i++) {
-    h += '<div class="ch"><div class="cht"><span class="chn">' + esc(list[i].label) + '</span><b class="chv">-</b></div>'
+    h += '<div class="ch"><div class="cht"><span class="chn">' + esc(list[i].m.label) + '</span><b class="chv">-</b></div>'
       + '<canvas class="chc"></canvas>'
       + '<div class="chf"><span>最小 <b class="f0">-</b></span><span>最大 <b class="f1">-</b></span><span>平均 <b class="f2">-</b></span></div></div>';
   }
@@ -99,20 +126,19 @@ function renderCharts(d) {
   }
   var nodes = host.querySelectorAll(".ch");
   var n = 0;
+  CHART.data = list;
   for (i = 0; i < nodes.length && i < list.length; i++) {
-    var m = list[i], raw = series[m.key] || [];
-    var win = [];
-    for (var j = 0; j < raw.length; j++) {
-      var v = Number(raw[j][1]);
-      if (isFinite(v)) win.push([Number(raw[j][0]), v]);
-    }
-    drawChart(nodes[i], win, m.color || colorOf[m.key] || pickColor(m.key, i), m.fmt);
-    n = Math.max(n, win.length);
+    drawChart(nodes[i], list[i].pts, list[i].color, list[i].m.fmt,
+      CHART.hover && CHART.hover.i === i ? CHART.hover.x : null);
+    n = Math.max(n, list[i].pts.length);
   }
-  setT("chartSub", "服务端保留 " + fInt(n) + " 个采样点 · 每 " + fFix(d.interval, 1) + " 秒一次");
+  var span = CHART.win > 0 ? (CHART.win >= 60 ? (CHART.win / 60) + " 分钟" : CHART.win + " 秒") : "全部历史";
+  setT("chartSub", "窗口 " + span + " · 每 " + fFix(d.interval, 1) + " 秒采样 · 当前 " + fInt(n) + " 点"
+    + (CHART.smooth ? " · 已平滑" : "") + " · 悬停看单点数值");
+  return nodes;
 }
 
-function drawChart(node, win, color, kind) {
+function drawChart(node, win, color, kind, hoverX) {
   var cv = node.querySelector(".chc"), ctx = cv.getContext("2d");
   var w = cv.clientWidth | 0, h = cv.clientHeight | 0;
   if (w < 24 || h < 24) return;
@@ -172,6 +198,219 @@ function drawChart(node, win, color, kind) {
   ctx.lineJoin = "round";
   ctx.stroke();
   ctx.beginPath(); ctx.arc(lx, ly, 2.6, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+  node.__chart = { win: win, xmin: xmin, xmax: xmax, ymin: ymin, ymax: ymax, L: L, R: R, T: T, B: B, color: color, kind: kind };
+  if (hoverX !== null && hoverX !== undefined) chartCrosshair(ctx, node.__chart, hoverX, w, h);
+}
+
+function chartCrosshair(ctx, c, mx, w, h) {
+  var i, best = 0, bd = Infinity;
+  for (i = 0; i < c.win.length; i++) {
+    var d = Math.abs(c.L + (c.win[i][0] - c.xmin) / (c.xmax - c.xmin) * (c.R - c.L) - mx);
+    if (d < bd) { bd = d; best = i; }
+  }
+  var p = c.win[best];
+  var X = c.L + (p[0] - c.xmin) / (c.xmax - c.xmin) * (c.R - c.L);
+  var Y = c.B - (p[1] - c.ymin) / (c.ymax - c.ymin) * (c.B - c.T);
+  ctx.strokeStyle = "rgba(200,220,240,.35)";
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(Math.round(X) + .5, c.T); ctx.lineTo(Math.round(X) + .5, c.B); ctx.stroke();
+  ctx.beginPath(); ctx.arc(X, Y, 3, 0, Math.PI * 2);
+  ctx.fillStyle = c.color; ctx.fill();
+  var d2 = new Date(p[0] * 1000);
+  function p2(x) { return (x < 10 ? "0" : "") + x; }
+  var txt = p2(d2.getHours()) + ":" + p2(d2.getMinutes()) + ":" + p2(d2.getSeconds()) + "  " + fmt(c.kind, p[1]);
+  ctx.font = '10px "Microsoft YaHei UI","Segoe UI",sans-serif';
+  var tw = ctx.measureText(txt).width + 10;
+  var bx = Math.max(1, Math.min(w - tw - 1, X + 6));
+  ctx.fillStyle = "rgba(11,15,20,.92)";
+  ctx.fillRect(bx, c.T, tw, 15);
+  ctx.strokeStyle = "rgba(90,110,135,.6)";
+  ctx.strokeRect(bx + .5, c.T + .5, tw - 1, 14);
+  ctx.fillStyle = "#dfe7ef";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(txt, bx + 5, c.T + 8);
+}
+
+function bindCharts() {
+  var host = el("charts");
+  if (!host || host.__bound) return;
+  host.__bound = true;
+  host.addEventListener("mousemove", function (ev) {
+    var cv = ev.target;
+    if (!cv || cv.tagName !== "CANVAS") return;
+    var node = cv.parentNode;
+    var boxes = host.querySelectorAll(".ch");
+    var i = -1;
+    for (var k = 0; k < boxes.length; k++) if (boxes[k] === node) i = k;
+    if (i < 0) return;
+    var r = cv.getBoundingClientRect();
+    CHART.hover = { i: i, x: ev.clientX - r.left };
+    drawChart(node, CHART.data[i].pts, CHART.data[i].color, CHART.data[i].m.fmt, CHART.hover.x);
+  });
+  host.addEventListener("mouseleave", function () {
+    CHART.hover = null;
+    var boxes = host.querySelectorAll(".ch");
+    for (var k = 0; k < boxes.length && k < CHART.data.length; k++) {
+      drawChart(boxes[k], CHART.data[k].pts, CHART.data[k].color, CHART.data[k].m.fmt, null);
+    }
+  });
+}
+
+function exportCSV() {
+  if (!STATE) return;
+  function pad2(x) { return (x < 10 ? "0" : "") + x; }
+  var series = STATE.series || {}, keys = [], i;
+  for (i = 0; i < STATE.metrics.length; i++) {
+    if (!STATE.metrics[i].chart) continue;
+    if (series[STATE.metrics[i].key]) keys.push(STATE.metrics[i].key);
+  }
+  var times = [], seen = {}, j;
+  for (i = 0; i < keys.length; i++) {
+    var arr = series[keys[i]];
+    for (j = 0; j < arr.length; j++) {
+      var t = Number(arr[j][0]);
+      if (!seen[t]) { seen[t] = 1; times.push(t); }
+    }
+  }
+  times.sort(function (a, b) { return a - b; });
+  var rows = [["时间"].concat(keys)];
+  var table = [];
+  for (i = 0; i < keys.length; i++) table.push({ v: {}, k: keys[i] });
+  for (i = 0; i < keys.length; i++) {
+    var a2 = series[keys[i]];
+    for (j = 0; j < a2.length; j++) table[i].v[Number(a2[j][0])] = a2[j][1];
+  }
+  for (i = 0; i < times.length; i++) {
+    var d = new Date(times[i] * 1000);
+    var line = [d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " "
+      + pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds())];
+    for (j = 0; j < keys.length; j++) {
+      var v = table[j].v[times[i]];
+      line.push(v === undefined ? "" : v);
+    }
+    rows.push(line);
+  }
+  var csv = "\ufeff" + rows.map(function (r) { return r.join(","); }).join("\r\n");
+  var blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "aimonitor-" + Date.now() + ".csv";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+}
+
+function bindChartCtl() {
+  var head = el("secCharts") ? el("secCharts").querySelector(".cctl") : null;
+  if (!head || head.__bound) return;
+  head.__bound = true;
+  head.addEventListener("click", function (ev) {
+    var b = ev.target;
+    if (!b || b.tagName !== "BUTTON") return;
+    if (b.id === "smoothBtn") {
+      CHART.smooth = !CHART.smooth;
+      b.className = CHART.smooth ? "vbtn on" : "vbtn";
+    } else if (b.id === "exportBtn") {
+      exportCSV();
+      return;
+    } else {
+      CHART.win = Number(b.getAttribute("data-win")) || 0;
+      var btns = head.querySelectorAll("button[data-win]");
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].className = btns[i] === b ? "vbtn on" : "vbtn";
+      }
+    }
+    if (STATE) renderCharts(STATE);
+  });
+}
+
+function renderAlerts(d) {
+  var as = d.alerts || [], bar = el("alertBar"), h = "";
+  for (var i = 0; i < as.length; i++) {
+    h += '<span class="al ' + esc(as[i].level || "warn") + '"><b>' + esc(as[i].label) + '</b>'
+      + esc(as[i].msg) + '</span>';
+  }
+  bar.innerHTML = h;
+  bar.className = h ? "alertbar on" : "alertbar";
+}
+
+var NAV_GROUPS = [
+  ["训练概览", ["secCards", "secCharts", "secHealth"]],
+  ["模型内部", ["secFeature", "secImages", "secHist", "secNet", "secSurface"]],
+  ["诊断分析", ["secTable", "secMatrix", "secScatter", "secBar", "secLog"]],
+  ["配置", ["secParams"]]
+];
+var navSig = "";
+
+function buildNav() {
+  var host = el("nav"), h = "", i, j, k;
+  var map = {};
+  var secs = document.querySelectorAll("section.card");
+  for (i = 0; i < secs.length; i++) map[secs[i].id] = secs[i];
+  for (i = 0; i < NAV_GROUPS.length; i++) {
+    var items = [];
+    for (j = 0; j < NAV_GROUPS[i][1].length; j++) {
+      var s = map[NAV_GROUPS[i][1][j]];
+      if (!s || s.className.indexOf("off") >= 0) continue;
+      var t = s.querySelector(".ctitle");
+      items.push('<a href="#' + s.id + '" data-t="' + s.id + '">' + esc(t ? t.textContent : s.id) + '</a>');
+    }
+    if (!items.length) continue;
+    if (h) h += '<span class="gp">|</span>';
+    h += items.join("");
+  }
+  if (h === navSig) return;
+  navSig = h;
+  host.innerHTML = h;
+  var as = host.querySelectorAll("a");
+  for (k = 0; k < as.length; k++) {
+    as[k].addEventListener("click", function (ev) {
+      ev.preventDefault();
+      var t = document.getElementById(this.getAttribute("data-t"));
+      if (t) window.scrollTo({ top: t.offsetTop - 74, behavior: "smooth" });
+    });
+  }
+}
+
+function markNav() {
+  var host = el("nav");
+  if (!host) return;
+  var as = host.querySelectorAll("a"), best = null, bd = Infinity;
+  for (var i = 0; i < as.length; i++) {
+    var t = document.getElementById(as[i].getAttribute("data-t"));
+    if (!t) continue;
+    var d = Math.abs(t.getBoundingClientRect().top - 90);
+    if (d < bd) { bd = d; best = as[i]; }
+  }
+  for (i = 0; i < as.length; i++) as[i].className = as[i] === best ? "on" : "";
+}
+
+function initFold() {
+  var secs = document.querySelectorAll("section.card");
+  for (var i = 0; i < secs.length; i++) {
+    (function (s) {
+      var head = s.querySelector(".chead");
+      if (!head) return;
+      var saved = null;
+      try { saved = localStorage.getItem("fold:" + s.id); } catch (e) {}
+      if (saved === "1") s.className = s.className + " folded";
+      head.addEventListener("click", function (ev) {
+        if (ev.target.tagName === "BUTTON") return;
+        if (s.className.indexOf("folded") >= 0) {
+          s.className = s.className.replace(" folded", "");
+        } else {
+          s.className = s.className + " folded";
+        }
+        try {
+          localStorage.setItem("fold:" + s.id, s.className.indexOf("folded") >= 0 ? "1" : "0");
+        } catch (e) {}
+        requestNet();
+        requestGD();
+      });
+    })(secs[i]);
+  }
 }
 
 function renderHealth(d) {
@@ -271,7 +510,9 @@ function drawHist(cv, h) {
 
 function setSec(id, on) {
   var e = el(id);
-  if (e) e.className = on ? "card" : "card off";
+  if (!e) return;
+  var folded = e.className.indexOf("folded") >= 0;
+  e.className = (on ? "card" : "card off") + (folded ? " folded" : "");
 }
 
 function tsShort(t) {
@@ -1402,6 +1643,8 @@ function poll() {
       renderLogs(d);
       renderParams(d);
       renderSurface(d);
+      renderAlerts(d);
+      buildNav();
       var gv = d.graph ? d.graph.version : 0;
       if (gv && gv !== GRAPH_VER) {
         return fetch("/api/graph", { cache: "no-store" })
@@ -1434,13 +1677,22 @@ function init() {
   bindNet();
   bindGD();
   bindMatrixHover();
+  bindCharts();
+  bindChartCtl();
+  initFold();
   setNetMode("3d");
   var bs = el("h-start"), bt = el("h-stop");
   if (bs) bs.addEventListener("click", function () { ctlSend("start"); });
   if (bt) bt.addEventListener("click", function () { ctlSend("stop"); });
   window.addEventListener("resize", function () {
     requestNet(); requestGD();
-    if (STATE) { renderMatrices(STATE); renderScatters(STATE); }
+    if (STATE) { renderMatrices(STATE); renderScatters(STATE); renderCharts(STATE); }
+  });
+  var scTick = false;
+  window.addEventListener("scroll", function () {
+    if (scTick) return;
+    scTick = true;
+    requestAnimationFrame(function () { scTick = false; markNav(); });
   });
   drawGD();
   poll();

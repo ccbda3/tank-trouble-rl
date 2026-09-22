@@ -88,6 +88,9 @@ class Trainer:
         self.train_steps += 1
         with self.stats["lock"]:
             self.stats["loss"] = float(loss.item() * self.config.ACCUM)
+            self.stats["q_mean"] = float(q.mean())
+            self.stats["q_max"] = float(q.max())
+            self.stats["td_mean"] = float(td.mean())
 
         if self.train_steps % self.config.ACCUM == 0:
             if self.updates % 25 == 0:

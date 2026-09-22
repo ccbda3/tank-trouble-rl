@@ -12,6 +12,10 @@ TEXT_TYPES = ("text/", "application/javascript", "application/json", "image/svg+
 
 
 def serve(monitor):
+    class Server(ThreadingHTTPServer):
+        allow_reuse_address = False
+        daemon_threads = True
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "aimonitor/1.0"
 
@@ -75,7 +79,7 @@ def serve(monitor):
     port = monitor.port
     for _ in range(20):
         try:
-            srv = ThreadingHTTPServer((monitor.host, port), Handler)
+            srv = Server((monitor.host, port), Handler)
             break
         except OSError:
             port += 1

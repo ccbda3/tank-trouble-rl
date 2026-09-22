@@ -95,8 +95,10 @@ class EnvWorker:
         n = len(self.envs)
         t0 = time.perf_counter()
         acts = self.act_batch(states, self.epsilon())
+        counts = [0] * self.actions
         for i in range(n):
             s = states[i]
+            counts[acts[i]] += 1
             s2, r, done = self.envs[i].step(acts[i])
             self.buffer.push(s, acts[i], r, s2, done)
             self.counter.add(1)
@@ -107,6 +109,9 @@ class EnvWorker:
                 states[i] = self.envs[i].reset()
             else:
                 states[i] = s2
+        with self.stats["lock"]:
+            for k in range(self.actions):
+                self.stats["acts"][k] += counts[k]
         if interval > 0:
             rest = interval - (time.perf_counter() - t0)
             if rest > 0:

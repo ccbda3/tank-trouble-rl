@@ -20,6 +20,8 @@
 | 散点投影 | 嵌入降维（PCA/t-SNE）、预测-真值分布、PR 曲线，按类别着色 + 图例 |
 | 对比条图 | 逐层梯度范数、各类准确率、任意分组对比，自动按绝对值排序 |
 | 训练日志 | 实时日志流，`attach_logger()` 一行把 `logging` 接进来（自动标红 ERROR / 标黄 WARN） |
+| 异常告警 | `alert()` 自定义条件 + `watchdog()` 看门狗 + 指标 NaN/Inf 自动检测，顶部红条分级提示 |
+| 曲线交互 | 悬停十字准线读单点数值、1/10/全部时间窗口、平滑、导出 CSV |
 | 训练控制 | 网页上直接"启动训练 / 结束训练并保存" |
 
 面板是**注册制**的：注册了就显示，没注册的区块自动隐藏。所以同一套前端既能当强化学习面板，也能当分类/NLP/检测的训练面板。
@@ -132,9 +134,37 @@ mon.bars("grad_norm", lambda: [[n, float(p.grad.norm())] for n, p in model.named
 buf = mon.attach_logger(logger, key="train_log", label="训练日志", limit=400)
 buf.write("这一行会出现在网页上")
 
+# 16) 异常告警：fn() 返回字符串就弹红条，返回 None 表示正常
+mon.alert("grad", lambda: ("范数 %.1f，疑似爆炸" % g) if g > 100 else None, label="梯度", level="error")
+
+# 17) 看门狗：这个数字超过 timeout 秒没变化就报警（训练卡死、采集线程死掉都能抓到）
+mon.watchdog("progress", counter.get, label="总步数", timeout=30.0)
+
 port = mon.start()
 print("监控面板 http://127.0.0.1:%d" % port)
 ```
+
+## 面板交互
+
+| 操作 | 效果 |
+|---|---|
+| 悬停曲线 | 十字准线 + 显示该采样点的时间与精确数值 |
+| 曲线右上按钮 | 切换 1 分钟 / 10 分钟 / 全部时间窗口 |
+| 平滑 | 对曲线做指数滑动平均，看趋势用 |
+| 导出 CSV | 把所有曲线导成宽表 CSV（UTF-8 BOM，Excel 直接打开） |
+| 点击区块标题 | 折叠 / 展开区块，状态记在浏览器里 |
+| 顶部导航 | 按「训练概览 / 模型内部 / 诊断分析 / 配置」分组跳转 |
+| 顶部告警条 | 有告警才出现，红色 = 严重，黄色 = 警告 |
+
+## 异常告警
+
+告警由服务端每秒评估一次，前端只在有告警时显示顶部红条，不需要人工盯着。
+
+| 来源 | 触发条件 |
+|---|---|
+| `watchdog` | 监控的数字在 `timeout` 秒内没有变化（训练线程/采集线程卡死、进程僵死）。训练停止时自动不报警 |
+| `alert` | 自定义条件，`fn()` 返回非空字符串即告警 |
+| 指标非法值 | 任何 `metric` 从有限值变成 NaN / Inf 时自动告警一次，恢复正常后自动解除 |
 
 ## 其他 AI 领域怎么用
 
@@ -165,6 +195,8 @@ print("监控面板 http://127.0.0.1:%d" % port)
 | `bars(key, fn, label)` | 条图；`fn()` 返回 `[[标签, 数值], ...]` / `[数值, ...]` / `[{"label":.., "value":..}, ...]` |
 | `log(key, fn, label, limit)` | 日志流；`fn()` 返回字符串列表或 `LogBuffer.get()` |
 | `attach_logger(logger, key, label, level, limit)` | 把某个 `logging.Logger` 的输出实时镜像到网页，返回可继续 `write()` 的 `LogBuffer` |
+| `alert(key, fn, label, level)` | 异常告警；`fn()` 返回字符串即告警，返回 `None` / `False` 表示正常；`level` 取 `"warn"` 或 `"error"` |
+| `watchdog(key, fn, label, timeout, level)` | 看门狗；`fn()` 返回的数字在 `timeout` 秒内没有变化就告警 |
 | `graph(fn)` | 返回 `{"layers": [...], "edges": [...]}`；`edges[i]` 形状必须是 `(目标层节点数, 源层节点数)` |
 | `surface(fn)` | 损失曲面数据 |
 | `params(fn)` | 底部参数表，返回 `[{"title": ..., "layers": [...], "rows": [[键, 值]]}]` |

@@ -61,7 +61,9 @@ class SnakeMonitor:
         self._rate = {"steps": None, "t": None, "v": 0.0}
         self._gs = {"t": 0.0, "v": (0.0, 0.0, 0.0)}
         self._gn = {"t": 0.0, "v": []}
+        self._gpu_zero = 0
         self._maps = None
+        self.mon = None
 
         zero = np.zeros((config.FRAME_STACK, config.GRID, config.GRID), np.uint8)
         c1a, c2a, c3a, _, _ = _forward(net, zero)
@@ -253,6 +255,55 @@ class SnakeMonitor:
         names = {"self": "自撞", "wall": "撞墙", "超时": "到达步数上限"}
         return [[names.get(k, k), v] for k, v in d.items()]
 
+    def _acts(self):
+        with self.stats["lock"]:
+            a = list(self.stats["acts"])
+        names = ("上", "下", "左", "右")
+        total = sum(a)
+        if total <= 0:
+            return []
+        return [["%s %.1f%%" % (names[i], 100.0 * v / total), v] for i, v in enumerate(a)]
+
+    def _buffer_td(self):
+        b = self.buffer
+        if b.size <= 0:
+            return None
+        p = b.tree[b.cap2:b.cap2 + b.size]
+        p = p[p > 0]
+        if p.size == 0:
+            return None
+        return np.power(p, 1.0 / config.ALPHA) - 1e-6
+
+    def _eval_steps_dist(self):
+        with self.stats["lock"]:
+            return list(self.stats["eval_recent_steps"])
+
+    def _alert_grad(self):
+        g = self._grad_stats()[0]
+        if g > 100.0:
+            return "范数 %.1f，疑似梯度爆炸" % g
+        if 0.0 < g < 1e-6:
+            return "范数 %.2e，疑似梯度消失" % g
+        return None
+
+    def _alert_gpu(self):
+        g = self.gpu_fn()
+        if g is None or not self.mon.is_training():
+            self._gpu_zero = 0
+            return None
+        self._gpu_zero = self._gpu_zero + 1 if g == 0 else 0
+        if self._gpu_zero >= 60:
+            return "利用率连续 %d 秒为 0%%，训练可能已停摆" % self._gpu_zero
+        return None
+
+    def _alert_eval(self):
+        with self.stats["lock"]:
+            n = self.stats["eval_episodes"]
+            avg = self.stats["eval_avg"]
+        if n >= 16 and 0 < avg < 1.0:
+            return "评估均值只有 %.2f 个苹果，策略可能已退化" % avg
+        return None
+
     def _params(self):
         net = self.net
         k1, k2, k3 = self._chans
@@ -304,6 +355,8 @@ class SnakeMonitor:
         mon.metric("eval_avg", self._eval_avg, label="贪心评估均值(无探索)", fmt="f2", color="#5fd0a0")
         mon.metric("eval_best", self._eval_best, label="贪心评估最高", fmt="int", color="#9fe6bf")
         mon.metric("train_steps", lambda: self.trainer.train_steps, label="梯度更新", fmt="int")
+        mon.metric("q_mean", lambda: self.stats["q_mean"], label="平均 Q 值", fmt="f3", color="#c39a5c")
+        mon.metric("td_mean", lambda: self.stats["td_mean"], label="平均 TD 误差", fmt="f4", color="#ff9f7a")
         mon.metric("buffer", lambda: len(self.buffer), label="经验池", fmt="int")
         mon.metric("dps", self._dps, label="决策/秒", fmt="int", color="#7fd0e0")
         mon.metric("gpu", lambda: (-1 if self.gpu_fn() is None else self.gpu_fn()),
@@ -338,7 +391,15 @@ class SnakeMonitor:
 
         mon.bars("grad_norm", self._layer_grad_norm, label="逐层梯度范数（真实值）")
         mon.bars("deaths", self._deaths, label="死亡原因（贪心评估累计）")
+        mon.bars("acts", self._acts, label="动作使用率（累计步数）")
         mon.histogram("eval_dist", self._eval_dist, label="贪心单局吃苹果数分布", bins=30, refresh=5.0)
+        mon.histogram("eval_steps", self._eval_steps_dist, label="贪心单局存活步数分布", bins=30, refresh=5.0)
+        mon.histogram("buffer_td", self._buffer_td, label="经验池 |TD 误差| 分布", bins=40, refresh=5.0)
+
+        mon.watchdog("progress", self.counter.get, label="总步数", timeout=30.0)
+        mon.alert("grad", self._alert_grad, label="梯度", level="warn")
+        mon.alert("gpu", self._alert_gpu, label="GPU", level="warn")
+        mon.alert("eval", self._alert_eval, label="策略质量", level="error")
         mon.table("layer_stats", self._layer_stats, label="逐层权重与梯度统计",
                   columns=["层", "参数名", "形状", "参数量", "权重均值", "权重标准差", "梯度范数"])
         mon.attach_logger(logging.getLogger("snake"), key="train_log", label="训练日志（实时镜像）")

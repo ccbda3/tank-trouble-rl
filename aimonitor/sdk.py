@@ -125,6 +125,11 @@ class Monitor:
         self._scatters = []
         self._bars = []
         self._logs = []
+        self._alerts = []
+        self._watchdogs = []
+        self._wd = {}
+        self._lastfinite = {}
+        self._nanflag = {}
         self._graph_fn = None
         self._surface_fn = None
         self._params_fn = None
@@ -204,6 +209,19 @@ class Monitor:
         logger.addHandler(handler)
         self.log(key, buf.get, label=label, limit=limit)
         return buf
+
+    def alert(self, key, fn, label=None, level="warn"):
+        self._alerts.append({
+            "key": key, "fn": fn, "label": label or key, "level": level,
+        })
+        return self
+
+    def watchdog(self, key, fn, label=None, timeout=30.0, level="error"):
+        self._watchdogs.append({
+            "key": key, "fn": fn, "label": label or key,
+            "timeout": float(timeout), "level": level,
+        })
+        return self
 
     def graph(self, fn):
         self._graph_fn = fn
@@ -526,11 +544,56 @@ class Monitor:
                 continue
         return out
 
+    def _alerts_payload(self, metric_alerts):
+        now = time.time()
+        out = list(metric_alerts)
+        for a in self._alerts:
+            msg = _safe(a["fn"])
+            if msg:
+                out.append({
+                    "key": a["key"], "label": a["label"],
+                    "level": a["level"], "msg": str(msg),
+                })
+        training = self.is_training()
+        for w in self._watchdogs:
+            st = self._wd.get(w["key"])
+            if st is None:
+                st = {"v": None, "t": now, "stall": 0.0}
+                self._wd[w["key"]] = st
+            v = _num(_safe(w["fn"]))
+            if v is None:
+                continue
+            if st["v"] is None or v != st["v"]:
+                st["v"] = v
+                st["t"] = now
+                st["stall"] = 0.0
+            else:
+                st["stall"] = now - st["t"]
+            if training and st["stall"] >= w["timeout"]:
+                out.append({
+                    "key": "watchdog:" + w["key"], "label": w["label"], "level": w["level"],
+                    "msg": "%s 已 %.0f 秒没有变化（阈值 %.0f 秒），训练可能卡死" % (
+                        w["label"], st["stall"], w["timeout"]),
+                })
+        return out
+
     def build_state(self):
         now = time.time()
         metrics = []
+        metric_alerts = []
         for m in self._metrics:
             v = _num(_safe(m["fn"]))
+            if v is None:
+                if m["key"] in self._lastfinite and not self._nanflag.get(m["key"]):
+                    self._nanflag[m["key"]] = True
+                    metric_alerts.append({
+                        "key": "metric_nan:" + m["key"], "label": m["label"], "level": "error",
+                        "msg": "%s 变成非法值（NaN / Inf），最近一次有效值 %s" % (
+                            m["label"], self._lastfinite[m["key"]]),
+                    })
+            else:
+                self._nanflag[m["key"]] = False
+                self._lastfinite[m["key"]] = v
             metrics.append({
                 "key": m["key"], "label": m["label"], "value": v,
                 "color": m["color"], "fmt": m["fmt"], "chart": m["chart"],
@@ -568,6 +631,7 @@ class Monitor:
             "params": _safe(self._params_fn) if self._params_fn else None,
             "graph": {"version": g["version"], "summary": g["summary"]},
             "acts": acts,
+            "alerts": self._alerts_payload(metric_alerts),
         }
 
     def build_graph(self):

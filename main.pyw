@@ -112,6 +112,10 @@ def main():
         "eval_best": 0,
         "eval_episodes": 0,
         "deaths": {},
+        "acts": [0] * config.ACTIONS,
+        "q_mean": None,
+        "q_max": None,
+        "td_mean": None,
     }
 
     resumed = False

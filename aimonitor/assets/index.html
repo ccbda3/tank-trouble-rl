@@ -18,14 +18,23 @@
 <span class="hmsg" id="hMsg"></span>
 </div>
 <div class="conn" id="conn"><i class="dot"></i><span id="connTxt">连接中</span></div>
+<nav class="nav" id="nav"></nav>
 </header>
+<div class="alertbar" id="alertBar"></div>
 <main>
 <section class="card" id="secCards">
 <div class="chead"><span class="ctitle">实时指标</span><span class="csub" id="cardSub">等待数据…</span></div>
 <div class="cards" id="cards"></div>
 </section>
 <section class="card" id="secCharts">
-<div class="chead"><span class="ctitle">训练曲线</span><span class="csub" id="chartSub">等待数据…</span><span class="chint">服务端保留历史，刷新页面不丢</span></div>
+<div class="chead"><span class="ctitle">训练曲线</span><span class="csub" id="chartSub">等待数据…</span>
+<span class="cctl">
+<button class="vbtn on" data-win="60">1 分钟</button>
+<button class="vbtn" data-win="600">10 分钟</button>
+<button class="vbtn" data-win="0">全部</button>
+<button class="vbtn" id="smoothBtn">平滑</button>
+<button class="vbtn" id="exportBtn">导出 CSV</button>
+</span></div>
 <div class="charts" id="charts"></div>
 </section>
 <section class="card" id="secHealth">
