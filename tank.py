@@ -120,7 +120,7 @@ def read_ctrl(down, keys):
     return (turn, thrust, 1 if held("fire") else 0)
 
 
-def generate(seed=None, braid=0.75):
+def generate(seed=None, braid=0.18):
     rng = random.Random(seed)
     vwall = [[True] * NR for _ in range(NC + 1)]
     hwall = [[True] * NC for _ in range(NR + 1)]
@@ -215,7 +215,7 @@ def overlap(pts_a, pts_b):
                 b0 = d
             elif d > b1:
                 b1 = d
-        if a1 < b0 or b1 < a0:
+        if a1 <= b0 or b1 <= a0:
             return False
     return True
 
@@ -400,15 +400,14 @@ class World:
                 return True
         return False
 
-    def _blocked(self, x, y, ang, skip):
-        pts = sq_pts(x, y, ang, TANK_H)
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        if min(xs) < 0.0 or min(ys) < 0.0 or max(xs) > WIDTH or max(ys) > HEIGHT:
+    def _blocked(self, x, y, ang, skip, tanks=True):
+        if x < TANK_H or y < TANK_H or x > WIDTH - TANK_H or y > HEIGHT - TANK_H:
             return True
-        for rect in self._near(min(xs), min(ys), max(xs), max(ys)):
-            if overlap(pts, rect_pts(*rect)):
-                return True
+        if self._circle_hit(x, y, TANK_H):
+            return True
+        if not tanks:
+            return False
+        pts = sq_pts(x, y, ang, TANK_H)
         for o in self.tanks:
             if o is skip or not o.alive:
                 continue
@@ -454,6 +453,48 @@ class World:
                 break
         return x, y
 
+    def cell_at(self, x, y):
+        return (
+            round((x - WALL_W - CORR_W * 0.5) / PITCH),
+            round((y - WALL_W - CORR_W * 0.5) / PITCH),
+        )
+
+    def can_go(self, i, j, di, dj):
+        if not (0 <= i < NC and 0 <= j < NR):
+            return False
+        ni = i + di
+        nj = j + dj
+        if not (0 <= ni < NC and 0 <= nj < NR):
+            return False
+        return (not self.vwall[max(i, ni)][j]) if di else (not self.hwall[max(j, nj)][i])
+
+    def route(self, i, j, gi, gj):
+        if not (0 <= gi < NC and 0 <= gj < NR):
+            return None
+        if (i, j) == (gi, gj):
+            return None
+        prev = {(i, j): None}
+        queue = [(i, j)]
+        head = 0
+        while head < len(queue):
+            cur = queue[head]
+            head += 1
+            if cur == (gi, gj):
+                break
+            ci, cj = cur
+            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                n = (ci + di, cj + dj)
+                if n in prev or not self.can_go(ci, cj, di, dj):
+                    continue
+                prev[n] = cur
+                queue.append(n)
+        if (gi, gj) not in prev:
+            return None
+        node = (gi, gj)
+        while prev[node] is not None and prev[prev[node]] is not None:
+            node = prev[node]
+        return node
+
     def trace(self, x, y, ang, bounces=2, ignore=None, step=None, limit=110):
         if self.point_solid(x, y):
             return [(x, y)], None
@@ -498,7 +539,7 @@ class World:
         ox, oy = t.x, t.y
         if turn:
             na = t.angle + turn * TANK_TURN * t.turn_mul * dt
-            if not self._blocked(t.x, t.y, na, t):
+            if not self._blocked(t.x, t.y, na, t, False):
                 t.angle = na
         if thrust:
             v = (TANK_SPEED if thrust > 0 else -TANK_BACK) * t.speed_mul
@@ -778,96 +819,98 @@ class World:
         self.step(dt, [ACTION_CTRL[a] for a in actions])
 
 
+def ang_diff(a, b):
+    return (a - b + math.pi) % (2.0 * math.pi) - math.pi
+
+
 class Laika:
     def __init__(self, level, seed=None):
         self.level = max(1, min(3, level))
         self.rng = random.Random(seed)
         self.think = 0.0
-        self.goal_t = 0.0
-        self.goal = None
-        self.aim = 0.0
-        self.safe = True
+        self.sol = 0.0
+        self.err = 0.0
         self.armed = False
-        self.aligned = False
-        self.dodge = 0.0
         self.dodge_ang = 0.0
-        self.speed_mul = (0.62, 1.0, 1.20)[self.level - 1]
-        self.turn_mul = (0.60, 1.0, 1.70)[self.level - 1]
-        self.scan = (0.60, 0.30, 0.20)[self.level - 1]
-        self.tol = (0.34, 0.10, 0.05)[self.level - 1]
-        self.grab = (0.10, 0.85, 1.0)[self.level - 1]
-        self.care = (0.0, 0.88, 1.0)[self.level - 1]
-        self.cautious = self.level >= 2
+        self.dodge_t = 0.0
+        self.speed_mul = (0.66, 1.0, 1.15)[self.level - 1]
+        self.turn_mul = (0.62, 1.0, 1.25)[self.level - 1]
+        self.scan = (0.45, 0.28, 0.18)[self.level - 1]
+        self.aim_err = (0.22, 0.075, 0.012)[self.level - 1]
+        self.dodge_skill = (0.08, 0.75, 1.0)[self.level - 1]
+        self.grab = (0.15, 0.75, 1.0)[self.level - 1]
+        self.lead = (0.0, 0.10, 0.24)[self.level - 1]
+        self.nav = None
+        self.px = 0.0
+        self.py = 0.0
+        self.pa = 0.0
+        self.stuck = 0.0
+        self.unstick = 0.0
+        self.unstick_dir = 1
+        self.search = (
+            ((3, 0.05, 0, 300),),
+            ((3, 0.05, 0, 640), (13, math.pi, 2, 380)),
+            ((5, 0.05, 0, 640), (17, math.pi, 3, 460), (29, math.pi, 5, 560)),
+        )[self.level - 1]
 
-    def _visible(self, world, me, foe):
-        d = math.hypot(foe.x - me.x, foe.y - me.y)
-        n = int(d // 5.0) + 1
-        for i in range(1, n):
-            x = me.x + (foe.x - me.x) * i / n
-            y = me.y + (foe.y - me.y) * i / n
-            if world.point_solid(x, y):
-                return False
-        return True
-
-    def _ricochet(self, world, me, foe):
+    def _solve(self, world, me, foe):
         mx, my = me.muzzle()
-        base = math.atan2(foe.y - my, foe.x - mx)
-        if self.level >= 3:
-            count, half, bounces, limit = 24, math.pi, 5, 480
-        else:
-            count, half, bounces, limit = 15, 2.0, 3, 360
+        px = foe.x + foe.vx * self.lead
+        py = foe.y + foe.vy * self.lead
+        base = math.atan2(py - my, px - mx)
+        for count, half, bounces, limit in self.search:
+            best = None
+            for k in range(count):
+                ang = base if count == 1 else base + half * (2.0 * k / (count - 1) - 1.0)
+                pts, hit = world.trace(mx, my, ang, bounces, me, None, limit)
+                if hit is foe:
+                    run = 0.0
+                    for i in range(len(pts) - 1):
+                        run += math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+                    if best is None or run < best[0]:
+                        best = (run, ang)
+            if best is not None:
+                return best[1]
+        return None
+
+    def _threat(self, world, me):
         best = None
-        for k in range(count):
-            ang = base + half * (2.0 * k / (count - 1) - 1.0)
-            pts, hit = world.trace(mx, my, ang, bounces, me, None, limit)
-            if hit is foe:
-                run = 0.0
-                for i in range(len(pts) - 1):
-                    run += math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
-                if best is None or run < best[0]:
-                    best = (run, ang)
-        return None if best is None else best[1]
-
-    def _risk(self, world, me, ang):
-        _, hit = world.trace(me.x, me.y, ang, 2, me, None, 150)
-        return hit is me
-
-    def _safe_angle(self, world, me, ang):
-        if not self._risk(world, me, ang):
-            return ang, True
-        for off in (0.07, -0.07, 0.14, -0.14, 0.22, -0.22, 0.3, -0.3):
-            if not self._risk(world, me, ang + off):
-                return ang + off, True
-        return ang, False
-
-    def _incoming(self, world, me):
-        ca = math.cos(me.angle)
-        sa = math.sin(me.angle)
         for b in world.bullets:
-            if b.owner is not me:
-                continue
             dx = b.x - me.x
             dy = b.y - me.y
             d = math.hypot(dx, dy)
-            if d < 1.0 or d > 96.0:
+            if d < 1.0 or d > 190.0:
                 continue
-            if (dx * ca + dy * sa) / d < 0.35:
+            sp = math.hypot(b.vx, b.vy)
+            if sp < 1e-6:
                 continue
-            if (dx * (b.vx - me.vx) + dy * (b.vy - me.vy)) / d < 0.0:
-                return True
-        return False
+            ux = b.vx / sp
+            uy = b.vy / sp
+            if -dx * ux - dy * uy <= 0.0:
+                continue
+            s = -dx * uy + dy * ux
+            if abs(s) > TANK_H + BULLET_R + 3.0:
+                continue
+            if best is None or d < best[2]:
+                nx, ny = (-uy, ux) if s >= 0.0 else (uy, -ux)
+                best = (nx * 0.85 - ux * 0.55, ny * 0.85 - uy * 0.55, d)
+        return best
 
-    def _free_dir(self, world, me, foe):
-        reach = TANK_H + PITCH * 1.6
+    def _clear_dir(self, world, me, tx, ty):
+        want = math.atan2(ty - me.y, tx - me.x)
+        near = TANK_H + 7.0
+        far = TANK_H + PITCH * 1.5
         best = None
-        for off in (0.4, -0.4, 0.8, -0.8, 1.2, -1.2, 1.7, -1.7, 2.3, -2.3, 2.9, -2.9, math.pi):
+        for off in (0.0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05, 1.4, -1.4,
+                    1.8, -1.8, 2.2, -2.2, 2.7, -2.7, math.pi):
             a = me.angle + off
-            tx = me.x + math.cos(a) * reach
-            ty = me.y + math.sin(a) * reach
-            if world._blocked(tx, ty, a, me):
+            if world._blocked(me.x + math.cos(a) * near, me.y + math.sin(a) * near, a, me):
                 continue
-            if best is None or (tx - foe.x) ** 2 + (ty - foe.y) ** 2 < best[0]:
-                best = ((tx - foe.x) ** 2 + (ty - foe.y) ** 2, a)
+            score = abs(ang_diff(a, want))
+            if not world._blocked(me.x + math.cos(a) * far, me.y + math.sin(a) * far, a, me):
+                score -= 0.35
+            if best is None or score < best[0]:
+                best = (score, a)
         return None if best is None else best[1]
 
     def act(self, world, me, foe, dt):
@@ -875,90 +918,90 @@ class Laika:
             return (0, 0, 0)
         me.speed_mul = self.speed_mul
         me.turn_mul = self.turn_mul
-        seen = self._visible(world, me, foe)
         self.think -= dt
-        self.goal_t -= dt
+        self.dodge_t -= dt
+        threat = self._threat(world, me) if self.rng.random() < self.dodge_skill else None
+        if threat is not None:
+            d = ang_diff(math.atan2(threat[1], threat[0]), me.angle)
+            me.turn_mul = self.turn_mul if abs(d) > 0.14 else self.turn_mul * 0.3
+            turn = 0 if abs(d) < 0.03 else (1 if d > 0 else -1)
+            if threat[2] < 56.0 and abs(d) > 2.2:
+                return (turn, -1, 0)
+            return (turn, 1 if abs(d) < 1.3 else 0, 0)
         if self.think <= 0.0:
             self.think = self.scan
-            if seen:
-                lead = 0.22 if self.level >= 3 else 0.0
-                self.goal = (foe.x + foe.vx * lead, foe.y + foe.vy * lead)
-                self.goal_t = 0.8
-            elif self.goal_t <= 0.0:
-                self.goal = None
-                if world.capsules and self.rng.random() < self.grab:
-                    near = min(
-                        world.capsules,
-                        key=lambda c: (c.x - me.x) ** 2 + (c.y - me.y) ** 2,
-                    )
-                    if (near.x - me.x) ** 2 + (near.y - me.y) ** 2 < (PITCH * 8.0) ** 2:
-                        self.goal = (near.x, near.y)
-                        self.goal_t = 1.6
-                if self.goal is None:
-                    jitter = self.rng.uniform(-0.2, 0.2) if self.level >= 3 else self.rng.uniform(-0.7, 0.7)
-                    a = math.atan2(foe.y - me.y, foe.x - me.x) + jitter
-                    self.goal = (
-                        me.x + math.cos(a) * PITCH * 3.0,
-                        me.y + math.sin(a) * PITCH * 3.0,
-                    )
-                    self.goal_t = self.rng.uniform(0.4, 0.9)
-            aim = math.atan2(self.goal[1] - me.y, self.goal[0] - me.x)
-            armed = seen
-            safe = True
-            aligned = False
-            if self.level >= 2:
-                sol = self._ricochet(world, me, foe) if not seen else None
-                if sol is not None:
-                    aim = sol
-                    armed = True
-                elif seen:
-                    aim, safe = self._safe_angle(world, me, aim)
-                d = (aim - me.angle + math.pi) % (2.0 * math.pi) - math.pi
-                if armed and abs(d) < self.tol:
-                    aligned = True
-            self.aim = aim
-            self.armed = armed
-            self.safe = safe
-            self.aligned = aligned
-        diff = (self.aim - me.angle + math.pi) % (2.0 * math.pi) - math.pi
-        turn = 0 if abs(diff) < 0.04 else (1 if diff > 0 else -1)
-        ahead = (
-            me.x + math.cos(me.angle) * (TANK_H + PITCH * 0.55),
-            me.y + math.sin(me.angle) * (TANK_H + PITCH * 0.55),
-        )
-        blocked = world._blocked(ahead[0], ahead[1], me.angle, me)
-        if self.aligned:
-            thrust = 0
-        elif self.dodge > 0.0:
-            self.dodge -= dt
-            thrust = 1 if abs(self.dodge_ang - me.angle) < 1.2 else 0
-        elif blocked:
-            fd = self._free_dir(world, me, foe)
-            if fd is None:
-                thrust = 0
-            else:
-                self.dodge = self.rng.uniform(0.5, 0.9) if self.level >= 2 else self.rng.uniform(0.3, 0.7)
-                self.dodge_ang = fd + self.rng.uniform(-0.15, 0.15)
-                self.armed = False
-                self.aligned = False
-                self.aim = self.dodge_ang
-                self.goal_t = 0.0
-                thrust = 0
-        elif abs(diff) > 1.7:
-            thrust = 0
+            self.err = self.rng.uniform(-self.aim_err, self.aim_err)
+            sol = self._solve(world, me, foe)
+            self.armed = sol is not None
+            if sol is not None:
+                self.sol = sol
+            gx, gy = foe.x, foe.y
+            if world.capsules and self.rng.random() < self.grab:
+                near = min(world.capsules, key=lambda c: (c.x - me.x) ** 2 + (c.y - me.y) ** 2)
+                if (near.x - me.x) ** 2 + (near.y - me.y) ** 2 < (PITCH * 7.0) ** 2:
+                    gx, gy = near.x, near.y
+            nxt = world.route(*world.cell_at(me.x, me.y), *world.cell_at(gx, gy))
+            self.nav = cell_center(*nxt) if nxt is not None else (gx, gy)
+        aim = None
+        if self.armed:
+            aim = self.sol + self.err
         else:
-            thrust = 1
-        if self.dodge > 0.0:
-            d = (self.dodge_ang - me.angle + math.pi) % (2.0 * math.pi) - math.pi
-            turn = 0 if abs(d) < 0.04 else (1 if d > 0 else -1)
-        back_off = self.cautious and self._incoming(world, me)
-        if back_off:
-            thrust = 0
+            aim = math.atan2(self.nav[1] - me.y, self.nav[0] - me.x)
+        diff = ang_diff(aim, me.angle)
+        turn = 0
+        thrust = 0
         fire = 0
-        if self.level >= 2:
-            if self.armed and self.aligned and not back_off:
-                fire = 1 if (self.safe or self.rng.random() > self.care) else 0
-        elif self.rng.random() < 0.035:
+        if self.unstick > 0.0:
+            self.unstick -= dt
+            return (self.unstick_dir, -1, 0)
+        if self.armed and abs(diff) < 0.05:
+            me.turn_mul = self.turn_mul * 0.25
+            turn = 0 if abs(diff) < 0.012 else (1 if diff > 0 else -1)
             fire = 1
-        me.turn_mul = self.turn_mul if abs(diff) > 0.12 else self.turn_mul * 0.28
+        elif self.level == 1 and self.rng.random() < 0.012:
+            fire = 1
+            me.turn_mul = self.turn_mul
+            turn = self.rng.choice((-1, 0, 1))
+            thrust = 1
+        else:
+            me.turn_mul = self.turn_mul if abs(diff) > 0.14 else self.turn_mul * 0.3
+            turn = 0 if abs(diff) < 0.03 else (1 if diff > 0 else -1)
+            if world._blocked(
+                me.x + math.cos(me.angle) * (TANK_H + PITCH * 0.6),
+                me.y + math.sin(me.angle) * (TANK_H + PITCH * 0.6),
+                me.angle, me,
+            ):
+                fd = self._clear_dir(world, me, self.nav[0], self.nav[1])
+                if fd is None:
+                    turn, thrust = 0, -1
+                else:
+                    d = ang_diff(fd, me.angle)
+                    fwd_ok = not world._blocked(
+                        me.x + math.cos(me.angle) * (TANK_H + 9.0),
+                        me.y + math.sin(me.angle) * (TANK_H + 9.0),
+                        me.angle, me,
+                    )
+                    rot_ok = not world._blocked(me.x, me.y, me.angle + (0.1 if d > 0 else -0.1), me, False)
+                    if not rot_ok:
+                        turn, thrust = 0, (1 if fwd_ok else -1)
+                    elif abs(d) < 0.04:
+                        turn, thrust = 0, (1 if fwd_ok else 0)
+                    else:
+                        turn, thrust = (1 if d > 0 else -1), 0
+            else:
+                thrust = 1 if abs(diff) < 1.9 else 0
+        moved = (me.x - self.px) ** 2 + (me.y - self.py) ** 2
+        turned = abs(ang_diff(me.angle, self.pa))
+        self.px = me.x
+        self.py = me.y
+        self.pa = me.angle
+        if (thrust != 0 or turn != 0) and moved < 0.04 and turned < 0.008:
+            self.stuck += dt
+            if self.stuck > 0.3:
+                self.stuck = 0.0
+                self.unstick = self.rng.uniform(0.5, 1.0)
+                self.unstick_dir = self.rng.choice((-1, 1))
+        else:
+            self.stuck = 0.0
         return (turn, thrust, fire)
+
