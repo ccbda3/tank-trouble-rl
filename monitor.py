@@ -836,7 +836,7 @@ window.addEventListener("resize",function(){var i;for(i=0;i<charts.length;i++)dr
 
 
 class Monitor:
-    def __init__(self, state_fn, port=8787, start_fn=None, stop_fn=None):
+    def __init__(self, state_fn, port=80, start_fn=None, stop_fn=None):
         self.port = port
         self.state_fn = state_fn
         self.start_fn = start_fn
