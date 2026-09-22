@@ -5,6 +5,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import torch
 
+import config
+
 
 def group_avg(a, n):
     a = np.asarray(a, dtype=float).ravel()
@@ -14,179 +16,644 @@ def group_avg(a, n):
     return [float(a[idx[i]:idx[i + 1]].mean()) for i in range(n)]
 
 
+def net_map_bucket(b, n, conn):
+    v = int((b + 0.5) * conn / n)
+    return 0 if v < 0 else (conn - 1 if v > conn - 1 else v)
+
+
+def bucket_edges(weight, conn, n_src, n_dst):
+    w = torch.abs(weight)
+    while w.dim() > 2:
+        w = w.mean(-1)
+    W = w.detach().cpu().numpy()
+    t_n, s_n = W.shape
+    acc = np.zeros(conn * conn)
+    cnt = np.zeros(conn * conn)
+    for s in range(s_n):
+        gs = net_map_bucket(s, n_src, conn)
+        for t in range(t_n):
+            gt = net_map_bucket(t, n_dst, conn)
+            i = gt * conn + gs
+            acc[i] += float(W[t, s])
+            cnt[i] += 1
+    out = np.zeros(conn * conn)
+    np.divide(acc, cnt, out=out, where=cnt > 0)
+    return out
+
+
 def act_stats(net, obs):
     x = torch.tensor(np.asarray(obs, dtype=np.float32) / 255.0).unsqueeze(0).to(
         net.fc[0].weight.device
     )
     with torch.no_grad():
-        z = net.net[1](net.net[0](x))
-        c1 = z.mean((2, 3))[0].cpu().numpy()
-        z = net.net[3](net.net[2](z))
-        c2 = z.mean((2, 3))[0].cpu().numpy()
-        z = net.net[5](net.net[4](z))
-        c3 = z.mean((2, 3))[0].cpu().numpy()
-        f = net.fc[1](net.fc[0](torch.flatten(z, 1)))
+        c1a = net.net[1](net.net[0](x))
+        c2a = net.net[3](net.net[2](c1a))
+        c3a = net.net[5](net.net[4](c2a))
+        c1 = c1a[0].mean((1, 2)).cpu().numpy()
+        c2 = c2a[0].mean((1, 2)).cpu().numpy()
+        c3 = c3a[0].mean((1, 2)).cpu().numpy()
+        pool = net.net[6](c3a)
+        f = net.fc[1](net.fc[0](torch.flatten(pool, 1)))
         fc = f[0].cpu().numpy()
         out = net.fc[2](f)[0].cpu().numpy()
+
     gray = np.asarray(obs, dtype=float).mean(0)
-    h, w = gray.shape
-    in_arr = [float(gray[int(i * h / 10):int((i + 1) * h / 10)].mean()) for i in range(10)]
-    wf = np.array([torch.mean(torch.abs(t)).item() for t in [
-        net.net[0].weight,
-        net.net[2].weight,
-        net.net[4].weight,
-        net.fc[0].weight,
-        net.fc[2].weight,
-    ]])
-    wf = (wf / (wf.max() or 1.0)).tolist()
+    rows, cols = 6, 8
+    rh = gray.shape[0] // rows
+    cw = gray.shape[1] // cols
+    in_arr = []
+    for r in range(rows):
+        for c in range(cols):
+            in_arr.append(float(gray[r * rh:(r + 1) * rh, c * cw:(c + 1) * cw].mean()))
+
+    conn = 16
+
+    def layer(name, detail, shown, tdim, params, outsz):
+        arr = np.asarray(shown, dtype=float)
+        return {
+            "name": name,
+            "detail": detail,
+            "nodeCount": len(arr),
+            "trueDim": int(tdim),
+            "nodes": [float(v) for v in arr],
+            "params": int(params),
+            "out": outsz,
+            "actMin": float(arr.min()) if arr.size else 0.0,
+            "actMax": float(arr.max()) if arr.size else 0.0,
+            "actMean": float(arr.mean()) if arr.size else 0.0,
+        }
+
+    layers = [
+        layer("输入", f"{config.GRID}×{config.GRID} 灰度 · 融合 {config.FRAME_STACK} 帧",
+              in_arr, config.GRID * config.GRID, 0, f"{rows}×{cols} 网格采样"),
+        layer("C1", "32 通道 @ 12×12 卷积", group_avg(c1, 24), 32,
+              32 * config.FRAME_STACK * 9 + 32, "32 @ 12×12"),
+        layer("C2", "64 通道 @ 6×6 卷积", group_avg(c2, 24), 64, 64 * 32 * 9 + 64, "64 @ 6×6"),
+        layer("C3", "64 通道 @ 6×6 卷积", group_avg(c3, 24), 64, 64 * 64 * 9 + 64, "64 @ 6×6"),
+        layer("FC", "全连接 512", group_avg(fc, 24), 512, 64 * 512 + 512, "512 特征"),
+        layer("输出", "四个动作 Q 值", out.tolist(), config.ACTIONS,
+              512 * config.ACTIONS + config.ACTIONS, "上 / 下 / 左 / 右"),
+    ]
+
+    edges = [
+        [float(net.net[0].weight.abs().mean().item())] * (conn * conn),
+        bucket_edges(net.net[2].weight, conn, 24, 24).tolist(),
+        bucket_edges(net.net[4].weight, conn, 24, 24).tolist(),
+        bucket_edges(net.fc[0].weight, conn, 24, 24).tolist(),
+        bucket_edges(net.fc[2].weight, conn, 24, 24).tolist(),
+    ]
+
     return {
-        "in": in_arr,
-        "c1": group_avg(c1, 12),
-        "c2": group_avg(c2, 14),
-        "c3": group_avg(c3, 12),
-        "fc": group_avg(fc, 12),
-        "out": group_avg(out, 3),
-        "wf": wf,
+        "ready": 1,
+        "layers": layers,
+        "edges": edges,
+        "conn": conn,
+        "value": float(out.max()) if out.size else 0.0,
     }
 
 
+CFG = {
+    "grid": config.GRID,
+    "frames": config.FRAME_STACK,
+    "actions": config.ACTIONS,
+    "agents": config.AGENTS,
+    "gamma": config.GAMMA,
+    "lr": config.LR,
+    "batch": config.BATCH,
+    "accum": config.ACCUM,
+    "replay": config.REPLAY_CAP,
+    "targetSync": config.TARGET_SYNC,
+    "alpha": config.ALPHA,
+    "epsStart": config.EPS_START,
+    "epsEnd": config.EPS_END,
+    "epsDecay": config.EPS_DECAY,
+    "betaFrames": config.BETA_FRAMES,
+    "saveEvery": config.SAVE_EVERY,
+    "ckptEvery": config.CHECKPOINT_INTERVAL,
+    "connBucket": 16,
+}
+
 PAGE = """<!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>贪吃蛇 · 强化学习监控面板</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>贪吃蛇 DQN 训练详情</title>
 <style>
-:root{--bg:#0f1219;--card:#171c27;--line:#262e3f;--txt:#c9d4e3;--dim:#7d8aa0;--acc:#ff8f5a;--acc2:#5ac8ff;--good:#6bff8f}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--txt);font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif}
-header{padding:16px 22px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-h1{font-size:20px;margin:0;font-weight:600}
-.dot{width:9px;height:9px;border-radius:50%;background:#5ff25f;box-shadow:0 0 8px #5ff25f;animation:p 1.6s infinite}
-@keyframes p{50%{opacity:.35}}
-.meta{color:var(--dim);font-size:13px;margin-left:auto}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;padding:16px 22px 6px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:13px 16px}
-.card .k{font-size:12px;color:var(--dim);margin-bottom:6px}
-.card .v{font-size:23px;font-weight:600;font-variant-numeric:tabular-nums}
-.card .v.acc{color:var(--acc)}.card .v.good{color:var(--good)}.card .v.cy{color:var(--acc2)}
-section{padding:6px 22px 24px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.panel.rowwide{grid-column:1/-1}
-@media(max-width:900px){section{grid-template-columns:1fr}}
-.panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-.panel h2{font-size:14px;margin:0 0 10px;color:var(--dim);font-weight:600}
-canvas{width:100%;display:block;background:#0b0e14;border-radius:8px}
-.lg{display:flex;gap:14px;font-size:11px;color:var(--dim);margin-top:6px;flex-wrap:wrap}
-.lg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
-.help{font-size:12px;color:var(--dim);line-height:1.8}
-.help b{color:var(--txt)}
+html,body{margin:0;background:#0f1216;color:#c8d0da;font:12px/1.35 "Microsoft YaHei UI","Segoe UI",system-ui,sans-serif;overflow-x:hidden}
+header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:7px 12px;background:#141920;border-bottom:1px solid #232a33}
+.brand{font-size:13px;font-weight:700;color:#e8eef5;letter-spacing:.5px}
+.stats{display:flex;gap:16px;flex-wrap:wrap;flex:1;min-width:0}
+.st{display:flex;align-items:baseline;gap:5px}
+.st em{font-style:normal;font-size:11px;color:#79828f}
+.st b{font-size:13px;font-weight:700;color:#e2e9f1;font-variant-numeric:tabular-nums}
+.conn{display:flex;align-items:center;gap:6px;font-size:11px;color:#79828f;white-space:nowrap}
+.conn .dot{width:8px;height:8px;border-radius:50%;background:#4a5563}
+.conn.ok .dot{background:#3ddc84;box-shadow:0 0 6px #3ddc84}
+.conn.ok{color:#9fe6bf}
+.conn.bad .dot{background:#ff5f56;box-shadow:0 0 6px #ff5f56}
+.conn.bad{color:#ff9d97}
+main{display:flex;flex-direction:column;gap:10px;padding:10px;min-width:0}
+.card{min-width:0;background:#151a21;border:1px solid #232a33;border-radius:8px;padding:8px 10px 10px}
+.chead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+.ctitle{font-size:13px;font-weight:700;color:#e8eef5;letter-spacing:.3px}
+.csub{font-size:11px;color:#79828f;font-variant-numeric:tabular-nums}
+.chint{margin-left:auto;font-size:11px;color:#5f6a78}
+.charts{display:grid;gap:8px;grid-template-columns:repeat(5,minmax(0,1fr))}
+@media(max-width:1500px){.charts{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:1180px){.charts{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:860px){.charts{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.charts{grid-template-columns:minmax(0,1fr)}}
+.ch{min-width:0;overflow:hidden;background:#12171d;border:1px solid #1f262f;border-radius:6px;padding:5px 6px 4px;display:flex;flex-direction:column;gap:3px}
+.cht{display:flex;align-items:baseline;gap:6px;font-size:11px;white-space:nowrap}
+.chn{color:#93a0af}
+.chv{margin-left:auto;font-weight:700;color:#dfe7ef;font-variant-numeric:tabular-nums}
+.chc{display:block;width:100%;height:76px}
+.chf{display:flex;gap:9px;font-size:10px;color:#66707d;font-variant-numeric:tabular-nums;white-space:nowrap}
+.chf b{color:#8d99a7;font-weight:600}
+.cards{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:0}
+.cd{min-width:0;background:#12171d;border:1px solid #1f262f;border-radius:6px;padding:6px 9px}
+.cd .ck{font-size:11px;color:#79828f}
+.cd .cv{font-size:21px;font-weight:700;color:#dfe7ef;font-variant-numeric:tabular-nums;margin-top:3px}
+.cd .cv.acc{color:#ff8f5a}.cd .cv.good{color:#5fd08a}.cd .cv.cy{color:#8fb9ff}
+.panels{display:grid;gap:8px;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);align-items:start}
+@media(max-width:1240px){.panels{grid-template-columns:minmax(0,1fr)}}
+.pnl{min-width:0;background:#12171d;border:1px solid #1f262f;border-radius:6px;padding:6px 8px 8px}
+.pnlh{font-size:11px;font-weight:700;color:#b9c4d1;margin:0 0 5px;border-bottom:1px solid #202730;padding-bottom:4px}
+.pnlh.sub{margin-top:9px}
+.row{display:flex;align-items:baseline;gap:10px;font-size:11px;padding:1px 0;min-width:0}
+.row .rk{color:#79828f;white-space:nowrap}
+.row .rv{margin-left:auto;color:#cbd4de;font-variant-numeric:tabular-nums;text-align:right;min-width:0;word-break:break-word}
+.row .rv b{font-weight:700;color:#a9c8ee}
+.row .rv b.dim{color:#8b95a3;font-weight:600}
+.lyrs{display:flex;flex-direction:column;gap:1px}
+.lyr{display:grid;grid-template-columns:52px minmax(0,1fr) 66px 66px;gap:6px;align-items:baseline;font-size:11px;font-variant-numeric:tabular-nums;padding:1px 0}
+.lyr.hd{color:#5f6a78;font-size:10px;border-bottom:1px solid #1c232b;padding-bottom:3px;margin-bottom:2px}
+.lyr.hd span:not(:first-child),.lyr span:not(.lnm):not(.lsh){text-align:right}
+.lyr.tot{border-top:1px solid #232a33;margin-top:3px;padding-top:4px;color:#e8eef5;font-weight:700}
+.lnm{color:#9db4cd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lsh{color:#8b95a3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lpr{color:#cbb98f;text-align:right;font-variant-numeric:tabular-nums}
+.lot{color:#7f8b99;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vbtn{font:12px "Microsoft YaHei UI","Segoe UI",sans-serif;color:#9fb2c6;background:#151b22;border:1px solid #263039;border-radius:5px;padding:3px 10px;margin-left:6px;cursor:pointer}
+.vbtn:hover{border-color:#3b4a58;color:#cfd8e3}
+.vbtn.on{color:#0d1218;background:#5fb0e8;border-color:#5fb0e8;font-weight:700}
+.netwrap{position:relative;width:100%;height:560px;background:radial-gradient(120% 100% at 50% 0%,#141b24 0%,#0d1218 72%);border:1px solid #1c232b;border-radius:6px;overflow:hidden}
+#netcv{display:block;width:100%;height:100%;cursor:crosshair}
+.nettip{position:absolute;display:none;z-index:4;max-width:264px;padding:6px 9px;background:rgba(11,15,20,.95);border:1px solid #2b3644;border-radius:5px;font-size:11px;line-height:1.55;color:#b9c4d1;pointer-events:none;box-shadow:0 8px 20px rgba(0,0,0,.55)}
+.nettip.on{display:block}
+.nettip .th{font-weight:700;color:#a9c8ee;margin-bottom:2px}
+.nettip .th.sub{margin-top:5px;border-top:1px solid #202730;padding-top:4px}
+.nettip .tr{display:flex;gap:10px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.nettip .tr i{margin-left:auto;font-style:normal;color:#8fd7f2}
+.netlegend{display:flex;gap:16px;flex-wrap:wrap;margin-top:7px;font-size:11px;color:#79828f}
+.netlegend i{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}
+.gdwrap{position:relative;width:100%;height:340px;background:radial-gradient(130% 100% at 50% 0%,#141b24 0%,#0d1218 72%);border:1px solid #1c232b;border-radius:6px;overflow:hidden}
+#gdcv{display:block;width:100%;height:100%;cursor:grab;touch-action:none}
+.hint{font-size:11px;color:#79828f;margin-top:6px;display:flex;gap:16px;flex-wrap:wrap}
+.hint i{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}
+.help{font-size:12px;color:#79828f;line-height:1.9;margin-top:6px}
+.help b{color:#c8d0da}
+@media(max-width:860px){.netwrap{height:440px}}
 </style>
 </head>
 <body>
-<header><span class="dot"></span><h1>贪吃蛇 · 大地图强化学习监控面板</h1><span class="meta" id="meta">连接中…</span></header>
-<div class="grid" id="cards"></div>
-<section>
-  <div class="panel rowwide"><h2>神经网络 · 逐层神经元连接（连线亮 = 真实权重 × 两端激活）</h2><canvas id="nn" height="430"></canvas>
-    <div class="lg"><span><i style="background:#1d7fd1"></i>输入</span><span><i style="background:#e76a2e"></i>卷积/FC</span><span><i style="background:#6bff8f"></i>输出</span><span style="opacity:.85">当前画面哪条通路被点亮一目了然</span></div>
-  </div>
-  <div class="panel"><h2>梯度下降 · 3D 损失面</h2><canvas id="gd" height="300"></canvas>
-    <div class="lg"><span><i style="background:#3a465c"></i>损失面</span><span><i style="background:#ff8f5a"></i>小球沿梯度滚向谷底 = 让 Loss 最小化</span></div>
-  </div>
-  <div class="panel"><h2>训练曲线（Loss 与 平均蛇身长度）</h2><canvas id="chart" height="300"></canvas></div>
-  <div class="panel rowwide"><h2>通俗解释 · 怎么看这些数字</h2>
-    <div class="help" id="help">
-      <div><b>Loss（损失）</b>：网络"猜错"的程度，越低越会玩；训练就是让小球滚向谷底把 Loss 压下去。</div>
-      <div><b>探索率 ε</b>：从 1 慢慢降到接近 0。前期疯狂乱走试错，后期主要靠学到的策略。</div>
-      <div><b>平均蛇长 / 最长蛇身</b>：这局蛇长到多长，越大越会玩，是给"吃苹果能力"打的进度条。</div>
-      <div><b>神经连接图</b>：训练时网络"大脑"在思考，亮的线就是正在算的数据通路；权重×激活越强越亮。</div>
-    </div>
-  </div>
+<header>
+<span class="brand">贪吃蛇 · DQN 强化学习训练监控</span>
+<div class="stats" id="stats"></div>
+<div class="conn" id="conn"><i class="dot"></i><span id="connTxt">连接中</span></div>
+</header>
+<main>
+<section class="card">
+<div class="chead"><span class="ctitle">实时指标</span><span class="csub" id="cardSub">等待数据…</span></div>
+<div class="cards" id="cards"></div>
 </section>
+<section class="card">
+<div class="chead"><span class="ctitle">训练曲线</span><span class="csub" id="chartSub">等待数据…</span></div>
+<div class="charts" id="charts"></div>
+</section>
+<section class="card">
+<div class="chead"><span class="ctitle">神经网络前向传播</span><span class="csub" id="netSub">等待复杂数据…</span><span class="chint">收到新快照就按真实层序重放一次前向传播 · 3D 可拖拽旋转/滚轮缩放 · 悬停节点看细节</span><button class="vbtn on" id="v-3d" data-view="3d">3D 立体</button><button class="vbtn" id="v-2d" data-view="2d">2D 平面</button></div>
+<div class="netwrap" id="netwrap">
+<canvas id="netcv"></canvas>
+<div class="nettip" id="nettip"></div>
+</div>
+<div class="netlegend">
+<span><i style="background:linear-gradient(90deg,#101e2a,#2f6f97,#8ce0fa)"></i>节点颜色 = 该层激活强度（按本层节点值 min~max 归一）</span>
+<span><i style="background:linear-gradient(90deg,rgba(126,170,216,.05),rgba(126,170,216,.9))"></i>连线透明度 = 归一权重 × 源节点激活</span>
+<span><i style="background:#b0e2ff"></i>脉冲沿连线由输入侧流向输出侧 · 亮度 = 连接强度</span>
+<span><i style="background:#ffb020"></i>最强通路（权重 × 源激活）</span>
+</div>
+</section>
+<section class="card">
+<div class="chead"><span class="ctitle">详细参数</span><span class="csub" id="paramSub">等待数据…</span></div>
+<div class="panels" id="panels"><div class="pnl"><div class="pnlh">参数</div><div class="row"><span class="rk">状态</span><span class="rv">等待数据…</span></div></div></div>
+</section>
+<section class="card">
+<div class="chead"><span class="ctitle">损失曲面 · 3D 视图</span><span class="csub">Double DQN 训练轨迹示意</span><span class="chint">拖动旋转 · 滚轮缩放 · 小球沿梯度向谷底滚动</span></div>
+<div class="gdwrap" id="gdwrap"><canvas id="gdcv"></canvas></div>
+<div class="hint">
+<span><i style="background:#ff8f5a"></i>小球 = 当前 Loss，沿梯度下降向谷底滚动</span>
+<span><i style="background:linear-gradient(90deg,#182c48,#4a96c6,#a6e0f6)"></i>曲面高度 = 损失值，低暗高亮</span>
+</div>
+</section>
+<section class="card">
+<div class="chead"><span class="ctitle">通俗解释 · 怎么看这些数字</span></div>
+<div class="help" id="help"></div>
+</section>
+</main>
 <script>
-const $=id=>document.getElementById(id);
-const num=v=>Math.round(v||0).toLocaleString();
-function pick(k,d){switch(k){
- case"步数":return num(d.steps);case"探索率 ε":return d.eps.toFixed(3);case"训练步数":return num(d.trainSteps);
- case"经验池":return num(d.buffer);case"Loss":return d.loss.toFixed(4);case"本局蛇长":return num(d.score);
- case"平均蛇长":return num(d.avgScore);case"最长蛇身":return num(d.bestScore);case"GPU 利用率":return d.gpu+"%";
- case"局数":return num(d.episodes);default:return"—";}}
-function cls(k){return(k==="平均蛇长"||k==="最长蛇身"||k==="GPU 利用率")?" good":(k==="探索率 ε"?" cy":"");}
-const keys=["步数","探索率 ε","训练步数","经验池","Loss","本局蛇长","平均蛇长","最长蛇身","GPU 利用率","局数"];
-const LN=[["in","输入",10],["c1","C1·32",12],["c2","C2·64",14],["c3","C3·64",12],["fc","FC·512",12],["out","输出",4]];
-let A={in:new Array(10).fill(0),c1:new Array(12).fill(0),c2:new Array(14).fill(0),c3:new Array(12).fill(0),fc:new Array(12).fill(0),out:new Array(4).fill(0),wf:[0.5,0.5,0.5,0.5,0.5]};
-function norm(v){const m=Math.max.apply(null,v);return m>0?v.map(x=>Math.max(0,x)/m):v;}
-function drawNN(t){
- const c=$("nn"),x=c.getContext("2d"),W=c.clientWidth,H=c.clientHeight||430;
- c.width=W;c.height=H;x.clearRect(0,0,W,H);
- const pad=40;const xs=LN.map((_,i)=>pad+i*(W-2*pad)/(LN.length-1));
- const pos=LN.map(f=>{const n=f[2],ys=[];for(let i=0;i<n;i++)ys.push(H/2+(i-(n-1)/2)*(H-80)/n);return ys;});
- for(let li=0;li<LN.length-1;li++){
-  const aarr=norm(A[LN[li][0]]),barr=norm(A[LN[li+1][0]]);
-  const wfv=(A.wf&&A.wf[li])||0;
-  for(let i=0;i<LN[li][2];i++)for(let j=0;j<LN[li+1][2];j++){
-   const a=aarr[i],b=barr[j],amp=a*b,pulse=.45+.55*Math.abs(Math.sin(t/300+li*1.7+i*0.4+j*0.25));
-   const al=Math.min(1,(amp*(0.5+wfv*1.8)+wfv*0.3)*pulse);
-   if(al<0.03)continue;
-   x.beginPath();x.strokeStyle="rgba(255,143,90,"+al.toFixed(2)+")";
-   x.lineWidth=Math.min(2.2,.6+al*1.8);
-   if(al>0.5){x.shadowColor="rgba(255,143,90,"+al.toFixed(2)+")";x.shadowBlur=8;}else x.shadowBlur=0;
-   x.moveTo(xs[li],pos[li][i]);x.lineTo(xs[li+1],pos[li+1][j]);x.stroke();
-  }
-  x.shadowBlur=0;
+(function(){
+"use strict";
+function el(id){return document.getElementById(id);}
+function fInt(v){var n=Number(v);return isFinite(n)?Math.round(n).toLocaleString("en-US"):"-";}
+function fFix(v,d){var n=Number(v);return isFinite(n)?n.toFixed(d):"-";}
+function fSci(v,sig){var n=Number(v);if(!isFinite(n))return"-";if(n===0)return"0";var e=Math.floor(Math.log(Math.abs(n))/Math.LN10);var m=n/Math.pow(10,e);return m.toFixed((sig||3)-1)+"e"+e;}
+function fSmart(v){var n=Number(v);if(!isFinite(n))return"-";if(n===0)return"0";var a=Math.abs(n);if(a<1e-3)return fSci(n,3);if(a>=1e5)return fInt(n);if(a>=1e3)return n.toLocaleString("en-US",{maximumFractionDigits:1});return String(+n.toFixed(5));}
+function esc(s){return String(s===null||s===undefined?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
+function row(k,v){return '<div class="row"><span class="rk">'+k+'</span><span class="rv">'+v+'</span></div>';}
+function setT(id,txt){var e=el(id);if(e) e.textContent=txt;}
+var charts=[];
+function buildCharts(){
+ var host=el("charts"),h="",i;
+ for(i=0;i<METRICS.length;i++){
+  h+='<div class="ch"><div class="cht"><span class="chn">'+METRICS[i].n+'</span><b class="chv">-</b></div><canvas class="chc"></canvas>'
+     +'<div class="chf"><span>最小 <b class="f0">-</b></span><span>最大 <b class="f1">-</b></span><span>平均 <b class="f2">-</b></span></div></div>';
  }
- for(let li=0;li<LN.length;li++){
-  const aarr=norm(A[LN[li][0]]);
-  for(let i=0;i<LN[li][2];i++){
-   const v=aarr[i],col=li===0?"#1d7fd1":(li===LN.length-1?"#6bff8f":"#e76a2e");
-   const r=2.5+v*6;
-   x.beginPath();x.arc(xs[li],pos[li][i],r,0,7);x.fillStyle=col;x.globalAlpha=.35+.65*v;x.shadowBlur=10;x.shadowColor=col;x.fill();x.globalAlpha=1;x.shadowBlur=0;
-  }
-  x.font="11px sans-serif";x.fillStyle="#7d8aa0";x.textAlign="center";x.fillText(LN[li][1],xs[li],H-6);
+ host.innerHTML=h;
+ var nodes=host.querySelectorAll(".ch");
+ for(i=0;i<nodes.length;i++){
+  var n=nodes[i],cv=n.querySelector(".chc");
+  charts.push({m:METRICS[i],cv:cv,ctx:cv.getContext("2d"),v:n.querySelector(".chv"),f0:n.querySelector(".f0"),f1:n.querySelector(".f1"),f2:n.querySelector(".f2"),win:[]});
  }
 }
+function drawChart(ch){
+ var cv=ch.cv,ctx=ch.ctx,w=cv.clientWidth|0,h=cv.clientHeight|0;
+ if(w<24||h<24)return;
+ var dpr=Math.min(window.devicePixelRatio||1,2),nw=Math.round(w*dpr),nh=Math.round(h*dpr);
+ if(cv.width!==nw||cv.height!==nh){cv.width=nw;cv.height=nh;}
+ ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+ var win=ch.win||[],n=win.length;
+ if(n<1)return;
+ var i,ymin=Infinity,ymax=-Infinity,xmin=win[0][0],xmax=win[n-1][0];
+ for(i=0;i<n;i++){var v=win[i][1];if(v<ymin)ymin=v;if(v>ymax)ymax=v;}
+ if(ymin===ymax){var e=Math.abs(ymin)*0.05+0.5;ymin-=e;ymax+=e;}
+ var pad=(ymax-ymin)*0.12;ymin-=pad;ymax+=pad;
+ if(xmax===xmin)xmax=xmin+1;
+ var L=2,R=w-2,T=6,B=h-12;
+ function px(it){return L+(it-xmin)/(xmax-xmin)*(R-L);}
+ function py(v){return B-(v-ymin)/(ymax-ymin)*(B-T);}
+ ctx.strokeStyle="rgba(255,255,255,.045)";ctx.lineWidth=1;
+ for(i=0;i<=3;i++){var gy=T+(B-T)*i/3;ctx.beginPath();ctx.moveTo(L,Math.round(gy)+.5);ctx.lineTo(R,Math.round(gy)+.5);ctx.stroke();}
+ ctx.beginPath();
+ for(i=0;i<n;i++){var X=px(win[i][0]),Y=py(win[i][1]);if(i===0)ctx.moveTo(X,Y);else ctx.lineTo(X,Y);}
+ var last=win[n-1],lx=px(last[0]),ly=py(last[1]);
+ var grad=ctx.createLinearGradient(0,T,0,B);
+ grad.addColorStop(0,ch.m.c+"2e");grad.addColorStop(1,ch.m.c+"00");
+ ctx.lineTo(lx,B);ctx.lineTo(px(win[0][0]),B);ctx.closePath();ctx.fillStyle=grad;ctx.fill();
+ ctx.beginPath();
+ for(i=0;i<n;i++){var X2=px(win[i][0]),Y2=py(win[i][1]);if(i===0)ctx.moveTo(X2,Y2);else ctx.lineTo(X2,Y2);}
+ ctx.strokeStyle=ch.m.c;ctx.lineWidth=1.5;ctx.lineJoin="round";ctx.lineCap="round";ctx.stroke();
+ ctx.beginPath();ctx.arc(lx,ly,2.6,0,Math.PI*2);ctx.fillStyle=ch.m.c;ctx.fill();
+ ctx.font='9px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="#5b6672";
+ ctx.textAlign="left";ctx.fillText(ch.m.f(ymax),3,T+8);ctx.fillText(ch.m.f(ymin),3,B-2);
+ ctx.textAlign="left";ctx.fillText(fInt(xmin),3,h-3);ctx.textAlign="right";ctx.fillText(fInt(xmax),w-2,h-3);
+}
+var METRICS=[
+ {k:"loss",n:"Loss",c:"#ff8f5a",f:fSmart},
+ {k:"avg",n:"平均蛇长",c:"#3ddc84",f:function(v){var n=Number(v);return isFinite(n)?n.toFixed(2):"-";}},
+ {k:"best",n:"最长蛇身",c:"#ffd36a",f:function(v){var n=Number(v);return isFinite(n)?n.toFixed(1):"-";}},
+ {k:"eps",n:"探索率 ε",c:"#8fb9ff",f:function(v){var n=Number(v);return isFinite(n)?n.toFixed(3):"-";}},
+ {k:"gpu",n:"GPU 利用率",c:"#cf7fff",f:function(v){var n=Number(v);return isFinite(n)?n.toFixed(0)+"%":"-";}},
+ {k:"dps",n:"决策/秒",c:"#7fd0e0",f:function(v){var n=Number(v);return isFinite(n)?n.toLocaleString("en-US"):"-";}}
+];
+var KEYS=[["steps","总步数",""],["eps","探索率 ε","cy"],["trainSteps","训练步数",""],["buffer","经验池容量",""],
+ ["loss","Loss","acc"],["score","本局蛇长","good"],["avgScore","平均蛇长","good"],["bestScore","最长蛇身","good"],
+ ["dps","决策/秒",""],["gpu","GPU 利用率","acc"],["episodes","完成局数",""]];
+function fmt(k,d){var v=d[k];switch(k){case"eps":return Number(v).toFixed(3);case"loss":return Number(v).toFixed(4);case"gpu":return Number(v)>0?Number(v)+"%":"CPU";case"dps":return Number(v).toLocaleString("en-US");default:return Number(v).toLocaleString("en-US");}}
+var statRefs=[];
+function renderStats(d){
+ var h="";
+ for(var i=0;i<KEYS.length;i++){
+  var k=KEYS[i][0];h+='<div class="cd"><div class="ck">'+KEYS[i][1]+'</div><div class="cv '+KEYS[i][2]+'">'+fmt(k,d)+'</div></div>';
+ }
+ el("cards").innerHTML=h;
+ el("cardSub").textContent="第 "+fInt(d.episodes)+" 局 · 总步数 "+fInt(d.steps)+" · 后台并行 "+fInt(d.agents)+" 路";
+ el("help").innerHTML=[
+  ["Loss（损失）","网络猜错的程度，越低越会玩；训练就是让小球往谷底滚把 Loss 压低。"],
+  ["探索率 ε","从 1 慢慢降到接近 0。前期疯狂乱走试错，后期主要靠学到的策略。"],
+  ["平均蛇长 / 最长蛇身","这局蛇吃到几个苹果、长到多长，越大越会玩，是吃苹果能力的进度条。"],
+  ["神经网络图","训练时网络在思考：节点颜色=本层激活强弱，亮的连线=正在算的数据通路。"],
+  ["决策/秒","所有后台智能体每秒作出的动作数，越大说明并行利用越满。"]
+ ].map(function(x){return"<div><b>"+x[0]+"</b>："+x[1]+"</div>";}).join("");
+}
+var HIST=[];
+function pushHistory(d){
+ HIST.push({s:d.steps,loss:d.loss,avg:d.avgScore,best:d.bestScore,eps:d.eps,gpu:d.gpu,dps:d.dps});
+ if(HIST.length>240)HIST.splice(0,HIST.length-240);
+}
+function renderCharts(){
+ for(var i=0;i<charts.length;i++){
+  var ch=charts[i],win=[],j;
+  for(j=0;j<HIST.length;j++){var v=Number(HIST[j][ch.m.k]);if(ch.m.k==="gpu"&&v<0)continue;if(isFinite(v))win.push([HIST[j].s,v]);}
+  ch.win=win;drawChart(ch);
+  var n=win.length;
+  if(n){var s=0,mn=Infinity,mx=-Infinity,k;for(k=0;k<n;k++){s+=win[k][1];if(win[k][1]<mn)mn=win[k][1];if(win[k][1]>mx)mx=win[k][1];}
+   ch.v.textContent=ch.m.f(win[n-1][1]);ch.f0.textContent=ch.m.f(mn);ch.f1.textContent=ch.m.f(mx);ch.f2.textContent=ch.m.f(s/n);}
+  else{ch.v.textContent="-";ch.f0.textContent="-";ch.f1.textContent="-";ch.f2.textContent="-";}
+ }
+ el("chartSub").textContent="历史 "+fInt(HIST.length)+" 点 · 每 1 秒刷新";
+}
+var panelSig=null;
+function panelSigOf(d){var c=d.config||{},L=(d.acts&&d.acts.layers)||[];return JSON.stringify([c,c.L?0:L.map(function(l){return l.params+"/"+l.trueDim;})]);}
+function buildPanels(d){
+ var c=d.config||{},L=(d.acts&&d.acts.layers)||[];
+ var h='<div class="pnl"><div class="pnlh">网络结构 · Double DQN</div><div class="lyrs">';
+ h+='<div class="lyr hd"><span>层</span><span>结构</span><span>参数量</span><span>输出</span></div>';
+ var i,tot=0;
+ for(i=0;i<L.length;i++){var ly=L[i];tot+=ly.params;
+  h+='<div class="lyr"><span class="lnm" title="'+esc(ly.name)+'">'+esc(ly.name)+'</span><span class="lsh" title="'+esc(ly.detail)+'">'+esc(ly.detail)+'</span><span class="lpr">'+fInt(ly.params)+'</span><span class="lot">'+esc(ly.out)+'</span></div>';
+  if(i<L.length-1){h+='<div class="lyr"><span class="lnm">↘ 连接</span><span class="lsh">'+fInt(ly.nodeCount)+' → '+fInt(L[i+1].nodeCount)+' 桶 · 权重绝对均值采样</span><span class="lpr">-</span><span class="lot">桶化 '+fInt(c.connBucket)+'×'+fInt(c.connBucket)+'</span></div>';}
+ }
+ h+='<div class="lyr tot"><span class="lnm">合计</span><span class="lsh">'+fInt(L.length)+' 层</span><span class="lpr">'+fInt(tot)+'</span><span class="lot">'+fInt(c.actions)+' 动作</span></div>';
+ h+='</div><div class="row" style="margin-top:5px"><span class="rk">算力</span><span class="rv"><b>'+(d.gpu>0?"GPU 加速":"CPU")+'</b></span></div></div>';
+ h+='<div class="pnl"><div class="pnlh">DQN 超参数</div>';
+ h+=row("Double DQN",'<b class="yes">启用</b>');
+ h+=row("优先级经验池","SumTree · α="+fFix(c.alpha,2));
+ h+=row("折扣因子 gamma",fFix(c.gamma,3));
+ h+=row("学习率 lr",fSci(c.lr,3));
+ h+=row("批大小 × 梯度累积",fInt(c.batch)+" × "+fInt(c.accum));
+ h+=row("目标网络同步",fInt(c.targetSync)+" 步");
+ h+=row("经验池容量",fInt(c.replay));
+ h+=row("探索率区间",fFix(c.epsStart,2)+" → "+fFix(c.epsEnd,2));
+ h+=row("探索衰减总步数",fInt(c.epsDecay));
+ h+=row("当前探索率",'<b id="p-eps">-</b>');
+ h+=row("当前经验池",'<b id="p-buf">-</b>');
+ h+='</div>';
+ h+='<div class="pnl"><div class="pnlh">运行配置</div>';
+ h+=row("棋盘 GRID",fInt(c.grid)+" × "+fInt(c.grid));
+ h+=row("堆叠帧",fInt(c.frames)+" 帧");
+ h+=row("动作数",fInt(c.actions));
+ h+=row("后台并行 agent",fInt(c.agents-1)+" + 1 显示");
+ h+=row("帧堆叠 / 采样率","DQN 每帧决策");
+ h+=row("保存权重间隔",fInt(c.ckptEvery)+" 秒");
+ h+=row("完整续训保存",fInt(c.saveEvery)+" 步 + 60 秒 + 关窗");
+ h+=row("β 退火帧数",fInt(c.betaFrames));
+ h+='<div class="row"><span class="rk">训练步数</span><span class="rv"><b id="p-train">-</b></span></div>';
+ h+='<div class="row"><span class="rk">Loss</span><span class="rv"><b id="p-loss">-</b></span></div>';
+ h+='<div class="row"><span class="rk">GPU</span><span class="rv"><b id="p-gpu">-</b></span></div>';
+ h+='</div>';
+ el("panels").innerHTML=h;
+}
+function updatePanels(d){
+ setT("p-eps",fFix(d.eps,3));
+ setT("p-buf",fInt(d.buffer));
+ setT("p-train",fInt(d.trainSteps));
+ setT("p-loss",fFix(d.loss,4));
+ setT("p-gpu",d.gpu>0?d.gpu+"%":"CPU 训练");
+ el("paramSub").textContent="第 "+fInt(d.episodes)+" 局 · 步数 "+fInt(d.steps)+" · "+fFix(d.loss,4)+" Loss";
+}
+var NET={raf:0,ready:false,layers:[],edges:[],conn:0,act:[],pick:[],anim:[],maxS:1,hover:null,hoverKey:"",view:null,mode:"3d",iter:0,samples:0,value:0,budget:480,brands:8,cv:null,ctx:null,t0:0,lastDraw:0,pairs:[[0,1],[1,2],[2,3],[3,4],[4,5]],cam:{yaw:-1.05,pitch:0.30,dist:40.0,drag:false,lx:0,ly:0}};
+var NET_HOP=205,NET_CYCLE=2500;
+var NET_FONT='10px "Microsoft YaHei UI","Segoe UI",sans-serif';
+function netBucket(b,n,conn){var v=Math.floor((b+0.5)*conn/n);return v<0?0:(v>conn-1?conn-1:v);}
+function netColorRange(ly){var cnt=Math.max(1,ly.nodeCount|0),raw=ly.nodes||[],lo=Infinity,hi=-Infinity,j,v;for(j=0;j<cnt;j++){v=Number(raw[j]);if(!isFinite(v))continue;if(v<lo)lo=v;if(v>hi)hi=v;}return isFinite(lo)&&isFinite(hi)?[lo,hi]:[0,0];}
+function netColor(t){t=t<0?0:(t>1?1:t);var r,g,b;if(t<0.5){var u=t/0.5;r=16+(47-16)*u;g=30+(111-30)*u;b=42+(151-42)*u;}else{var v=(t-0.5)/0.5;r=47+(140-47)*v;g=111+(224-111)*v;b=151+(250-151)*v;}return "rgb("+(r|0)+","+(g|0)+","+(b|0)+")";}
+function netNodeAct(ly){var cnt=Math.max(1,ly.nodeCount|0),raw=ly.nodes||[],sc=netColorRange(ly),span=sc[1]-sc[0],out=[],j,v;for(j=0;j<cnt;j++){v=Number(raw[j]);out.push(isFinite(v)?(span>1e-12?((v-sc[0])/span<0?0:((v-sc[0])/span>1?1:(v-sc[0])/span)):0.5):0.5);}return out;}
+function buildNetPick(){
+ var L=NET.layers,E=NET.edges,conn=NET.conn,n=L.length,i,e,j,k;
+ NET.act=[];
+ for(i=0;i<n;i++)NET.act.push(netNodeAct(L[i]));
+ var pairs=Math.max(1,NET.pairs.length),per=Math.max(20,Math.round(NET.budget/pairs)),all=[];
+ for(e=0;e<pairs;e++){
+  var pr=NET.pairs[e]||[e,e+1];
+  if(!L[pr[0]]||!L[pr[1]])continue;
+  var src=NET.act[pr[0]],sN=Math.max(1,L[pr[0]].nodeCount|0),tN=Math.max(1,L[pr[1]].nodeCount|0);
+  var M=E[e]||[],cand=[];
+  for(j=0;j<sN;j++){
+   var sj=netBucket(j,sN,conn),sa=src[j];
+   for(k=0;k<tN;k++){
+    var w=Number(M[netBucket(k,tN,conn)*conn+sj]);
+    if(!isFinite(w)||w<=0)continue;
+    cand.push({e:e,s:pr[0],t:pr[1],j:j,i:k,w:w,a:sa,v:w*(0.28+0.72*sa)});
+   }
+  }
+  cand.sort(function(p,q){return q.v-p.v;});
+  var lim=Math.min(per,cand.length);
+  for(j=0;j<lim;j++)all.push(cand[j]);
+ }
+ all.sort(function(p,q){return p.v-q.v;});
+ NET.pick=all;
+ NET.strong=all.length?all[all.length-1]:null;
+ NET.maxS=1e-9;
+ for(i=0;i<all.length;i++)if(all[i].v>NET.maxS)NET.maxS=all[i].v;
+ var animSub=[];
+ for(i=0;i<all.length;i++)if(all[i].v/NET.maxS>=0.26)animSub.push(all[i]);
+ NET.anim=animSub;
+}
+function prepNet(d){
+ NET.ready=false;NET.layers=[];NET.edges=[];NET.conn=0;NET.act=[];NET.pick=[];NET.anim=[];NET.strong=null;
+ if(!d||Number(d.ready)!==1)return;
+ var L=d.layers||[],conn=Number(d.conn)|0;
+ if(!L.length||conn<2)return;
+ NET.layers=L;NET.edges=d.edges||[];NET.conn=conn;
+ NET.iter=Number(d.iteration);NET.samples=Number(d.samples);NET.value=Number(d.value);
+ NET.ready=true;buildNetPick();NET.t0=0;
+}
+function netEmptyFrame(ctx,w,h){
+ ctx.save();ctx.setLineDash([6,5]);ctx.strokeStyle="rgba(120,140,168,.24)";ctx.lineWidth=1;ctx.strokeRect(15.5,15.5,w-31,h-31);ctx.restore();
+ ctx.textAlign="center";ctx.textBaseline="middle";ctx.font='13px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="#5f6a78";ctx.fillText("正在采集网络激活…",w*0.5,h*0.5-11);
+ ctx.font='11px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="#4a545f";ctx.fillText("等待训练循环产生前向快照",w*0.5,h*0.5+11);ctx.textBaseline="alphabetic";
+}
+function netCam(yaw,pitch,dist){var cy=Math.cos(yaw),sy=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch);var ex=cp*cy,ey=cp*sy,ez=sp;return {ox:ex*dist,oy:ey*dist,oz:ez*dist,fx:-ex,fy:-ey,fz:-ez,rx:-sy,ry:cy,rz:0,ux:-cy*sp,uy:-sy*sp,uz:cp};}
+function netProj(c,x,y,z){var vx=x-c.ox,vy=y-c.oy,vz=z-c.oz;var cz=vx*c.fx+vy*c.fy+vz*c.fz;if(cz<0.15)cz=0.15;var sx=vx*c.rx+vy*c.ry+vz*c.rz;var uy=vx*c.ux+vy*c.uy+vz*c.uz;return [sx/cz,uy/cz,cz];}
+function netGrid(count){if(count<=1)return[1,1];var cols=Math.max(1,Math.ceil(Math.sqrt(count*1.9)));return[cols,Math.ceil(count/cols)];}
+function netLayout(){var L=NET.layers,n=L.length,i,j,gap=2.6,pitch=0.40,zSpan=(n-1)*gap,boxes=[];for(i=0;i<n;i++){var cnt=Math.max(1,L[i].nodeCount|0);var cr=netGrid(cnt),cols=cr[0],rows=cr[1];var x=i*gap-zSpan*0.5;var pts=[];for(j=0;j<cnt;j++){var g=Math.floor(j/cols),c=j%cols;pts.push([(c-(cols-1)*0.5)*pitch,((rows-1)*0.5-g)*pitch]);}boxes.push({x:x,cols:cols,rows:rows,pts:pts,cnt:cnt,halfY:(cols-1)*0.5*pitch,halfZ:(rows-1)*0.5*pitch});}return {boxes:boxes,gap:gap,zSpan:zSpan};}
+function netFitFocal(lay,w,h){var c=netCam(NET.cam.yaw,NET.cam.pitch,40.0);var mx=1e-4,my=1e-4,i,k;for(i=0;i<lay.boxes.length;i++){var b=lay.boxes[i],ey=b.halfY+0.30,ez=b.halfZ+0.30;var cand=[[b.x,ey,ez],[b.x,-ey,ez],[b.x,ey,-ez],[b.x,-ey,-ez]];for(k=0;k<4;k++){var p=netProj(c,cand[k][0],cand[k][1],cand[k][2]);if(Math.abs(p[0])>mx)mx=Math.abs(p[0]);if(Math.abs(p[1])>my)my=Math.abs(p[1]);}}return Math.min(w*0.46/mx,h*0.42/my);}
+function drawNet3D(ts){
+ var cv=NET.cv,ctx=NET.ctx;if(!cv||!ctx)return;
+ var w=cv.clientWidth|0,h=cv.clientHeight|0;if(w<40||h<40)return;
+ var dpr=Math.min(window.devicePixelRatio||1,2),nw=Math.round(w*dpr),nh=Math.round(h*dpr);
+ if(cv.width!==nw||cv.height!==nh){cv.width=nw;cv.height=nh;}
+ ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+ if(!NET.ready){NET.view=null;netEmptyFrame(ctx,w,h);return;}
+ var L=NET.layers,n=L.length,i,j,k,lay=netLayout();
+ var FOCAL=netFitFocal(lay,w,h),c=netCam(NET.cam.yaw,NET.cam.pitch,NET.cam.dist);
+ var ox=w*0.5,oy=h*0.52,act=NET.act||[],scr=[],flat=[];
+ for(i=0;i<n;i++){var b=lay.boxes[i],A=act[i]||netNodeAct(L[i]),col=[];
+  for(j=0;j<b.cnt;j++){var pt=b.pts[j],p=netProj(c,b.x,pt[0],pt[1]),nd={x:ox+p[0]*FOCAL,y:oy-p[1]*FOCAL,z:p[2],r:(0.055*FOCAL/p[2])<1?1:((0.055*FOCAL/p[2])>6.5?6.5:0.055*FOCAL/p[2]),li:i,bi:j,a:A[j]};col.push(nd);flat.push(nd);}
+  scr.push(col);}
+ NET.view={nodes:flat,cols:null};
+ var zmin=Infinity,zmax=-Infinity;for(i=0;i<flat.length;i++){if(flat[i].z<zmin)zmin=flat[i].z;if(flat[i].z>zmax)zmax=flat[i].z;}var zspan=(zmax-zmin)||1;
+ function depthF(z){var q=(z-zmin)/zspan;return q<0?0:(q>1?1:q);}
+ var t=Number(ts)||0;if(!NET.t0)NET.t0=t;
+ var wt=(t-NET.t0)%NET_CYCLE,pairs=NET.pairs,lastCol=n-1;
+ function waveDepth(e){var d=(pairs[e]||[e,e+1])[0];return d<lastCol-1?d:lastCol-1;}
+ var pick=NET.pick,edges=[];for(i=0;i<pick.length;i++){var q=pick[i],A2=scr[q.s]&&scr[q.s][q.j],B2=scr[q.t]&&scr[q.t][q.i];if(!A2||!B2)continue;var st=q.w*(0.22+0.78*q.a)<0?0:(q.w*(0.22+0.78*q.a)>1?1:q.w*(0.22+0.78*q.a));if(st<0.03)continue;edges.push({A:A2,B:B2,st:st,z:(A2.z+B2.z)*0.5});}
+ edges.sort(function(p,q){return q.z-p.z;});
+ var BANDS=5,bands=[];for(k=0;k<BANDS;k++)bands.push([]);
+ for(i=0;i<edges.length;i++)bands[Math.min(BANDS-1,Math.floor(depthF(edges[i].z)*BANDS))].push(edges[i]);
+ ctx.lineWidth=1;
+ for(k=0;k<BANDS;k++){var band=bands[k];if(!band.length)continue;var fb=1-(k+0.5)/BANDS;ctx.strokeStyle="rgba(126,170,216,"+(0.10+0.30*fb).toFixed(3)+")";ctx.beginPath();for(i=0;i<band.length;i++){ctx.moveTo(band[i].A.x,band[i].A.y);ctx.lineTo(band[i].B.x,band[i].B.y);}ctx.stroke();}
+ var anim=NET.anim,maxS=NET.maxS||1;ctx.lineCap="round";
+ for(i=0;i<anim.length;i++){var pp=anim[i],u=(wt-waveDepth(pp.e)*NET_HOP)/NET_HOP;if(u<0||u>1)continue;var A3=scr[pp.s]&&scr[pp.s][pp.j],B3=scr[pp.t]&&scr[pp.t][pp.i];if(!A3||!B3)continue;var sn=pp.v/maxS,u0=u-0.34;if(u0<0)u0=0;var x1=A3.x+(B3.x-A3.x)*u,y1=A3.y+(B3.y-A3.y)*u;var fz=depthF((A3.z+B3.z)*0.5),fade=1-0.5*fz;ctx.strokeStyle="rgba(178,228,255,"+((0.18+0.82*sn)*fade).toFixed(3)+")";ctx.lineWidth=(1+1.8*sn)*fade<0.6?0.6:((1+1.8*sn)*fade>2.8?2.8:(1+1.8*sn)*fade);ctx.beginPath();ctx.moveTo(A3.x+(B3.x-A3.x)*u0,A3.y+(B3.y-A3.y)*u0);ctx.lineTo(x1,y1);ctx.stroke();if(sn>0.30){ctx.beginPath();ctx.arc(x1,y1,(0.056*FOCAL/((A3.z+B3.z)*0.5))<0.6?0.6:((0.056*FOCAL/((A3.z+B3.z)*0.5))>3.4?3.4:0.056*FOCAL/((A3.z+B3.z)*0.5))*(0.6+0.8*sn),0,Math.PI*2);ctx.fillStyle="rgba(238,250,255,"+((0.24+0.76*sn)*fade).toFixed(3)+")";ctx.fill();}}
+ ctx.lineCap="butt";
+ var order=[];for(i=0;i<flat.length;i++)order.push(i);
+ order.sort(function(p,q){return flat[q].z-flat[p].z;});
+ for(k=0;k<order.length;k++){var nd2=flat[order[k]],age=wt-Math.min(nd2.li,lastCol-1)*NET_HOP;var fl=1-Math.abs(age)/(NET_HOP*1.7);fl=fl<0?0:(fl>1?1:fl);fl=fl*fl*(3-2*fl);var fade2=1-0.45*depthF(nd2.z);if(fl>0.06){ctx.beginPath();ctx.arc(nd2.x,nd2.y,nd2.r+1.0+3.0*fl,0,Math.PI*2);ctx.fillStyle="rgba(150,214,255,"+((0.05+0.34*fl*(0.35+0.65*nd2.a))*fade2).toFixed(3)+")";ctx.fill();}ctx.beginPath();ctx.arc(nd2.x,nd2.y,nd2.r,0,Math.PI*2);ctx.fillStyle=netColor((nd2.a*0.72+fl*0.5)<0?0:((nd2.a*0.72+fl*0.5)>1?1:nd2.a*0.72+fl*0.5));ctx.fill();}
+ var st2=NET.strong;
+ if(st2){var SA=scr[st2.s]&&scr[st2.s][st2.j],SB=scr[st2.t]&&scr[st2.t][st2.i];if(SA&&SB){ctx.save();ctx.strokeStyle="rgba(255,176,32,.85)";ctx.lineWidth=1.8;ctx.shadowColor="rgba(255,176,32,.8)";ctx.shadowBlur=9;ctx.beginPath();ctx.moveTo(SA.x,SA.y);ctx.lineTo(SB.x,SB.y);ctx.stroke();ctx.restore();}}
+ ctx.textAlign="center";ctx.textBaseline="alphabetic";
+ for(i=0;i<n;i++){var bb=lay.boxes[i],lyr=L[i],lp=netProj(c,bb.x,0,bb.halfZ+0.42);var lx=ox+lp[0]*FOCAL,ly=oy-lp[1]*FOCAL;var al2=0.55+0.45*(1-depthF(lp[2]));ctx.font='700 12px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="rgba(223,231,239,"+al2.toFixed(2)+")";ctx.fillText(String(lyr.name||""),lx,ly);ctx.font=NET_FONT;ctx.fillStyle="rgba(139,149,163,"+al2.toFixed(2)+")";ctx.fillText(String(lyr.detail||""),lx,ly+13);ctx.fillStyle="rgba(102,112,125,"+al2.toFixed(2)+")";ctx.fillText("激活均值 "+fSmart(Number(lyr.actMean)),lx,ly+25);}
+ var hv=NET.hover;
+ if(hv&&scr[hv.li]&&scr[hv.li][hv.bi]){var hn=scr[hv.li][hv.bi];ctx.strokeStyle="#e8eef5";ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(hn.x,hn.y,hn.r+3.4,0,Math.PI*2);ctx.stroke();}
+ var dNow=Math.min(lastCol-1,Math.floor(wt/NET_HOP));
+ ctx.font=NET_FONT;ctx.textAlign="left";ctx.fillStyle="rgba(170,208,240,.8)";
+ ctx.fillText("3D 立体 · 前向传播重放 · 波前 "+(dNow+1)+"/"+lastCol+" 层 · 拖动旋转 · 滚轮缩放",8,14);
+}
+function drawNet2D(ts){
+ var cv=NET.cv,ctx=NET.ctx;if(!cv||!ctx)return;
+ var w=cv.clientWidth|0,h=cv.clientHeight|0;if(w<40||h<40)return;
+ var dpr=Math.min(window.devicePixelRatio||1,2),nw=Math.round(w*dpr),nh=Math.round(h*dpr);
+ if(cv.width!==nw||cv.height!==nh){cv.width=nw;cv.height=nh;}
+ ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+ if(!NET.ready){NET.view=null;netEmptyFrame(ctx,w,h);return;}
+ var L=NET.layers,n=L.length,i,j,b;
+ var padX=Math.max(34,Math.min(74,w*0.05));
+ var step=n>1?(w-padX*2)/(n-1):0;
+ var yTop=60,yBot=h-80;if(yBot-yTop<100){yTop=48;yBot=h-64;}
+ var cols=[],nodes=[];
+ for(i=0;i<n;i++){var ly=L[i],cnt=Math.max(1,ly.nodeCount|0),x=padX+step*i;var sp=cnt>1?(yBot-yTop)/(cnt-1):0;var rad=cnt>1?((sp*0.34)<1.5?1.5:(sp*0.34>5.2?5.2:sp*0.34)):6.5;var ys=[];for(j=0;j<cnt;j++)ys.push(cnt>1?yTop+sp*j:(yTop+yBot)*0.5);var col={x:x,ys:ys,r:rad,act:NET.act[i]||netNodeAct(ly),sc:netColorRange(ly),ly:ly};cols.push(col);for(j=0;j<ys.length;j++)nodes.push({x:x,y:ys[j],r:rad,li:i,bi:j,a:col.act[j]});}
+ NET.view={nodes:nodes,cols:cols};
+ var pairs=NET.pairs,lastCol=n-1;
+ function waveDepth(e){var d=(pairs[e]||[e,e+1])[0];return d<lastCol-1?d:lastCol-1;}
+ var LEVELS=5,bands=[],pick=NET.pick;for(b=0;b<LEVELS;b++)bands.push([]);
+ for(i=0;i<pick.length;i++){var p=pick[i],al=p.w*(0.22+0.78*p.a);al=al<0?0:(al>1?1:al)*0.92;if(al<0.014)continue;bands[Math.min(LEVELS-1,Math.max(0,Math.round(al*LEVELS)-1))].push(p);}
+ var t=Number(ts)||0;if(!NET.t0)NET.t0=t;var wt=(t-NET.t0)%NET_CYCLE;ctx.lineWidth=1;
+ for(b=0;b<LEVELS;b++){var band=bands[b];if(!band.length)continue;ctx.strokeStyle="rgba(126,170,216,"+(((b+1)/LEVELS)*0.36).toFixed(3)+")";ctx.beginPath();for(i=0;i<band.length;i++){var q=band[i],qa=cols[q.s],qb=cols[q.t];ctx.moveTo(qa.x+qa.r,qa.ys[q.j]);ctx.lineTo(qb.x-qb.r,qb.ys[q.i]);}ctx.stroke();}
+ var anim=NET.anim,maxS=NET.maxS||1;ctx.lineCap="round";
+ for(i=0;i<anim.length;i++){var pp=anim[i],u=(wt-waveDepth(pp.e)*NET_HOP)/NET_HOP;if(u<0||u>1)continue;var sn=pp.v/maxS,ca=cols[pp.s],cb=cols[pp.t];if(!ca||!cb)continue;var x0=ca.x+ca.r,y0=ca.ys[pp.j],x1=cb.x-cb.r,y1=cb.ys[pp.i],u0=u-0.34;if(u0<0)u0=0;ctx.strokeStyle="rgba(178,228,255,"+(0.18+0.82*sn).toFixed(3)+")";ctx.lineWidth=1+1.7*sn;ctx.beginPath();ctx.moveTo(x0+(x1-x0)*u0,y0+(y1-y0)*u0);ctx.lineTo(x0+(x1-x0)*u,y0+(y1-y0)*u);ctx.stroke();if(sn>0.35){ctx.beginPath();ctx.arc(x0+(x1-x0)*u,y0+(y1-y0)*u,0.8+2.2*sn,0,Math.PI*2);ctx.fillStyle="rgba(238,250,255,"+(0.28+0.72*sn).toFixed(3)+")";ctx.fill();}}
+ ctx.lineCap="butt";
+ for(i=0;i<n;i++){var cc=cols[i],age=wt-Math.min(i,lastCol-1)*NET_HOP;var fl=1-Math.abs(age)/(NET_HOP*1.7);fl=fl<0?0:(fl>1?1:fl);fl=fl*fl*(3-2*fl);for(j=0;j<cc.ys.length;j++){var a=cc.act[j];if(fl>0.06){ctx.beginPath();ctx.arc(cc.x,cc.ys[j],cc.r+1.0+3.2*fl,0,Math.PI*2);ctx.fillStyle="rgba(150,214,255,"+(0.05+0.36*fl*(0.35+0.65*a)).toFixed(3)+")";ctx.fill();}ctx.beginPath();ctx.arc(cc.x,cc.ys[j],cc.r,0,Math.PI*2);ctx.fillStyle=netColor((a*0.72+fl*0.5)<0?0:((a*0.72+fl*0.5)>1?1:a*0.72+fl*0.5));ctx.fill();}}
+ var st=NET.strong;
+ if(st){var sa=cols[st.s],sb=cols[st.t];var x0=sa.x+sa.r,y0=sa.ys[st.j],x1=sb.x-sb.r,y1=sb.ys[st.i];ctx.save();ctx.strokeStyle="#ffb020";ctx.lineWidth=2;ctx.shadowColor="rgba(255,176,32,.85)";ctx.shadowBlur=11;ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.stroke();ctx.restore();ctx.strokeStyle="rgba(255,213,138,.95)";ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(sa.x,y0,sa.r+3.4,0,Math.PI*2);ctx.stroke();ctx.beginPath();ctx.arc(sb.x,y1,sb.r+3.4,0,Math.PI*2);ctx.stroke();ctx.textAlign="left";ctx.textBaseline="middle";ctx.font=NET_FONT;ctx.fillStyle="#ffd58a";ctx.fillText("最强通路 权重 "+st.w.toFixed(3),"6",h-8);ctx.textBaseline="alphabetic";}
+ ctx.textAlign="center";
+ for(i=0;i<n;i++){var cl=cols[i],lyr=cl.ly;ctx.font='700 12px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.fillStyle="#dfe7ef";ctx.fillText(String(lyr.name||""),cl.x,16);ctx.font=NET_FONT;ctx.fillStyle="#8b95a3";ctx.fillText(String(lyr.detail||""),cl.x,30);ctx.font=NET_FONT;ctx.fillStyle="#66707d";ctx.textAlign="center";ctx.fillText("真实宽度 "+(lyr.trueDim|0),cl.x,43);var bw2=(step>0?step*0.62:90)<40?40:((step>0?step*0.62:90)>150?150:step>0?step*0.62:90);var gx=cl.x-bw2*0.5,gy=h-62;for(j=0;j<24;j++){ctx.fillStyle=netColor(j/23);ctx.fillRect(gx+bw2*j/24,gy,bw2/24+1,7);}ctx.strokeStyle="rgba(220,235,250,.2)";ctx.lineWidth=1;ctx.strokeRect(gx+.5,gy+.5,bw2,7);ctx.font=NET_FONT;ctx.fillStyle="#8794a3";ctx.textAlign="left";ctx.fillText(fSmart(cl.sc[0]),gx,gy+21);ctx.textAlign="right";ctx.fillText(fSmart(cl.sc[1]),gx+bw2,gy+21);ctx.textAlign="center";ctx.fillStyle="#79828f";ctx.fillText("均值 "+fSmart(Number(lyr.actMean)),cl.x,gy+36);ctx.fillStyle="#66707d";ctx.fillText("全层 "+fSmart(Number(lyr.actMin))+" ~ "+fSmart(Number(lyr.actMax)),cl.x,gy+48);}
+ if(NET.hover&&cols[NET.hover.li]){var hc=cols[NET.hover.li],hy=hc.ys[NET.hover.bi];if(hy!==undefined){ctx.strokeStyle="#e8eef5";ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(hc.x,hy,hc.r+3.6,0,Math.PI*2);ctx.stroke();}}
+ var dNow=Math.min(lastCol-1,Math.floor(wt/NET_HOP));ctx.font=NET_FONT;ctx.textAlign="left";ctx.textBaseline="alphabetic";ctx.fillStyle="rgba(170,208,240,.8)";ctx.fillText("前向传播重放 · 波前 "+(dNow+1)+"/"+lastCol+" 层",8,14);
+}
+function drawNet(ts){if(NET.mode==="3d"){drawNet3D(ts);return;}drawNet2D(ts);}
+function netAnimFrame(ts){if(!NET.ready){NET.raf=0;return;}NET.raf=requestAnimationFrame(netAnimFrame);if(ts-NET.lastDraw<24)return;NET.lastDraw=ts;drawNet(ts);}
+function requestNet(){if(NET.ready){if(!NET.raf)NET.raf=requestAnimationFrame(netAnimFrame);return;}if(NET.raf){cancelAnimationFrame(NET.raf);NET.raf=0;}drawNet(0);}
+function netHit(mx,my){var v=NET.view;if(!v)return null;var best=null,bd=Infinity,i,nd,d,rr;for(i=0;i<v.nodes.length;i++){nd=v.nodes[i];d=(nd.x-mx)*(nd.x-mx)+(nd.y-my)*(nd.y-my);rr=nd.r+4;if(d<=rr*rr&&d<bd){bd=d;best=nd;}}return best;}
+function netTipHTML(hit){
+ var L=NET.layers,ly=L[hit.li],j=hit.bi;
+ var cnt=Math.max(1,ly.nodeCount|0),td=Math.max(1,ly.trueDim|0);
+ var raw=Number((ly.nodes||[])[j]);
+ var h='<div class="th">'+esc(ly.name)+' · 节点 '+(j+1)+' / '+cnt+'</div>';
+ h+='<div class="tr"><span>激活值</span><i>'+fSmart(raw)+'</i></div>';
+ h+='<div class="tr"><span>覆盖真实索引</span><i>'+Math.floor(j*td/cnt)+' ~ '+Math.floor((j+1)*td/cnt)+'</i></div>';
+ h+='<div class="tr"><span>层真实宽度</span><i>'+td+'</i></div>';
+ h+='<div class="tr"><span>本层范围</span><i>'+fSmart(ly.actMin)+' ~ '+fSmart(ly.actMax)+'</i></div>';
+ var gi=-1,kk;
+ for(kk=0;kk<NET.pairs.length;kk++){if(NET.pairs[kk][0]===hit.li){gi=kk;break;}}
+ if(gi>=0){
+  var tgt=NET.pairs[gi][1],conn=NET.conn,M=NET.edges[gi]||[],sj=netBucket(j,cnt,conn),arr=[],k,wv;
+  for(k=0;k<conn;k++){wv=Number(M[k*conn+sj]);if(isFinite(wv))arr.push([k,wv]);}
+  arr.sort(function(p,q){return q[1]-p[1];});
+  h+='<div class="th sub">输出连接最强 5 条 → '+esc(L[tgt].name)+'</div>';
+  for(k=0;k<Math.min(5,arr.length);k++){h+='<div class="tr"><span>目标桶 '+arr[k][0]+'</span><i>'+fFix(arr[k][1],3)+'</i></div>';}
+ }else{h+='<div class="tr"><span>输出层</span><i>无后续连接</i></div>';}
+ return h;
+}
+function netTipShow(hit,cx,cy){var tip=el("nettip"),wrap=el("netwrap");if(!tip||!wrap)return;tip.innerHTML=netTipHTML(hit);tip.className="nettip on";var ww=wrap.clientWidth,wh=wrap.clientHeight,tw=tip.offsetWidth,th=tip.offsetHeight;var x=cx+16,y=cy+14;if(x+tw>ww-6)x=cx-tw-16;if(x<6)x=6;if(y+th>wh-6)y=cy-th-14;if(y<6)y=6;tip.style.left=Math.round(x)+"px";tip.style.top=Math.round(y)+"px";}
+function setNetMode(v){NET.mode=(v==="2d")?"2d":"3d";var a=el("v-3d"),b=el("v-2d");
+ if(a)a.className="vbtn"+(NET.mode==="3d"?" on":"");
+ if(b)b.className="vbtn"+(NET.mode==="2d"?" on":"");
+ if(NET.cv)NET.cv.style.cursor=(NET.mode==="3d")?"grab":"default";NET.t0=0;requestNet();}
+function renderNetwork(dd){prepNet(dd);var tip=el("nettip");if(NET.ready){NET.value=(dd&&Number(dd.value))||0;NET.iter=(dd&&Number(dd.iteration))||0;NET.samples=(dd&&Number(dd.samples))||0;
+ el("netSub").textContent="第 "+fInt(NET.iter)+" 步快照 · "+fInt(NET.samples)+" 局 · 最优 Q "+fFix(NET.value,4)+" · 边缘矩阵 "+NET.conn+"×"+NET.conn+" · 可见连线 "+fInt(NET.pick.length)+" · 动态脉冲 "+fInt(NET.anim.length);
+ }else{el("netSub").textContent="等待网络快照…";NET.hover=null;NET.hoverKey="";if(tip){tip.className="nettip";tip.innerHTML="";}}
+ requestNet();}
+function bindNet(){
+ var cv=NET.cv,tip=el("nettip");if(!cv)return;
+ cv.addEventListener("pointerdown",function(e){if(NET.mode!=="3d")return;NET.cam.drag=true;NET.cam.lx=e.clientX;NET.cam.ly=e.clientY;cv.style.cursor="grabbing";if(cv.setPointerCapture)cv.setPointerCapture(e.pointerId);});
+ cv.addEventListener("pointermove",function(e){if(NET.mode!=="3d"||!NET.cam.drag)return;NET.cam.yaw-=(e.clientX-NET.cam.lx)*0.010;NET.cam.pitch=(NET.cam.pitch+(e.clientY-NET.cam.ly)*0.008)<-1.35?-1.35:((NET.cam.pitch+(e.clientY-NET.cam.ly)*0.008)>1.35?1.35:NET.cam.pitch+(e.clientY-NET.cam.ly)*0.008);NET.cam.lx=e.clientX;NET.cam.ly=e.clientY;});
+ cv.addEventListener("pointerup",function(){NET.cam.drag=false;cv.style.cursor=(NET.mode==="3d")?"grab":"default";});
+ cv.addEventListener("pointercancel",function(){NET.cam.drag=false;cv.style.cursor=(NET.mode==="3d")?"grab":"default";});
+ cv.addEventListener("wheel",function(e){if(NET.mode!=="3d")return;e.preventDefault();NET.cam.dist=(NET.cam.dist*Math.exp(e.deltaY*0.0011))<12?12:((NET.cam.dist*Math.exp(e.deltaY*0.0011))>90?90:NET.cam.dist*Math.exp(e.deltaY*0.0011));},{passive:false});
+ cv.addEventListener("mousemove",function(ev){if(NET.cam.drag)return;var rect=cv.getBoundingClientRect(),mx=ev.clientX-rect.left,my=ev.clientY-rect.top,hit=netHit(mx,my),key=hit?(hit.li+":"+hit.bi):"";if(key===NET.hoverKey){if(hit)netTipShow(hit,mx,my);return;}NET.hoverKey=key;NET.hover=hit;if(hit)netTipShow(hit,mx,my);else if(tip){tip.className="nettip";tip.innerHTML="";}requestNet();});
+ cv.addEventListener("mouseleave",function(){if(!NET.hoverKey)return;NET.hoverKey="";NET.hover=null;if(tip){tip.className="nettip";tip.innerHTML="";}requestNet();});
+}
+function bindNetView(){var list=document.querySelectorAll("[data-view]"),i;for(i=0;i<list.length;i++){list[i].addEventListener("click",function(){setNetMode(this.getAttribute("data-view"));});}}
+var GD={yaw:-0.72,pitch:0.60,dist:3.5,drag:false,lx:0,ly:0,cv:null,ctx:null,raf:0};
+function gdProj(c,x,y,z){var vx=x-c.ox,vy=y-c.oy,vz=z-c.oz;var cz=vx*c.fx+vy*c.fy+vz*c.fz;if(cz<0.08)cz=0.08;var cx=vx*c.rx+vy*c.ry+vz*c.rz,cyv=vx*c.ux+vy*c.uy+vz*c.uz;return[cx/cz,cyv/cz,cz];}
+function gdCam(){var cy=Math.cos(GD.yaw),sy=Math.sin(GD.yaw),cp=Math.cos(GD.pitch),sp=Math.sin(GD.pitch);var ex=cp*cy,ey=cp*sy,ez=sp,d=GD.dist;return{ox:ex*d,oy:ey*d,oz:ez*d,fx:-ex,fy:-ey,fz:-ez,rx:-sy,ry:cy,rz:0,ux:-cy*sp,uy:-sy*sp,uz:cp};}
+function gdColor(t){t=t<0?0:(t>1?1:t);var r,g,b;if(t<0.35){var u=t/0.35;r=20+(42-20)*u;g=40+(100-40)*u;b=66+(150-66)*u;}else if(t<0.7){var u2=(t-0.35)/0.35;r=42+(86-42)*u2;g=100+(170-100)*u2;b=150+(210-150)*u2;}else{var u3=(t-0.7)/0.3;r=86+(190-86)*u3;g=170+(230-170)*u3;b=210+(252-210)*u3;}return[r|0,g|0,b|0];}
 function drawGD(t){
- const c=$("gd"),x=c.getContext("2d"),W=c.clientWidth,H=300;
- c.width=W;c.height=H;x.clearRect(0,0,W,H);
- const cx=W/2,cy=H/2+8,S=Math.min(W,H)*0.30,rot=t/2600,rot2=Math.sin(t/5200)*0.5;
- function pr(u,v,h){let X=(u*Math.cos(rot)-v*Math.sin(rot));let Z=(u*Math.sin(rot)+v*Math.cos(rot));const Y=h + Math.sin(rot2)*X*0.5 + Math.cos(rot2)*Z*0.5;const per=(1/(1.6+Y*0.06));return[cx+X*S*per,cy-Y*S*per];}
- x.strokeStyle="#2a3245";x.lineWidth=1.1;
- for(let i=0;i<=24;i++){const u=-1+2*i/24;x.beginPath();for(let j=0;j<=24;j++){const p=pr(u,-1+2*j/24,(u*u+(-1+2*j/24)*(-1+2*j/24))/2);j?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]);}x.stroke();x.beginPath();for(let j=0;j<=24;j++){const p=pr(-1+2*j/24,u,((-1+2*j/24)*(-1+2*j/24)+u*u)/2);j?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]);}x.stroke();}
- const th=(t/3200)%1;const bu=Math.cos(th*2)*0.35,ba=Math.sin(th*2)*0.35;const bh=(bu*bu+ba*ba)/2;const bp=pr(bu,ba,bh);
- x.beginPath();x.arc(bp[0],bp[1],9,0,7);x.fillStyle="#ff8f5a";x.shadowColor="#ff8f5a";x.shadowBlur=16;x.fill();x.shadowBlur=0;
- x.strokeStyle="#ff8f5a";x.lineWidth=2;x.globalAlpha=.4;
- x.beginPath();for(let i=0;i<=40;i++){const tt=Math.max(0,th-i*0.01);const p=pr(Math.cos(tt*2)*0.4,Math.sin(tt*2)*0.4,0.16);i?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]);}x.stroke();x.globalAlpha=1;
- x.font="12px sans-serif";x.fillStyle="#7d8aa0";x.fillText("小球沿梯度向谷底滚动 = Loss 越来越小",10,18);
+ var cv=GD.cv,ctx=GD.ctx;if(!cv||!ctx)return;
+ var w=cv.clientWidth|0,h=cv.clientHeight|0;if(w<40||h<40)return;
+ var dpr=Math.min(window.devicePixelRatio||1,2),nw=Math.round(w*dpr),nh=Math.round(h*dpr);
+ if(cv.width!==nw||cv.height!==nh){cv.width=nw;cv.height=nh;}
+ ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+ var c=gdCam(),FOCAL=Math.min(w,h)*1.1,ox=w*0.5,oy=h*0.54;
+ var ZH=0.75,res=22,i,j,k;
+ var sx=new Float64Array(res*res),sy=new Float64Array(res*res),sd=new Float64Array(res*res),zn=new Float64Array(res*res),wx=new Float64Array(res*res),wy=new Float64Array(res*res),wz=new Float64Array(res*res);
+ for(i=0;i<res;i++)for(j=0;j<res;j++){var u=-1+2*i/(res-1),v=-1+2*j/(res-1),z=0.35*(u*u+v*v);var p=gdProj(c,u,v,z);var idx=i*res+j;sx[idx]=ox+p[0]*FOCAL;sy[idx]=oy-p[1]*FOCAL;sd[idx]=p[2];zn[idx]=z/(2*0.35);wx[idx]=u;wy[idx]=v;wz[idx]=z;}
+ var quads=[];for(i=0;i<res-1;i++)for(j=0;j<res-1;j++){var a0=i*res+j,b0=(i+1)*res+j,cc=(i+1)*res+j+1,dd=i*res+j+1;quads.push([a0,b0,cc,dd,(sd[a0]+sd[b0]+sd[cc]+sd[dd])*0.25,(zn[a0]+zn[b0]+zn[cc]+zn[dd])*0.25]);}
+ quads.sort(function(p,q){return q[4]-p[4];});
+ var light=[0.45,0.25,0.86];
+ for(k=0;k<quads.length;k++){var q=quads[k],a=q[0],b=q[1],cc2=q[2],dd=q[3];var e1x=wx[b]-wx[a],e1y=wy[b]-wy[a],e1z=wz[b]-wz[a],e2x=wx[dd]-wx[a],e2y=wy[dd]-wy[a],e2z=wz[dd]-wz[a];var nxv=e1y*e2z-e1z*e2y,nyv=e1z*e2x-e1x*e2z,nzv=e1x*e2y-e1y*e2x;var nl=Math.sqrt(nxv*nxv+nyv*nyv+nzv*nzv)||1,dot=(nxv*light[0]+nyv*light[1]+nzv*light[2])/nl;if(dot<0)dot=-dot;var sh=0.72+0.38*dot,rgb=gdColor(q[5]);ctx.beginPath();ctx.moveTo(sx[a],sy[a]);ctx.lineTo(sx[b],sy[b]);ctx.lineTo(sx[cc2],sy[cc2]);ctx.lineTo(sx[dd],sy[dd]);ctx.closePath();ctx.fillStyle="rgb("+(rgb[0]*sh|0)+","+(rgb[1]*sh|0)+","+(rgb[2]*sh|0)+")";ctx.fill();ctx.strokeStyle="rgba(200,226,250,.07)";ctx.lineWidth=0.6;ctx.stroke();}
+ var th=(t/3400)%1,bu=Math.cos(th*2)*0.30,ba=Math.sin(th*2)*0.30,bh=0.35*(bu*bu+ba*ba);
+ var bp=gdProj(c,bu,ba,bh);var bx=ox+bp[0]*FOCAL,by=oy-bp[1]*FOCAL;
+ ctx.save();ctx.strokeStyle="#ff8f5a";ctx.lineWidth=2.4;ctx.lineJoin="round";ctx.lineCap="round";ctx.shadowColor="rgba(255,143,90,.75)";ctx.shadowBlur=10;ctx.beginPath();var started=false;for(i=0;i<=46;i++){var tt=Math.max(0,th-i*0.009),u0=Math.cos(tt*2)*0.30,v0=Math.sin(tt*2)*0.30,zz=0.35*(u0*u0+v0*v0)+0.004,lp=gdProj(c,u0,v0,zz),lx=ox+lp[0]*FOCAL,ly=oy-lp[1]*FOCAL;if(i===0)ctx.moveTo(lx,ly);else ctx.lineTo(lx,ly);}ctx.stroke();ctx.restore();
+ ctx.beginPath();ctx.arc(bx,by,9,0,Math.PI*2);ctx.fillStyle="#ff8f5a";ctx.shadowColor="#ff8f5a";ctx.shadowBlur=16;ctx.fill();ctx.shadowBlur=0;ctx.strokeStyle="rgba(20,16,8,.85)";ctx.lineWidth=1.4;ctx.stroke();
+ var cbx=w-14,cby=16,cbh=90,cbw=8;for(i=0;i<32;i++){var t2=1-i/31,rgb2=gdColor(t2);ctx.fillStyle="rgb("+rgb2[0]+","+rgb2[1]+","+rgb2[2]+")";ctx.fillRect(cbx,cby+cbh*i/32,cbw,cbh/32+1);}ctx.strokeStyle="rgba(220,235,250,.2)";ctx.strokeRect(cbx+.5,cby+.5,cbw,cbh);
+ ctx.font='10px "Microsoft YaHei UI","Segoe UI",sans-serif';ctx.textAlign="left";ctx.fillStyle="#79828f";ctx.fillText("低",cbx+cbw+5,cby+8);ctx.fillText("高",cbx+cbw+5,cby+cbh);ctx.fillStyle="#5f6a78";ctx.fillText("损失",cbx+cbw+5,cby-6);
 }
-let loss=[],avg=[];
-function drawChart(){
- const c=$("chart"),x=c.getContext("2d"),W=c.clientWidth,H=300,pad=24;
- c.width=W;c.height=H;x.clearRect(0,0,W,H);
- x.strokeStyle="#2a3245";for(let i=1;i<4;i++){const yy=pad+(H-2*pad)*i/4;x.beginPath();x.moveTo(pad,yy);x.lineTo(W-pad,yy);x.stroke();}
- const N=Math.max(loss.length,200),nl=loss.slice(-N),na=avg.slice(-N);
- const maxl=Math.max.apply(null,nl)||1,maxa=Math.max.apply(null,na)||1;
- const line=(arr,max,col)=>{x.beginPath();x.strokeStyle=col;x.lineWidth=2;for(let i=0;i<arr.length;i++){const px=pad+(i/(N-1))*(W-2*pad),py=H-pad-(arr[arr.length-1-i]/max)*(H-2*pad);i?x.lineTo(px,py):x.moveTo(px,py);}x.stroke();};
- line(nl,maxl,"#ff8f5a");line(na,maxa,"#6bff8f");
- x.fillStyle="#7d8aa0";x.font="12px sans-serif";x.fillText("0",4,H-8);x.fillStyle="#5ac8ff";x.fillText("Loss",W-44,12);x.fillStyle="#6bff8f";x.fillText("蛇长",W-44,26);
+function gdFrame(t){GD.raf=requestAnimationFrame(gdFrame);drawGD(t);}
+function bindGD(){
+ var cv=GD.cv;cv.addEventListener("pointerdown",function(e){GD.drag=true;GD.lx=e.clientX;GD.ly=e.clientY;cv.style.cursor="grabbing";if(cv.setPointerCapture)cv.setPointerCapture(e.pointerId);});
+ cv.addEventListener("pointermove",function(e){if(!GD.drag)return;GD.yaw-=(e.clientX-GD.lx)*0.011;GD.pitch=(GD.pitch+(e.clientY-GD.ly)*0.009)<0.08?0.08:((GD.pitch+(e.clientY-GD.ly)*0.009)>1.45?1.45:GD.pitch+(e.clientY-GD.ly)*0.009);GD.lx=e.clientX;GD.ly=e.clientY;});
+ function stop(){if(!GD.drag)return;GD.drag=false;cv.style.cursor="grab";}
+ cv.addEventListener("pointerup",stop);cv.addEventListener("pointercancel",stop);cv.addEventListener("pointerleave",stop);
+ cv.addEventListener("wheel",function(e){e.preventDefault();GD.dist=(GD.dist*Math.exp(e.deltaY*0.0012))<1.7?1.7:((GD.dist*Math.exp(e.deltaY*0.0012))>11?11:GD.dist*Math.exp(e.deltaY*0.0012));},{passive:false});
 }
-function loop(){requestAnimationFrame(loop);const t=performance.now();drawNN(t);drawGD(t);}
+function setConn(ok){var e=el("conn"),t=el("connTxt");if(!ok){e.className="conn bad";t.textContent="连接断开";return;}e.className="conn ok";t.textContent="已连接";}
+var PREV=null;
 async function poll(){
  try{
-  const d=await (await fetch("/stats")).json();
-  $("meta").textContent="在线 · 每 1 秒刷新 · http://127.0.0.1:"+d.port;
-  if(d.acts){A=d.acts;}else for(const k in A)A[k]=new Array(A[k].length).fill(0);
-  loss.push(d.loss);avg.push(d.avgScore||0);if(loss.length>400){loss.shift();avg.shift();}
-  $("cards").innerHTML=keys.map(k=>'<div class="card"><div class="k">'+k+'</div><div class="v'+cls(k)+'">'+pick(k,d)+'</div></div>').join("");
-  drawChart();
-  $("help").innerHTML=[
-   ["Loss（损失）","网络猜错的程度，越低越会玩；训练就是让它往谷底滚把 Loss 压低。"],
-   ["探索率 ε","从 1 降到接近 0：前期乱走试错，后期用学到的策略。"],
-   ["平均蛇长 / 最长蛇身","这局蛇吃几个苹果长到多长，越大越会玩。"],
-   ["神经连接图","亮的线 = 正在算的数据通路；真实权重 × 激活 越强越亮。"]
-  ].map(x=>'<div><b>'+x[0]+'</b>：'+x[1]+'</div>').join("");
- }catch(e){$("meta").textContent="离线 / 连接断开";}
+  var d=await (await fetch("/stats",{cache:"no-store"})).json();
+  var now=Date.now(),dps=-1;
+  if(PREV&&PREV.ts>0){var dt=(now-PREV.ts)/1000;if(dt>0)dps=Math.round((Number(d.steps)-PREV.steps)/dt);}
+  PREV={steps:Number(d.steps),ts:now};
+  if(dps<0)dps=0;
+  d.dps=dps;
+  setConn(true);
+  renderStats(d);
+  pushHistory(d);
+  renderCharts();
+  renderNetwork(d.acts||null);
+  var sig=(d.config||{});var sigS=JSON.stringify(sig)+"|"+((d.acts&&d.acts.layers||[]).map(function(l){return l.params+"/"+l.trueDim;})).join(",");
+  if(sigS!==panelSig){panelSig=sigS;buildPanels(d);}
+  updatePanels(d);
+ }catch(e){setConn(false);}
  setTimeout(poll,1000);
 }
-requestAnimationFrame(loop);poll();drawChart();
+NET.cv=el("netcv");NET.ctx=NET.cv.getContext("2d");
+GD.cv=el("gdcv");GD.ctx=GD.cv.getContext("2d");
+buildCharts();
+bindNet();
+bindNetView();
+setNetMode("3d");
+bindGD();
+gdFrame();
+renderNetwork(null);
+poll();
+window.addEventListener("resize",function(){var i;for(i=0;i<charts.length;i++)drawChart(charts[i]);requestNet();});
+})();
 </script>
 </body>
 </html>
@@ -205,7 +672,9 @@ class Monitor:
         class H(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
                 if self.path == "/stats":
-                    body = json.dumps(state_fn()).encode("utf-8")
+                    d = dict(state_fn())
+                    d["config"] = CFG
+                    body = json.dumps(d).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))

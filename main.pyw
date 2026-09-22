@@ -176,7 +176,10 @@ def main():
 
     def self_acts():
         try:
-            return act_stats(net, r_env._stack())
+            r = act_stats(net, r_env._stack())
+            r["iteration"] = counter.get()
+            r["samples"] = stats["episodes"]
+            return r
         except Exception:
             return None
 
