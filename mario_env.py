@@ -7,6 +7,8 @@ import gym_super_mario_bros
 from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
 from nes_py.wrappers.joypad_space import JoypadSpace
 
+JUMP_ACTIONS = {2, 4, 5}
+
 
 class MarioEnv:
     def __init__(self, frames=4, size=84):
@@ -21,6 +23,18 @@ class MarioEnv:
         self._score = 0.0
         self._max_x = 0.0
         self._steps = 0
+        self._coins = 0
+        self._prev_score = 0
+        self._prev_enemy = 0
+        self._nes = None
+        n = self.gymenv
+        while hasattr(n, "env"):
+            n = n.env
+        self._nes = n
+
+    def _count_enemy(self):
+        ram = self._nes.ram
+        return sum(1 for a in range(0x16, 0x1B) if ram[a] != 0)
 
     @property
     def score(self):
@@ -49,6 +63,12 @@ class MarioEnv:
         self._score = 0.0
         self._max_x = float(info.get("x_pos", 0.0))
         self._steps = 0
+        self._coins = int(info.get("coins", 0))
+        self._prev_score = int(info.get("score", 0))
+        try:
+            self._prev_enemy = self._count_enemy()
+        except Exception:
+            self._prev_enemy = 0
         return self._stack()
 
     def step(self, action):
@@ -66,6 +86,33 @@ class MarioEnv:
         progress = max(0.0, x_pos - self._max_x)
         self._max_x = max(self._max_x, x_pos)
         self._score = self._max_x
-        reward = float(reward_raw) + progress * 0.1
+
+        coins = int(info.get("coins", 0))
+        score = int(info.get("score", 0))
+        flag_get = bool(info.get("flag_get", False))
+        coin_delta = max(0, coins - self._coins)
+        cur_enemy = self._prev_enemy
+        try:
+            cur_enemy = self._count_enemy()
+        except Exception:
+            cur_enemy = self._prev_enemy
+        killed = self._prev_enemy - cur_enemy > 0 and score > self._prev_score
+
+        shaped = coin_delta * 2.0
+        if killed:
+            shaped += 5.0
+        if flag_get:
+            shaped += 15.0
+        if action in JUMP_ACTIONS:
+            shaped -= 0.03
+        done_ = bool(terminated or truncated)
+        if done_ and not flag_get:
+            shaped -= 2.0
+
+        reward = float(reward_raw) + progress * 0.1 + shaped
+
+        self._coins = coins
+        self._prev_score = score
+        self._prev_enemy = cur_enemy
         self.history.append(self._pre(self.raw))
-        return self._stack(), reward, bool(terminated or truncated)
+        return self._stack(), reward, done_
