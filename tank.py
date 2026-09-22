@@ -18,6 +18,22 @@ BOUNCE_LIMIT = 6
 FIRE_COOLDOWN = 0.34
 MAX_BULLETS = 5
 
+POWERUP_KINDS = ("laser", "bomb", "speed", "shield")
+POWERUP_R = 10.0
+POWERUP_TTL = 14.0
+POWERUP_EVERY = 6.5
+POWERUP_MAX = 2
+BOOST_TIME = 9.0
+BOOST_MUL = 1.75
+AMMO_SHOTS = 3
+BLAST_R = 46.0
+BLAST_TTL = 0.45
+
+KIND_LIFE = {"normal": BULLET_LIFE, "laser": 1.1, "bomb": 1.4}
+KIND_BOUNCE = {"normal": BOUNCE_LIMIT, "laser": 0, "bomb": 2}
+KIND_PIERCE = {"normal": False, "laser": True, "bomb": False}
+KIND_BLAST = {"normal": 0.0, "laser": 0.0, "bomb": BLAST_R}
+
 
 def _ctrl_name(turn, thrust, fire):
     parts = []
@@ -100,17 +116,30 @@ class Tank:
         self.score = 0
         self.shots = 0
         self.death = None
+        self.shield = False
+        self.boost = 0.0
+        self.ammo_kind = None
+        self.ammo_left = 0
+
+
+class PowerUp:
+    def __init__(self, x, y, kind):
+        self.x = x
+        self.y = y
+        self.kind = kind
+        self.ttl = POWERUP_TTL
 
 
 class Bullet:
-    def __init__(self, x, y, vx, vy, owner):
+    def __init__(self, x, y, vx, vy, owner, kind="normal"):
         self.x = x
         self.y = y
         self.vx = vx
         self.vy = vy
         self.owner = owner
+        self.kind = kind
         self.bounce = 0
-        self.life = BULLET_LIFE
+        self.life = KIND_LIFE[kind]
 
 
 class World:
@@ -144,6 +173,7 @@ class World:
         for cr, cc in corners:
             picks.append(min(cells, key=lambda rc: (rc[0] - cr) ** 2 + (rc[1] - cc) ** 2))
         a, b = picks
+        self.rng = rng
         self.tanks = [
             Tank((a[1] + 0.5) * CELL, (a[0] + 0.5) * CELL, 0.0),
             Tank((b[1] + 0.5) * CELL, (b[0] + 0.5) * CELL, 0.0),
@@ -152,6 +182,9 @@ class World:
             o = self.tanks[1 - i]
             t.angle = math.atan2(o.y - t.y, o.x - t.x)
         self.bullets = []
+        self.powerups = []
+        self.blasts = []
+        self.spawn_t = POWERUP_EVERY * 0.5
         self.time = 0.0
         self.over = False
         self.winner = None
@@ -234,10 +267,22 @@ class World:
         by = t.y + math.sin(t.angle) * (TANK_R + BULLET_R + 1.0)
         if self._circle_hit(bx, by, 1.5):
             return False
+        kind = t.ammo_kind if t.ammo_left > 0 and t.ammo_kind else "normal"
         t.cool = FIRE_COOLDOWN
         t.shots += 1
+        if kind != "normal":
+            t.ammo_left -= 1
+            if t.ammo_left <= 0:
+                t.ammo_kind = None
         self.bullets.append(
-            Bullet(bx, by, math.cos(t.angle) * BULLET_SPEED, math.sin(t.angle) * BULLET_SPEED, t)
+            Bullet(
+                bx,
+                by,
+                math.cos(t.angle) * BULLET_SPEED,
+                math.sin(t.angle) * BULLET_SPEED,
+                t,
+                kind,
+            )
         )
         return True
 
@@ -247,9 +292,13 @@ class World:
             t.angle += turn * TANK_TURN * dt
         if thrust:
             v = TANK_SPEED if thrust > 0 else -TANK_BACK
+            if t.boost > 0.0:
+                v *= BOOST_MUL
             nx = t.x + math.cos(t.angle) * v * dt
             ny = t.y + math.sin(t.angle) * v * dt
             t.x, t.y = self._push_out(nx, ny, TANK_R)
+        if t.boost > 0.0:
+            t.boost = max(0.0, t.boost - dt)
         t.cool = max(0.0, t.cool - dt)
         if fire:
             self._fire(t)
@@ -257,22 +306,26 @@ class World:
     def _fly(self, b, dt):
         steps = int(BULLET_SPEED * dt / 4.0) + 1
         h = dt / steps
+        pierce = KIND_PIERCE[b.kind]
+        limit = KIND_BOUNCE[b.kind]
         for _ in range(steps):
             nx = b.x + b.vx * h
-            if self._circle_hit(nx, b.y, BULLET_R):
+            if (not pierce) and self._circle_hit(nx, b.y, BULLET_R):
                 b.vx = -b.vx
                 b.bounce += 1
                 b.x, b.y = self._push_out(b.x, b.y, BULLET_R)
             else:
                 b.x = nx
             ny = b.y + b.vy * h
-            if self._circle_hit(b.x, ny, BULLET_R):
+            if (not pierce) and self._circle_hit(b.x, ny, BULLET_R):
                 b.vy = -b.vy
                 b.bounce += 1
                 b.x, b.y = self._push_out(b.x, b.y, BULLET_R)
             else:
                 b.y = ny
-            if b.bounce > BOUNCE_LIMIT:
+            if b.bounce > limit:
+                return False
+            if not (0.0 <= b.x <= WIDTH and 0.0 <= b.y <= HEIGHT):
                 return False
         b.life -= dt
         return b.life > 0.0
@@ -285,6 +338,89 @@ class World:
             d += 4.0
         return limit
 
+    def _kill(self, t, killer):
+        t.alive = False
+        other = self.tanks[1] if t is self.tanks[0] else self.tanks[0]
+        if killer is t:
+            t.death = "被自己的子弹弹死"
+            other.score += 1
+        else:
+            t.death = "被对手打中"
+            killer.score += 1
+
+    def _damage(self, t, killer):
+        if t.shield:
+            t.shield = False
+            return False
+        self._kill(t, killer)
+        return True
+
+    def _blast(self, x, y, rad, owner):
+        self.blasts.append([x, y, rad, BLAST_TTL])
+        for t in self.tanks:
+            if not t.alive:
+                continue
+            if (x - t.x) ** 2 + (y - t.y) ** 2 <= rad * rad:
+                self._damage(t, owner)
+
+    def _apply(self, t, kind):
+        if kind == "shield":
+            t.shield = True
+        elif kind == "speed":
+            t.boost = BOOST_TIME
+        else:
+            t.ammo_kind = kind
+            t.ammo_left = AMMO_SHOTS
+
+    def _spawn_powerup(self):
+        cells = [
+            (r, c)
+            for r in range(1, ROWS - 1)
+            for c in range(1, COLS - 1)
+            if self.grid[r][c] == "."
+        ]
+        for _ in range(40):
+            r, c = self.rng.choice(cells)
+            x = (c + 0.5) * CELL
+            y = (r + 0.5) * CELL
+            near = False
+            for t in self.tanks:
+                if (t.x - x) ** 2 + (t.y - y) ** 2 < (CELL * 3.0) ** 2:
+                    near = True
+                    break
+            if not near:
+                self.powerups.append(PowerUp(x, y, self.rng.choice(POWERUP_KINDS)))
+                return
+
+    def _pickups(self, dt):
+        self.spawn_t -= dt
+        if self.spawn_t <= 0.0:
+            self.spawn_t = POWERUP_EVERY
+            if len(self.powerups) < POWERUP_MAX:
+                self._spawn_powerup()
+        keep = []
+        for p in self.powerups:
+            p.ttl -= dt
+            if p.ttl <= 0.0:
+                continue
+            taken = False
+            for t in self.tanks:
+                if not t.alive:
+                    continue
+                if (p.x - t.x) ** 2 + (p.y - t.y) ** 2 <= (POWERUP_R + TANK_R) ** 2:
+                    self._apply(t, p.kind)
+                    taken = True
+                    break
+            if not taken:
+                keep.append(p)
+        self.powerups = keep
+        live = []
+        for b in self.blasts:
+            b[3] -= dt
+            if b[3] > 0.0:
+                live.append(b)
+        self.blasts = live
+
     def step(self, dt, ctrl0, ctrl1):
         if self.over:
             return
@@ -292,26 +428,23 @@ class World:
         for t, ctrl in ((self.tanks[0], ctrl0), (self.tanks[1], ctrl1)):
             if t.alive:
                 self._drive(t, ctrl, dt)
+        self._pickups(dt)
         keep = []
         for b in self.bullets:
-            if not self._fly(b, dt):
-                continue
+            alive = self._fly(b, dt)
             hit = False
-            for t in self.tanks:
-                if not t.alive:
-                    continue
-                if (b.x - t.x) ** 2 + (b.y - t.y) ** 2 <= (BULLET_R + TANK_R) ** 2:
-                    t.alive = False
-                    other = self.tanks[1] if t is self.tanks[0] else self.tanks[0]
-                    if b.owner is t:
-                        t.death = "被自己的子弹弹死"
-                        other.score += 1
-                    else:
-                        t.death = "被对手打中"
-                        b.owner.score += 1
-                    hit = True
-                    break
-            if not hit:
+            if alive:
+                for t in self.tanks:
+                    if not t.alive:
+                        continue
+                    if (b.x - t.x) ** 2 + (b.y - t.y) ** 2 <= (BULLET_R + TANK_R) ** 2:
+                        self._damage(t, b.owner)
+                        hit = True
+                        break
+            blast = KIND_BLAST[b.kind]
+            if blast > 0.0 and (hit or not alive):
+                self._blast(b.x, b.y, blast, b.owner)
+            if alive and not hit:
                 keep.append(b)
         self.bullets = keep
         a0 = self.tanks[0].alive
@@ -349,9 +482,9 @@ class Bot:
                 return False
         return True
 
-    def _next_cell(self, world, me, foe):
+    def _next_cell(self, world, me, tx, ty):
         start = (int(me.y // CELL), int(me.x // CELL))
-        goal = (int(foe.y // CELL), int(foe.x // CELL))
+        goal = (int(ty // CELL), int(tx // CELL))
         if world._solid(*start) or world._solid(*goal):
             return None
         prev = {start: None}
@@ -384,7 +517,18 @@ class Bot:
         self.think -= dt
         if self.think <= 0.0:
             self.think = self.rng.uniform(0.10, 0.22)
-            self.way = self._next_cell(world, me, foe)
+            gx = foe.x
+            gy = foe.y
+            if not seen and world.powerups:
+                best = None
+                for p in world.powerups:
+                    d = (p.x - me.x) ** 2 + (p.y - me.y) ** 2
+                    if best is None or d < best[0]:
+                        best = (d, p)
+                if best is not None and best[0] < (CELL * 9.0) ** 2:
+                    gx = best[1].x
+                    gy = best[1].y
+            self.way = self._next_cell(world, me, gx, gy)
         if seen:
             tx = foe.x
             ty = foe.y

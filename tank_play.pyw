@@ -18,6 +18,13 @@ P2_COLOR = (255, 108, 96)
 SHOT = (255, 216, 104)
 TEXT = (212, 218, 230)
 DIM = (134, 142, 160)
+POWER_COLOR = {
+    "laser": (110, 226, 255),
+    "bomb": (255, 156, 74),
+    "speed": (255, 226, 106),
+    "shield": (140, 172, 255),
+}
+BULLET_COLOR = {"normal": SHOT, "laser": (110, 226, 255), "bomb": (255, 156, 74)}
 
 def make_font(size):
     for name in ("microsoftyahei", "msyh", "simhei", "simsun"):
@@ -57,12 +64,61 @@ def draw_tank(t, color):
     pygame.draw.circle(screen, (14, 16, 21), (cx, cy), int(TANK_R), 2)
     pygame.draw.circle(screen, (228, 233, 242), (cx, cy), 4)
     pygame.draw.circle(screen, (14, 16, 21), (cx, cy), 4, 1)
+    if t.shield:
+        pygame.draw.circle(screen, POWER_COLOR["shield"], (cx, cy), int(TANK_R) + 5, 2)
+    if t.boost > 0.0:
+        pygame.draw.circle(screen, POWER_COLOR["speed"], (cx, cy), int(TANK_R) + 8, 2)
+    if t.ammo_left > 0:
+        acol = POWER_COLOR[t.ammo_kind]
+        pygame.draw.circle(
+            screen,
+            acol,
+            (int(cx - math.cos(t.angle) * 5), int(cy - math.sin(t.angle) * 5)),
+            3,
+        )
 
 
 def draw_bullets():
     for b in world.bullets:
-        pygame.draw.circle(screen, SHOT, (int(b.x), int(b.y)), 4)
-        pygame.draw.circle(screen, (255, 250, 222), (int(b.x), int(b.y)), 4, 1)
+        col = BULLET_COLOR[b.kind]
+        cx = int(b.x)
+        cy = int(b.y)
+        if b.kind == "laser":
+            pygame.draw.line(
+                screen, col, (int(b.x - b.vx * 0.018), int(b.y - b.vy * 0.018)), (cx, cy), 3
+            )
+        r = 5 if b.kind == "bomb" else 4
+        pygame.draw.circle(screen, col, (cx, cy), r)
+        pygame.draw.circle(screen, (255, 252, 232), (cx, cy), r, 1)
+
+
+def draw_powerups():
+    for p in world.powerups:
+        if p.ttl < 3.5 and int(p.ttl * 6) % 2 == 0:
+            continue
+        col = POWER_COLOR[p.kind]
+        cx = int(p.x)
+        cy = int(p.y)
+        pygame.draw.circle(screen, (18, 20, 26), (cx, cy), 10)
+        pygame.draw.circle(screen, col, (cx, cy), 10, 2)
+        if p.kind == "laser":
+            pygame.draw.line(screen, col, (cx - 6, cy), (cx + 6, cy), 3)
+        elif p.kind == "bomb":
+            pygame.draw.circle(screen, col, (cx, cy), 4)
+        elif p.kind == "speed":
+            pygame.draw.polygon(screen, col, [(cx - 5, cy - 4), (cx + 5, cy), (cx - 5, cy + 4)])
+        else:
+            pygame.draw.circle(screen, col, (cx, cy), 6, 2)
+
+
+def draw_blasts():
+    for x, y, rad, ttl in world.blasts:
+        k = max(0.0, ttl / tank.BLAST_TTL)
+        rr = max(2, int(rad * (1.35 - 0.55 * k)))
+        surf = pygame.Surface((rr * 2, rr * 2), pygame.SRCALPHA)
+        pygame.draw.circle(surf, (255, 176, 92, int(150 * k)), (rr, rr), rr)
+        pygame.draw.circle(surf, (255, 240, 200, int(235 * k)), (rr, rr), rr, 3)
+        screen.blit(surf, (int(x) - rr, int(y) - rr))
 
 
 def draw_hud():
@@ -162,6 +218,8 @@ while running:
         world.reset()
         restart_at = None
     draw_world()
+    draw_powerups()
+    draw_blasts()
     draw_bullets()
     draw_tank(world.tanks[0], P1_COLOR)
     draw_tank(world.tanks[1], P2_COLOR)
