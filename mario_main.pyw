@@ -36,6 +36,7 @@ import config
 from agent import Agent, Counter
 from buffer import PrioritizedReplayBuffer
 from mario_env import MarioEnv, SIMPLE_MOVEMENT
+from monitor import Monitor
 from network import DQN, DEVICE
 from trainer import Trainer
 
@@ -189,6 +190,36 @@ def main():
 
     r_env = MarioEnv(config.FRAME_STACK, config.SIZE)
     r_agent = Agent(net, buffer, r_env, counter, config, stats)
+
+    mon_port = [0]
+    params = sum(p.numel() for p in net.parameters())
+
+    def state_fn():
+        return {
+            "port": mon_port[0],
+            "steps": counter.get(),
+            "eps": r_agent.epsilon(),
+            "trainSteps": trainer.train_steps,
+            "buffer": len(buffer),
+            "loss": stats["loss"],
+            "score": r_env.score,
+            "avgScore": avg(stats),
+            "bestScore": max_score(stats),
+            "gpu": gpu_util() or -1,
+            "episodes": stats["episodes"],
+            "agents": config.AGENTS,
+            "batch": config.BATCH,
+            "accum": config.ACCUM,
+            "device": str(DEVICE),
+            "mark": "NES 模拟器 (gym-super-mario-bros)",
+            "frames": config.FRAME_STACK,
+            "size": config.SIZE,
+            "actions": actions,
+            "params": params,
+        }
+
+    mon_port[0] = Monitor(state_fn).start()
+    log.info("monitor: http://127.0.0.1:%d", mon_port[0])
     s = r_env.reset()
     state = {"running": True}
 

@@ -1,3 +1,4 @@
-08:25:55 loaded mario_checkpoint.pth
-08:25:56 device: cuda actions=7 size=96
-08:26:09 steps=26191 eps=0.992 buffer=20000 loss=0.1131 episodes=0 avg=0 best=0
+08:31:03 loaded mario_checkpoint.pth
+08:31:04 device: cuda actions=7 size=96
+08:31:12 monitor: http://127.0.0.1:8787
+08:31:17 steps=26859 eps=0.991 buffer=20000 loss=0.0966 episodes=0 avg=0 best=0
