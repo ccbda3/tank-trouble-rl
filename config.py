@@ -3,7 +3,7 @@ import os
 GRID = 24
 FRAME_STACK = 4
 ACTIONS = 4
-AGENTS = max(2, (os.cpu_count() or 6) * 2 // 3)
+AGENTS = max(2, os.cpu_count() or 4)
 GAMMA = 0.99
 LR = 5e-4
 BATCH = 1024
