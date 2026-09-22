@@ -32,8 +32,8 @@ import env
 import snake
 from agent import Agent, Counter, EnvWorker
 from buffer import PrioritizedReplayBuffer
-from monitor import Monitor, act_stats
 from network import DQN, DEVICE
+from snake_monitor import SnakeMonitor
 from torch.utils.tensorboard import SummaryWriter
 from trainer import LandscapeProbe, Trainer, load_optimizer
 
@@ -66,11 +66,6 @@ def gpu_util():
         return pynvml.nvmlDeviceGetUtilizationRates(_gpu_handle).gpu
     except Exception:
         return None
-
-
-def gpu_pct():
-    g = gpu_util()
-    return -1 if g is None else g
 
 
 def draw_scene(screen, g, scene_px):
@@ -206,38 +201,12 @@ def main():
     r_env = env.Env(config.GRID, config.FRAME_STACK)
     r_agent = Agent(net, buffer, r_env, counter, config, stats, trainer)
 
-    mon_port = [0]
-
-    def state_fn():
-        return {
-            "port": mon_port[0],
-            "steps": counter.get(),
-            "eps": r_agent.epsilon(),
-            "trainSteps": trainer.train_steps,
-            "buffer": len(buffer),
-            "loss": stats["loss"],
-            "score": r_env.score,
-            "avgScore": avg(stats),
-            "bestScore": max_score(stats),
-            "gpu": gpu_pct(),
-            "episodes": stats["episodes"],
-            "agents": config.AGENTS,
-            "training": run["stop"] is not None,
-            "acts": self_acts(),
-            "landscape": probe.snapshot(),
-        }
-
-    def self_acts():
-        try:
-            r = act_stats(net, r_env._stack())
-            r["iteration"] = counter.get()
-            r["samples"] = stats["episodes"]
-            return r
-        except Exception:
-            return None
-
-    mon_port[0] = Monitor(state_fn, start_fn=start_training, stop_fn=stop_training).start()
-    log.info("监控面板: http://127.0.0.1:%d (中文)", mon_port[0])
+    mon = SnakeMonitor(
+        net, target_net, buffer, counter, trainer, stats, probe, r_env,
+        start_training, stop_training, lambda: r_agent.epsilon(), gpu_util,
+    ).build(port=config.MONITOR_PORT)
+    mon_port = mon.start()
+    log.info("监控面板: http://127.0.0.1:%d", mon_port)
     s = r_env.reset()
     state = {"running": True}
 

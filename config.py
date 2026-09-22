@@ -21,3 +21,4 @@ BETA_FRAMES = 400000
 CHECKPOINT = "snake_checkpoint.pth"
 FULL_STATE = "snake_state.pth"
 LOG = "snake_train.log"
+MONITOR_PORT = 80

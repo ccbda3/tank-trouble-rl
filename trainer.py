@@ -32,6 +32,8 @@ class Trainer:
         self.train_steps = 0
         self.updates = 0
         self.loss = 0.0
+        self.grad_snapshot = {}
+        self.weight_snapshot = {}
 
     def _hist(self, world, named_params, step):
         for name, p in named_params:
@@ -88,6 +90,15 @@ class Trainer:
             self.stats["loss"] = float(loss.item() * self.config.ACCUM)
 
         if self.train_steps % self.config.ACCUM == 0:
+            if self.updates % 25 == 0:
+                self.grad_snapshot = {
+                    n: p.grad.detach().to("cpu", copy=True)
+                    for n, p in self.net.named_parameters() if p.grad is not None
+                }
+                self.weight_snapshot = {
+                    n: p.detach().to("cpu", copy=True)
+                    for n, p in self.net.named_parameters()
+                }
             self.optimizer.step()
             self.optimizer.zero_grad()
             self.updates += 1

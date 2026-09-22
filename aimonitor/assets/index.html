@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>AI 训练监控</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+<span class="brand" id="brand">AI 训练监控</span>
+<div class="stats" id="metricsStrip"></div>
+<div class="hctl">
+<span class="chip" id="hState">—</span>
+<button class="hbtn go" id="h-start">启动训练</button>
+<button class="hbtn stop" id="h-stop">结束训练并保存</button>
+<span class="hmsg" id="hMsg"></span>
+</div>
+<div class="conn" id="conn"><i class="dot"></i><span id="connTxt">连接中</span></div>
+</header>
+<main>
+<section class="card" id="secCards">
+<div class="chead"><span class="ctitle">实时指标</span><span class="csub" id="cardSub">等待数据…</span></div>
+<div class="cards" id="cards"></div>
+</section>
+<section class="card" id="secCharts">
+<div class="chead"><span class="ctitle">训练曲线</span><span class="csub" id="chartSub">等待数据…</span><span class="chint">服务端保留历史，刷新页面不丢</span></div>
+<div class="charts" id="charts"></div>
+</section>
+<section class="card" id="secHealth">
+<div class="chead"><span class="ctitle">训练健康度</span><span class="csub" id="healthSub">等待数据…</span><span class="chint">全部为当前模型的真实统计量</span></div>
+<div class="cards" id="health"></div>
+</section>
+<section class="card" id="secFeature">
+<div class="chead"><span class="ctitle">特征图热力图</span><span class="csub" id="featSub">等待数据…</span><span class="chint">每层的全部通道，按该层自身的 min~max 归一，原像素放大不做插值</span></div>
+<div class="imggrid" id="featureMaps"></div>
+</section>
+<section class="card" id="secImages">
+<div class="chead"><span class="ctitle">真实图片</span><span class="csub" id="imgSub">等待数据…</span><span class="chint">网络真实输入/输出，按原始像素显示</span></div>
+<div class="imggrid" id="images"></div>
+</section>
+<section class="card" id="secHist">
+<div class="chead"><span class="ctitle">权重 / 梯度直方图</span><span class="csub" id="histSub">等待数据…</span><span class="chint">每层参数与梯度的真实分布，用于判断梯度消失/爆炸</span></div>
+<div class="histgrid" id="hists"></div>
+</section>
+<section class="card" id="secNet">
+<div class="chead"><span class="ctitle">神经网络 · 全部神经元</span><span class="csub" id="netSub">等待数据…</span><span class="chint">全量显示不作抽样 · 连线为真实权重矩阵 · 3D 可拖拽旋转/滚轮缩放 · 悬停节点看细节</span><button class="vbtn on" id="v-3d" data-view="3d">3D 立体</button><button class="vbtn" id="v-2d" data-view="2d">2D 平面</button></div>
+<div class="netwrap" id="netwrap">
+<canvas id="netcv"></canvas>
+<div class="nettip" id="nettip"></div>
+</div>
+<div class="netlegend" id="netLegend">
+<span><i style="background:#8ce0fa"></i>节点 = 真实神经元，全部显示，无抽样</span>
+<span><i style="background:linear-gradient(90deg,#101e2a,#2f6f97,#8ce0fa)"></i>节点颜色 = 该层激活强度（按本层 min~max 归一）</span>
+<span><i style="background:linear-gradient(90deg,rgba(126,170,216,.05),rgba(126,170,216,.9))"></i>连线 = 真实权重矩阵（通道对精确值，非分桶近似）</span>
+<span><i style="background:#ffb020"></i>最强通路</span>
+<span>连线仅绘制最强若干条（保证每个神经元至少 1 条），实际总条数见上方标题</span>
+</div>
+</section>
+<section class="card" id="secSurface">
+<div class="chead"><span class="ctitle">损失曲面 3D · 真实测量</span><span class="csub" id="gdSub">等待数据…</span><span class="chint">在参数空间沿两个固定方向扰动采样，高度为真实损失 · 拖动旋转 · 滚轮缩放</span></div>
+<div class="gdwrap" id="gdwrap"><canvas id="gdcv"></canvas></div>
+<div class="hint">
+<span><i style="background:linear-gradient(90deg,#182c48,#4a96c6,#a6e0f6)"></i>曲面高度 = 实测损失，低暗高亮</span>
+<span><i style="background:#ffb020"></i>橙色轨迹 = 真实优化器走过的权重位移投影</span>
+<span><i style="background:#3ddc84"></i>绿点 = 当前权重位置</span>
+</div>
+</section>
+<section class="card" id="secParams">
+<div class="chead"><span class="ctitle">详细参数</span><span class="csub" id="paramSub">等待数据…</span></div>
+<div class="panels" id="panels"></div>
+</section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
