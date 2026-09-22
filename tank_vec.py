@@ -20,11 +20,22 @@ C_MAX = 3
 Z_MAX = 6
 L_MAX = 3
 SUBSTEPS = 4
+NEAR_BULLETS = 8
+CTRL = np.array(ref.ACTION_CTRL, dtype=np.float32)
 
-OBS_RES = 8
+OBS_RES = 16
 OBS_W = int(WIDTH) // OBS_RES
 OBS_H = int(HEIGHT) // OBS_RES
-OBS_CH = 7
+OBS_CH = 8
+BIT_WALL, BIT_SELF, BIT_ENEMY, BIT_BULLET, BIT_MINE, BIT_CAPSULE, BIT_BEAM = 0, 1, 2, 4, 5, 6, 7
+
+
+def unpack(packed):
+    b = packed.shape[0]
+    out = np.empty((b, OBS_CH) + packed.shape[1:], dtype=np.float32)
+    for c in range(OBS_CH):
+        out[:, c] = (packed >> c) & 1
+    return out
 
 
 def _maps():
@@ -142,7 +153,7 @@ class VecEnv:
         self.ep_kills = np.zeros((self.n, self.p), dtype=np.int32)
         self.ep_deaths = np.zeros((self.n, self.p), dtype=np.int32)
         self.ep_steps = np.zeros(self.n, dtype=np.int32)
-        self.obs_wall = np.zeros((self.n, OBS_H, OBS_W), dtype=np.uint8)
+        self.wall_bits = np.zeros((self.n, OBS_H, OBS_W), dtype=np.uint8)
         self.reset()
 
     def reset(self):
@@ -158,7 +169,7 @@ class VecEnv:
         self.ep_steps[:] = 0
         self.rounds[:] = 0
         self._new_round(self.rows)
-        return self.observation(0)
+        return self.obs_pack(0)
 
     def _new_round(self, rows):
         self.b_on[rows] = False
@@ -208,14 +219,14 @@ class VecEnv:
             far = np.argmax(d2, axis=1)
             ang[:, k] = np.arctan2(dy[np.arange(rows.size), far], dx[np.arange(rows.size), far])
         self.ta[rows] = ang
-        self._refresh_wall_obs(rows)
+        self._refresh_wall_bits(rows)
 
-    def _refresh_wall_obs(self, rows):
+    def _refresh_wall_bits(self, rows):
         vw = self.vwall[np.ix_(rows, _VS, _JC)]
         hw = self.hwall[np.ix_(rows, _HS, _IC)]
         vw = np.transpose(vw, (0, 2, 1))
         wall = (_SV[None, None, :] & vw) | (_SH[None, :, None] & hw)
-        self.obs_wall[rows] = np.where(wall, 255, 0).astype(np.uint8)
+        self.wall_bits[rows] = wall.astype(np.uint8) << BIT_WALL
 
     def free(self, rows, x, y, r):
         ci = np.clip(np.floor((x - WALL_W) / PITCH).astype(np.int64), 0, NC - 1)
@@ -663,19 +674,17 @@ class VecEnv:
             self.b_on[rows[r], c] = False
             self._damage(rows[r], j, self.b_owner[rows[r], c].astype(np.int64))
 
-    def observation(self, side):
-        obs = np.zeros((self.n, OBS_CH, OBS_H, OBS_W), dtype=np.uint8)
-        obs[:, 0] = self.obs_wall
+    def obs_pack(self, side):
+        out = self.wall_bits.copy()
         for j in range(self.p):
-            ch = 1 if j == side else 2
-            val = 255 if j == side else 200
-            self._blit(obs, ch, self.tx[:, j], self.ty[:, j], self.t_alive[:, j], val)
+            self._blit_bit(out, BIT_SELF if j == side else BIT_ENEMY,
+                           self.tx[:, j], self.ty[:, j], self.t_alive[:, j])
         for q in range(B_MAX):
-            self._dot(obs, 3, self.b_x[:, q], self.b_y[:, q], self.b_on[:, q], 255)
+            self._dot_bit(out, BIT_BULLET, self.b_x[:, q], self.b_y[:, q], self.b_on[:, q])
         for q in range(M_MAX):
-            self._dot(obs, 4, self.m_x[:, q], self.m_y[:, q], self.m_on[:, q], 90)
+            self._dot_bit(out, BIT_MINE, self.m_x[:, q], self.m_y[:, q], self.m_on[:, q])
         for q in range(C_MAX):
-            self._dot(obs, 5, self.c_x[:, q], self.c_y[:, q], self.c_on[:, q], 160)
+            self._dot_bit(out, BIT_CAPSULE, self.c_x[:, q], self.c_y[:, q], self.c_on[:, q])
         for q in range(L_MAX):
             on = self.l_on[:, q]
             if not on.any():
@@ -688,31 +697,42 @@ class VecEnv:
             for t in range(int(steps.max()) + 1):
                 sel = on & (t <= steps)
                 f = t / np.maximum(steps, 1)
-                self._dot(obs, 6, x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, sel, 255)
-        return obs
+                self._dot_bit(out, BIT_BEAM, x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, sel)
+        return out
 
-    def _blit(self, obs, ch, x, y, mask, value):
+    def _blit_bit(self, out, bit, x, y, mask):
         rows = np.nonzero(mask)[0]
         if rows.size == 0:
             return
         cx = np.clip((x[rows] / OBS_RES).astype(np.int64), 0, OBS_W - 1)
         cy = np.clip((y[rows] / OBS_RES).astype(np.int64), 0, OBS_H - 1)
         for dy, dx in _DISC:
-            obs[rows, ch, np.clip(cy + dy, 0, OBS_H - 1), np.clip(cx + dx, 0, OBS_W - 1)] = value
+            oy = np.clip(cy + dy, 0, OBS_H - 1)
+            ox = np.clip(cx + dx, 0, OBS_W - 1)
+            out[rows, oy, ox] |= np.uint8(1 << bit)
 
-    def _dot(self, obs, ch, x, y, mask, value):
+    def _dot_bit(self, out, bit, x, y, mask):
         rows = np.nonzero(mask)[0]
         if rows.size == 0:
             return
         cx = np.clip((x[rows] / OBS_RES).astype(np.int64), 0, OBS_W - 1)
         cy = np.clip((y[rows] / OBS_RES).astype(np.int64), 0, OBS_H - 1)
-        obs[rows, ch, cy, cx] = value
+        out[rows, cy, cx] |= np.uint8(1 << bit)
 
-    def scalars(self, side):
-        out = np.zeros((self.n, self.p * 7 + 6), dtype=np.float32)
-        order = [side] + [j for j in range(self.p) if j != side]
-        for k, j in enumerate(order):
-            b = k * 7
+    def feat(self, side):
+        others = [j for j in range(self.p) if j != side]
+        cols = 8 + 7 * len(others) + 6 * NEAR_BULLETS + 4
+        out = np.zeros((self.n, cols), dtype=np.float32)
+        out[:, 0] = self.tx[:, side] / WIDTH
+        out[:, 1] = self.ty[:, side] / HEIGHT
+        out[:, 2] = np.cos(self.ta[:, side])
+        out[:, 3] = np.sin(self.ta[:, side])
+        out[:, 4] = self.t_alive[:, side]
+        out[:, 5] = self.t_weapon[:, side] / 7.0
+        out[:, 6] = np.clip(self.t_wt[:, side] / 10.0, 0.0, 1.0)
+        out[:, 7] = self.t_cool[:, side]
+        b = 8
+        for j in others:
             out[:, b + 0] = self.tx[:, j] / WIDTH
             out[:, b + 1] = self.ty[:, j] / HEIGHT
             out[:, b + 2] = np.cos(self.ta[:, j])
@@ -720,22 +740,30 @@ class VecEnv:
             out[:, b + 4] = self.t_alive[:, j]
             out[:, b + 5] = self.t_weapon[:, j] / 7.0
             out[:, b + 6] = np.clip(self.t_wt[:, j] / 10.0, 0.0, 1.0)
-        base = self.p * 7
-        out[:, base + 0] = self.t_score[:, side] / 10.0
-        for j in range(self.p):
-            if j != side:
-                out[:, base + 1] = self.t_score[:, j] / 10.0
-            break
-        out[:, base + 2] = self.t_cool[:, side]
-        out[:, base + 3] = self.pause / DEATH_PAUSE
-        out[:, base + 4] = self.over
-        out[:, base + 5] = self.ep_steps / 1800.0
+            b += 7
+        dx = self.b_x - self.tx[:, side][:, None]
+        dy = self.b_y - self.ty[:, side][:, None]
+        ref_ang = self.ta[:, side][:, None]
+        rx = dx * np.cos(ref_ang) + dy * np.sin(ref_ang)
+        ry = dy * np.cos(ref_ang) - dx * np.sin(ref_ang)
+        dist = np.hypot(dx, dy)
+        dist = np.where(self.b_on, dist, 1e9)
+        order = np.argsort(dist, axis=1)[:, :NEAR_BULLETS]
+        rows = np.arange(self.n)
+        for k in range(NEAR_BULLETS):
+            c = order[:, k]
+            sel = dist[rows, c] < 1e8
+            out[:, b + 6 * k + 0] = np.where(sel, rx[rows, c] / 300.0, 0.0)
+            out[:, b + 6 * k + 1] = np.where(sel, ry[rows, c] / 300.0, 0.0)
+            vx = self.b_vx[rows, c]
+            vy = self.b_vy[rows, c]
+            out[:, b + 6 * k + 2] = np.where(sel, (vx * np.cos(self.ta[:, side]) + vy * np.sin(self.ta[:, side])) / 540.0, 0.0)
+            out[:, b + 6 * k + 3] = np.where(sel, (vy * np.cos(self.ta[:, side]) - vx * np.sin(self.ta[:, side])) / 540.0, 0.0)
+            out[:, b + 6 * k + 4] = np.where(sel, self.b_kind[rows, c] / 4.0, 0.0)
+            out[:, b + 6 * k + 5] = np.where(sel, np.minimum(dist[rows, c], 300.0) / 300.0, 0.0)
+        b += 6 * NEAR_BULLETS
+        out[:, b + 0] = self.t_score[:, side] / 10.0
+        out[:, b + 1] = self.pause / DEATH_PAUSE
+        out[:, b + 2] = self.over
+        out[:, b + 3] = np.clip(self.ep_steps / 1800.0, 0.0, 1.0)
         return out
-
-    def self_play_batch(self, policy, dt):
-        obs = np.concatenate([self.observation(j) for j in range(self.p)], axis=0)
-        scal = np.concatenate([self.scalars(j) for j in range(self.p)], axis=0)
-        acts = policy(obs, scal)
-        acts = np.asarray(acts).reshape(self.p, self.n, 3).transpose(1, 0, 2)
-        self.step(acts.astype(np.float32), dt)
-        return obs, scal, acts
