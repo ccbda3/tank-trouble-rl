@@ -300,13 +300,22 @@ def main():
     ap.add_argument("--monitor", action="store_true")
     ap.add_argument("--view", action="store_true")
     ap.add_argument("--resume", action="store_true")
+    # --ckpt/--log：覆盖默认的检查点与日志路径。跑 A/B 对比实验时用得上——
+    # 两组实验的存档必须分开，否则后一组会把前一组的成果覆盖掉。
+    ap.add_argument("--ckpt", default=config.CHECKPOINT)
+    ap.add_argument("--log", default=config.LOG)
+    # 迷宫连通度课程（课程学习）：从 --braid-from 线性退火到 --braid-to，
+    # 跨 --braid-steps 步走完。不给 --braid-from 就固定用生成器默认值（0.70）。
+    ap.add_argument("--braid-from", type=float, default=None)
+    ap.add_argument("--braid-to", type=float, default=None)
+    ap.add_argument("--braid-steps", type=float, default=4.0e7)
     args = ap.parse_args()
 
     # 日志同时写控制台和文件（UTF-8），这样跑在无控制台的 pythonw 下也能留档。
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         datefmt="%H:%M:%S",
                         handlers=[logging.StreamHandler(sys.stdout),
-                                  logging.FileHandler(config.LOG, encoding="utf-8")])
+                                  logging.FileHandler(args.log, encoding="utf-8")])
     # 启动横幅：打印设备、并行度、人数、观测张量形状和特征维度，
     # 方便一眼确认观测/特征是否和网络输入对得上。
     log.info("设备 %s  envs %d  %d 人混战  观测 %d 通道 %dx%d  特征 %d 维",
@@ -387,9 +396,9 @@ def main():
     # 断点续训：先把检查点备份成 .bak，再载入模型权重和历史步数。
     # 注意对手池会被重置成"只有当前网络这一份快照"（旧池子没有随检查点一起保存），
     # 续训后需要重新积累快照——这比用一份来历不明的旧池子更可控。
-    if args.resume and os.path.exists(config.CHECKPOINT):
-        shutil.copyfile(config.CHECKPOINT, config.CHECKPOINT + ".bak")
-        ck = torch.load(config.CHECKPOINT, map_location=network.DEVICE)
+    if args.resume and os.path.exists(args.ckpt):
+        shutil.copyfile(args.ckpt, args.ckpt + ".bak")
+        ck = torch.load(args.ckpt, map_location=network.DEVICE)
         policy.load_state_dict(ck["model"])
         target.load_state_dict(policy.state_dict())
         snapshots = [Snapshot(policy.state_dict(), feat_dim)]
@@ -400,7 +409,7 @@ def main():
         steps = int(ck.get("steps", 0))
         # 三个周期计时器一起推到当前步数，避免刚恢复就立刻触发同步/存快照/评测
         last_target = last_snap = last_eval = steps
-        log.info("断点续训：载入 %s，从第 %d 步继续", config.CHECKPOINT, steps)
+        log.info("断点续训：载入 %s，从第 %d 步继续", args.ckpt, steps)
 
     # 以下累加器都服务于"每 10 秒统计窗口"：打日志时求平均然后清零。
     it = 0
@@ -448,8 +457,17 @@ def main():
 
     # 主循环：按墙钟时间跑满 --minutes 分钟（而不是按固定步数，便于控制实验时长）。
     deadline = t0 + args.minutes * 60.0
+    # 迷宫难度课程（课程学习）的步数起点：从续训点开始算，跑满 --braid-steps 步退火到位。
+    braid_base = steps
     while time.time() < deadline:
         it += 1
+        # 按训练进度线性调整迷宫连通度：一开始给最开阔的地图（几乎没死胡同），
+        # 让策略先学会"瞄准、躲弹、别把自己打死"这些能在开阔场里获得密集反馈的技能，
+        # 再逐步加回死胡同，逼它学走廊反弹这种真正的难点。
+        # 只影响"之后新生成的迷宫"，已经在打的这局不会被中途换图。
+        if args.braid_from is not None:
+            frac = min(1.0, max(0.0, (steps - braid_base) / args.braid_steps))
+            env.braid = args.braid_from + (args.braid_to - args.braid_from) * frac
         # ---- 采样阶段 ----
         # 每个座位一份观测（网络按座位分别看自己视角的画面）。
         packs = [env.obs_pack(j) for j in range(players)]
@@ -702,6 +720,10 @@ def main():
                      "自杀占死因 %.0f%%  平局 %.0f%%  回合 %.1f 秒  %.0f 局/分  回放 %.0fk  损失 %.4f",
                      steps, spm, eps, stats["rew"], place, 100.0 * kill, 100.0 * draw_rate,
                      span, rpm, stats["buf"], stats["loss"])
+            # 课程学习期间把当前迷宫难度也打出来，方便确认退火真的在推进
+            if args.braid_from is not None:
+                log.info("本轮迷宫连通度 %.3f（从 %.2f 退火到 %.2f）",
+                         float(env.braid), args.braid_from, args.braid_to)
             # 清空本窗口的累加器，开始下一个 10 秒统计窗口
             loss_sum = loss_n = 0.0
             q_sum = td_sum = td_n = 0.0
@@ -735,7 +757,7 @@ def main():
                     v["place"] or 0.0, v["rounds"], v["span"] * DT)
                 for k, v in res.items()))
             # 评测后存一次检查点（带上总步数，供 --resume 恢复进度）
-            torch.save({"model": policy.state_dict(), "steps": steps}, config.CHECKPOINT)
+            torch.save({"model": policy.state_dict(), "steps": steps}, args.ckpt)
 
         # 把当前帧画面和各项统计推给观战窗口（另一个进程的 tank_view.py 通过共享内存读）
         if writer is not None:
@@ -745,7 +767,7 @@ def main():
                          [(stats["eval"].get(k) or {}).get("win", 0.0) for k in EVAL_NAMES])
 
     # 到达时长上限后收尾：最后存一次检查点，再关掉监控/观战相关资源。
-    torch.save({"model": policy.state_dict(), "steps": steps}, config.CHECKPOINT)
+    torch.save({"model": policy.state_dict(), "steps": steps}, args.ckpt)
     log.info("训练结束，共 %d 步", steps)
     if tmon is not None:
         tmon.close()

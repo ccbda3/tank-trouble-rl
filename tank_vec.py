@@ -195,10 +195,14 @@ def _ray_square(ox, oy, dx, dy, tx, ty, ta, half):
 # ep_ 一条 episode（训练用的一整条轨迹）内的累计统计。
 class VecEnv:
     # n：并行对局数（训练里常用 256）；players：每局座位数（混战传 4，默认 2）。
-    def __init__(self, n, players=2, seed=None):
+    def __init__(self, n, players=2, seed=None, braid=None):
         self.n = int(n)
         self.p = int(players)
         self.rng = np.random.default_rng(seed)
+        # braid：迷宫连通度，None 表示用 tank.generate 的默认值（0.70）。
+        # 训练时把它设成浮点数就能控制难度，也可以中途改（只影响之后新生成的迷宫），
+        # 用来做"课程学习"：先给开阔地图，再逐步加回死胡同。
+        self.braid = braid
         # 全体局索引数组，用于"一次操作部分局"的高级索引（比如只给死亡的那些局开新回合）。
         self.rows = np.arange(self.n)
         # ---- 迷宫（墙）----
@@ -327,7 +331,13 @@ class VecEnv:
         self._base = None          # 地图变了，观测底图缓存作废
         for i in rows:
             # 每局用独立随机种子生成迷宫（与可玩游戏同一套生成器，保证规则一致）。
-            vwall, hwall = ref.generate(int(self.rng.integers(1 << 30)))
+            # self.braid 为 None 时用生成器的默认连通度；设了值就按这个值生成，
+            # 所以课程学习只要在每个训练迭代里改 self.braid，之后新生成的迷宫就跟着变。
+            seed_i = int(self.rng.integers(1 << 30))
+            if self.braid is None:
+                vwall, hwall = ref.generate(seed_i)
+            else:
+                vwall, hwall = ref.generate(seed_i, braid=float(self.braid))
             self.vwall[i] = vwall
             self.hwall[i] = hwall
         self.picked[rows] = False
