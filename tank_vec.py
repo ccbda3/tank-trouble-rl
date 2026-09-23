@@ -1028,11 +1028,13 @@ class VecEnv:
     # 关键设计：除自己外的所有对手都合并画进同一个 BIT_ENEMY 通道，
     # 所以无论 2 人还是 4 人，图像格式都固定是 8 通道——网络结构不必随
     # 对手人数变化（每个对手的个体信息改在标量特征 feat() 里给出）。
-    def obs_pack(self, side):
-        out = self._obs_base().copy()
+    # rows 只给一部分局时只算这部分（上层复用了上一帧结果、只需要刷新刚重开的那几局时用）。
+    def obs_pack(self, side, rows=None):
+        ix = slice(None) if rows is None else rows
+        out = self._obs_base()[ix].copy()
         for j in range(self.p):
             self._blit_bit(out, BIT_SELF if j == side else BIT_ENEMY,
-                           self.tx[:, j], self.ty[:, j], self.t_alive[:, j])
+                           self.tx[ix, j], self.ty[ix, j], self.t_alive[ix, j])
         return out
 
     # 把一个实体画成以它所在像素为中心的 3×3 小方块（而不是单个像素）。
@@ -1064,32 +1066,34 @@ class VecEnv:
     # 但一些连续量（速度、剩余时间、名次）用图不好表达，就把它们单独列成向量。
     # 布局：自身 8 维 + 每个对手 7 维（4 人局是 3 个对手） + 最近 8 颗子弹各 6 维
     #       + 末尾 4 维（含回合进度）。
-    def feat(self, side):
+    # rows 同 obs_pack：只算指定的那些局（ix 为 slice(None) 时就是算全部）。
+    def feat(self, side, rows=None):
+        ix = slice(None) if rows is None else rows
         others = [j for j in range(self.p) if j != side]
         cols = 8 + 7 * len(others) + 6 * NEAR_BULLETS + 4
-        out = np.zeros((self.n, cols), dtype=np.float32)
+        out = np.zeros((self.n if rows is None else int(rows.size), cols), dtype=np.float32)
         # ---- 自身 8 维 ----
         # 位置归一化到 0~1；朝向用 cos/sin 两个分量而不是角度值，
         # 因为角度在 ±π 处会跳变（359° 和 1° 其实很近，但数值差 358），
         # 用 cos/sin 表达方向对神经网络更友好。
-        out[:, 0] = self.tx[:, side] / WIDTH
-        out[:, 1] = self.ty[:, side] / HEIGHT
-        out[:, 2] = np.cos(self.ta[:, side])
-        out[:, 3] = np.sin(self.ta[:, side])
-        out[:, 4] = self.t_alive[:, side]
-        out[:, 5] = self.t_weapon[:, side] / 7.0                 # 武器编号最大为 7，除以 7 归一
-        out[:, 6] = np.clip(self.t_wt[:, side] / 10.0, 0.0, 1.0)  # 武器剩余时间，按最长 10 秒归一
-        out[:, 7] = self.t_cool[:, side]                          # 开火冷却剩余秒数
+        out[:, 0] = self.tx[ix, side] / WIDTH
+        out[:, 1] = self.ty[ix, side] / HEIGHT
+        out[:, 2] = np.cos(self.ta[ix, side])
+        out[:, 3] = np.sin(self.ta[ix, side])
+        out[:, 4] = self.t_alive[ix, side]
+        out[:, 5] = self.t_weapon[ix, side] / 7.0                 # 武器编号最大为 7，除以 7 归一
+        out[:, 6] = np.clip(self.t_wt[ix, side] / 10.0, 0.0, 1.0)  # 武器剩余时间，按最长 10 秒归一
+        out[:, 7] = self.t_cool[ix, side]                          # 开火冷却剩余秒数
         b = 8
         for j in others:
             # ---- 每个对手 7 维：位置(2) + 朝向 cos/sin(2) + 存活(1) + 武器(1) + 武器剩余时间(1) ----
-            out[:, b + 0] = self.tx[:, j] / WIDTH
-            out[:, b + 1] = self.ty[:, j] / HEIGHT
-            out[:, b + 2] = np.cos(self.ta[:, j])
-            out[:, b + 3] = np.sin(self.ta[:, j])
-            out[:, b + 4] = self.t_alive[:, j]
-            out[:, b + 5] = self.t_weapon[:, j] / 7.0
-            out[:, b + 6] = np.clip(self.t_wt[:, j] / 10.0, 0.0, 1.0)
+            out[:, b + 0] = self.tx[ix, j] / WIDTH
+            out[:, b + 1] = self.ty[ix, j] / HEIGHT
+            out[:, b + 2] = np.cos(self.ta[ix, j])
+            out[:, b + 3] = np.sin(self.ta[ix, j])
+            out[:, b + 4] = self.t_alive[ix, j]
+            out[:, b + 5] = self.t_weapon[ix, j] / 7.0
+            out[:, b + 6] = np.clip(self.t_wt[ix, j] / 10.0, 0.0, 1.0)
             b += 7
         # ---- 最近 NEAR_BULLETS 颗子弹，每颗 6 维 ----
         # 先把子弹位置/速度变换到"以自机为原点、自机朝向为 x 轴"的相对坐标系，
@@ -1101,39 +1105,42 @@ class VecEnv:
         act = self.columns()
         na = int(act.size)
         if na:
-            bx = self.b_x[:, act]
-            by = self.b_y[:, act]
-            on = self.b_on[:, act]
-            bkx = self.b_kind[:, act]
-            bvx = self.b_vx[:, act]
-            bvy = self.b_vy[:, act]
-            dx = bx - self.tx[:, side][:, None]
-            dy = by - self.ty[:, side][:, None]
-            ref_ang = self.ta[:, side][:, None]
+            # 子弹相关的数组是 (局, 槽位) 二维的，要"局 × 槽位"两两配对取出，
+            # 必须用 np.ix_ 做笛卡尔积索引（直接写 sel[act] 会被当成逐元素配对）。
+            sel = np.arange(self.n) if rows is None else rows
+            bx = self.b_x[np.ix_(sel, act)]
+            by = self.b_y[np.ix_(sel, act)]
+            on = self.b_on[np.ix_(sel, act)]
+            bkx = self.b_kind[np.ix_(sel, act)]
+            bvx = self.b_vx[np.ix_(sel, act)]
+            bvy = self.b_vy[np.ix_(sel, act)]
+            dx = bx - self.tx[ix, side][:, None]
+            dy = by - self.ty[ix, side][:, None]
+            ref_ang = self.ta[ix, side][:, None]
             ca = np.cos(ref_ang)
             sa = np.sin(ref_ang)
             rx = dx * ca + dy * sa
             ry = dy * ca - dx * sa
             dist = np.where(on, np.hypot(dx, dy), 1e9)   # 未启用的槽位距离设为极大，排序时自然落到最后
-            rows = np.arange(self.n)
+            rows_all = np.arange(out.shape[0])
             pick_n = min(NEAR_BULLETS, na)   # 子弹不足 8 颗时只填前 pick_n 组，其余保持 0
             order = np.argsort(dist, axis=1)[:, :pick_n]   # 每局取最近的那些槽位
-            cs = np.cos(self.ta[:, side])
-            sn = np.sin(self.ta[:, side])
+            cs = np.cos(self.ta[ix, side])
+            sn = np.sin(self.ta[ix, side])
             for k in range(pick_n):
                 c = order[:, k]
-                sel = dist[rows, c] < 1e8   # 该局不足 pick_n 颗子弹时，剩下的槽位整组填 0
-                out[:, b + 6 * k + 0] = np.where(sel, rx[rows, c] / 300.0, 0.0)   # 相对位置 x
-                out[:, b + 6 * k + 1] = np.where(sel, ry[rows, c] / 300.0, 0.0)   # 相对位置 y
+                sel = dist[rows_all, c] < 1e8   # 该局不足 pick_n 颗子弹时，剩下的槽位整组填 0
+                out[:, b + 6 * k + 0] = np.where(sel, rx[rows_all, c] / 300.0, 0.0)   # 相对位置 x
+                out[:, b + 6 * k + 1] = np.where(sel, ry[rows_all, c] / 300.0, 0.0)   # 相对位置 y
                 # 相对速度同样旋到自机坐标系；除以 540（最快弹速 GATLING_SPEED）做归一。
-                out[:, b + 6 * k + 2] = np.where(sel, (bvx[rows, c] * cs + bvy[rows, c] * sn) / 540.0, 0.0)
-                out[:, b + 6 * k + 3] = np.where(sel, (bvy[rows, c] * cs - bvx[rows, c] * sn) / 540.0, 0.0)
-                out[:, b + 6 * k + 4] = np.where(sel, bkx[rows, c] / 4.0, 0.0)               # 子弹种类，最大 4
-                out[:, b + 6 * k + 5] = np.where(sel, np.minimum(dist[rows, c], 300.0) / 300.0, 0.0) # 距离，截断在 300
+                out[:, b + 6 * k + 2] = np.where(sel, (bvx[rows_all, c] * cs + bvy[rows_all, c] * sn) / 540.0, 0.0)
+                out[:, b + 6 * k + 3] = np.where(sel, (bvy[rows_all, c] * cs - bvx[rows_all, c] * sn) / 540.0, 0.0)
+                out[:, b + 6 * k + 4] = np.where(sel, bkx[rows_all, c] / 4.0, 0.0)               # 子弹种类，最大 4
+                out[:, b + 6 * k + 5] = np.where(sel, np.minimum(dist[rows_all, c], 300.0) / 300.0, 0.0) # 距离，截断在 300
         b += 6 * NEAR_BULLETS
         # ---- 末尾 4 维：本局得分、死亡停顿进度、本局是否已结束、本回合时间进度 ----
-        out[:, b + 0] = self.t_score[:, side] / 10.0
-        out[:, b + 1] = self.pause / DEATH_PAUSE
-        out[:, b + 2] = self.over
-        out[:, b + 3] = np.clip(self.round_frames / ROUND_LIMIT, 0.0, 1.0)   # 0=刚开局，1=即将判平局
+        out[:, b + 0] = self.t_score[ix, side] / 10.0
+        out[:, b + 1] = self.pause[ix] / DEATH_PAUSE
+        out[:, b + 2] = self.over[ix]
+        out[:, b + 3] = np.clip(self.round_frames[ix] / ROUND_LIMIT, 0.0, 1.0)   # 0=刚开局，1=即将判平局
         return out

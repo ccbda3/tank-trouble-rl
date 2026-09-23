@@ -461,6 +461,9 @@ def main():
     deadline = t0 + args.minutes * 60.0
     # 迷宫难度课程（课程学习）的步数起点：从续训点开始算，跑满 --braid-steps 步退火到位。
     braid_base = steps
+    # 首帧的观测：之后每帧都复用上一帧算好的"末帧观测"，不再每帧算两遍（见循环末尾）。
+    packs = [env.obs_pack(j) for j in range(players)]
+    feats = [env.feat(j) for j in range(players)]
     while time.time() < deadline:
         it += 1
         # 按训练进度线性调整迷宫连通度：一开始给最开阔的地图（几乎没死胡同），
@@ -471,9 +474,7 @@ def main():
             frac = min(1.0, max(0.0, (steps - braid_base) / args.braid_steps))
             env.braid = args.braid_from + (args.braid_to - args.braid_from) * frac
         # ---- 采样阶段 ----
-        # 每个座位一份观测（网络按座位分别看自己视角的画面）。
-        packs = [env.obs_pack(j) for j in range(players)]
-        feats = [env.feat(j) for j in range(players)]
+        # 每个座位一份观测（网络按座位分别看自己视角的画面），由循环末尾续上。
         ctrl = np.zeros((args.envs, players, 3), dtype=np.float32)
         # ε-贪心探索率：从 EPS_START=1.0 线性衰减到 EPS_END=0.05，衰减跨 3000 万步。
         # 3000 万步是上千局的量级：足够让策略在"敢乱试"阶段把走位/瞄准/道具的基本盘踩完。
@@ -598,6 +599,17 @@ def main():
         rows = np.nonzero(new)[0]
         if rows.size:
             env._new_round(rows)
+            # 只有这几局换了地图和出生点，其余局的末帧观测依然有效：整批复制上一帧结果，
+            # 再把刚重开的这几行覆盖成重算值。这样每帧全量观测只算一次（而不是两次）。
+            packs = [p.copy() for p in packs_next]
+            feats = [f.copy() for f in feats_next]
+            for j in range(players):
+                packs[j][rows] = env.obs_pack(j, rows)
+                feats[j][rows] = env.feat(j, rows)
+        else:
+            # 没有局重开时，下一帧的"初观测"逐位等于本帧的"末观测"：
+            # 两次 step 之间环境状态没有任何变化，而 obs_pack/feat 是纯函数，直接复用。
+            packs, feats = packs_next, feats_next
 
         # ---- 训练阶段 ----
         # LEARN_START：先攒够 2 万步经验再开始学。池子太小时抽出来的 512 条几乎全来自最近
