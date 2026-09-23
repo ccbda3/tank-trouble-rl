@@ -10,8 +10,9 @@
 # 模式二 follow()：跟随观战（本文件的主要用法）
 #   本地起 4 局模拟，每 2 秒按修改时间检查一次检查点文件，拉到新权重就用真实
 #   60 帧/秒推演，能看到当前策略到底在做什么。
-#   按 1-4 切台，按 E 在「贪心 ε=0（反映真实水平）」和「跟随训练 ε（训练时含
-#   探索噪声的真实行为）」之间切换，按 M 把 0 号座位换成脚本 Lv3 当对手。
+#   按 1-4 切台，按 M 把 0 号座位换成脚本 Lv3 当对手。
+#   推演永远用训练当时的 ε（实时从训练进程的统计量里读），所以画面就是训练现场：
+#   探索噪声照常掺进去，能看到"训练时它到底在做什么、为什么会自杀"。
 #
 # 数据流：
 #   tank_vec.VecEnv 的字段 → _fill() 抄进 DTYPE 结构化数组
@@ -369,8 +370,6 @@ def follow(envs=VIEW_ENVS, seed=20240923):
     bot = None
     # mode 0 = 四个座位都用自己（对等自对弈），1 = 0 号座位换成脚本 Lv3
     mode = 0
-    # eps_mode 0 = 贪心（ε=0），1 = 跟随训练时的 ε，用来对比「真实水平」和「训练行为」
-    eps_mode = 0
     # snap 缓存本帧各局状态，避免同一帧里重复调用 _fill
     snap = np.zeros((envs,), dtype=DTYPE)
     ck_steps = 0
@@ -415,9 +414,6 @@ def follow(envs=VIEW_ENVS, seed=20240923):
                 mode = 1 - mode
                 if mode == 1 and bot is None:
                     bot = selfplay.ScriptedBot(envs, 3, 11)
-            # E 切换探索率
-            if e.type == pygame.KEYDOWN and e.key == pygame.K_e:
-                eps_mode = 1 - eps_mode
 
         # 每 2 秒最多检查一次检查点：torch.load 是磁盘 IO + 反序列化，
         # 每帧都查会明显掉帧，所以用 last_ck 限流；再用 mtime 判断文件是否真的变过，
@@ -441,16 +437,18 @@ def follow(envs=VIEW_ENVS, seed=20240923):
                 except Exception:
                     ck_mtime = None
 
-        eps_show = 0.0
-        if eps_mode == 1:
-            # 跟随训练的 ε：直接从训练的统计量里读（拿不到就退化成固定 0.2）
-            eps_show = float(stat[0]["eps"]) if stat is not None else 0.2
+        # 永远按训练时的 ε 推演，看到的就是训练现场的真实画面
+        # （ε 实时从训练进程的统计量里读；没有训练进程时退化成最终值 0.05）
+        eps_show = float(stat[0]["eps"]) if stat is not None else 0.05
         with torch.no_grad():
-            # 每个座位 j 用「自己视角」的观测和特征，整批算出动作
-            # （obs_pack(j)/feat(j) 是第 j 个座位看到的信息，视线遮挡等都在这里体现）
-            for j in range(envs_p):
-                acts[:, j] = net.act(network.obs_tensor(env.obs_pack(j)),
-                                     network.feat_tensor(env.feat(j)), eps_show).cpu().numpy()
+            # 四个座位合成一次前向：同一张网、同一个 ε，合批不改变任何决策，
+            # 但把每帧 4 次小前向压成 1 次，少和训练进程抢 GPU。
+            # obs_pack(j)/feat(j) 是第 j 个座位自己视角的信息（视线遮挡等都在这里体现）
+            pk = np.stack([env.obs_pack(j) for j in range(envs_p)])
+            ft = np.stack([env.feat(j) for j in range(envs_p)])
+            q = net.act(network.obs_tensor(pk.reshape(-1, pk.shape[2], pk.shape[3])),
+                        network.feat_tensor(ft.reshape(-1, ft.shape[2])), eps_show)
+            acts[:] = q.cpu().numpy().reshape(envs_p, envs).T
             # 用脚本机器人覆盖 0 号座位：其余座位仍然是网络，形成「网络 vs 脚本」的对比
             if mode == 1 and bot is not None:
                 acts[:, 0] = bot.act(env, 0, [k for k in range(1, envs_p)])
@@ -481,10 +479,9 @@ def follow(envs=VIEW_ENVS, seed=20240923):
             ck_steps, env_index + 1, envs, "/".join(str(int(v)) for v in s["score"]),
             int(s["round"]), 100.0 * min(1.0, int(s["rframe"]) / float(ROUND_LIMIT)))
         screen.blit(font.render(line1, True, (230, 230, 235)), (10, H + 4))
-        screen.blit(font.render("1-4 切台   M 切对手   E 切探索   ESC 退出", True, (140, 140, 150)), (520, H + 4))
-        line2 = "对手 %s   推演 ε %.2f（%s）   本地 60 帧/秒推演，2 秒拉一次最新检查点" % (
-            "脚本Lv3" if mode == 1 else "自己（对等）", eps_show,
-            "贪心，反映真实水平" if eps_mode == 0 else "跟随训练")
+        screen.blit(font.render("1-4 切台   M 切对手   ESC 退出", True, (140, 140, 150)), (520, H + 4))
+        line2 = "对手 %s   按训练时的 ε %.2f 推演（探索噪声照常掺入）   本地 60 帧/秒，2 秒拉一次最新检查点" % (
+            "脚本Lv3" if mode == 1 else "自己（对等）", eps_show)
         screen.blit(font.render(line2, True, (150, 190, 235)), (10, H + 26))
         if st is None:
             line3 = "训练进程未开启，仅看当前检查点的对局"
