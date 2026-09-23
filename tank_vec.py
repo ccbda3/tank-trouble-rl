@@ -857,16 +857,25 @@ class VecEnv:
         self.b_vx[r, c] = np.cos(na) * sp
         self.b_vy[r, c] = np.sin(na) * sp
 
+    # 返回"本帧确实有子弹在飞"的槽位下标。子弹池固定 96 个槽，但实战平均只有
+    # 个位数子弹同时在天上；所有跟子弹有关的运算都先过这一层筛选，把 96 降到 ~9，
+    # 这是整个环境里省算力最狠的一刀（不改变任何物理结果，只是不再空算空槽）。
+    def columns(self):
+        return np.nonzero(self.b_on.any(axis=0))[0]
+
     # 把"卡在墙里的子弹"顶出来。理论上不该发生，但换地图、边界上的浮点误差
     # 都可能让子弹落在墙体内；卡住的子弹会一直占着槽位，还会污染观测图。
     def _unstick(self):
         rows = np.nonzero(self.b_on.any(axis=1))[0]
         if rows.size == 0:
             return
-        bx = self.b_x[rows].copy()
-        by = self.b_y[rows].copy()
-        ang = np.arctan2(self.b_vy[rows], self.b_vx[rows])
-        stuck = self.b_on[rows] & ~self.free(rows[:, None], bx, by, BULLET_R)
+        act = self.columns()
+        ix = np.ix_(rows, act)
+        bx = self.b_x[ix]
+        by = self.b_y[ix]
+        on = self.b_on[ix]
+        ang = np.arctan2(self.b_vy[ix], self.b_vx[ix])
+        stuck = on & ~self.free(rows[:, None], bx, by, BULLET_R)
         for k in range(1, 11):
             if not stuck.any():
                 break
@@ -878,10 +887,10 @@ class VecEnv:
             bx = np.where(fix, nx, bx)
             by = np.where(fix, ny, by)
             stuck = stuck & ~ok   # 已经找到合法位置的，从待处理集合里去掉
-        self.b_x[rows] = bx
-        self.b_y[rows] = by
+        self.b_x[ix] = bx
+        self.b_y[ix] = by
         if stuck.any():
-            self.b_on[rows] = self.b_on[rows] & ~stuck   # 实在救不回来的就直接删掉这颗子弹
+            self.b_on[ix] = on & ~stuck   # 实在救不回来的就直接删掉这颗子弹
 
     # 子弹推进的主体。把一帧拆成 SUBSTEPS 个子步，每个子步里分别处理
     # x、y 两个方向的移动与撞墙反弹——这是标准做法：先沿 x 走，撞了就翻 vx 并留在原地；
@@ -893,38 +902,58 @@ class VecEnv:
         self._home(dt)    # 追踪导弹要先转向再前进
         h = dt / SUBSTEPS
         for _ in range(SUBSTEPS):
-            live = self.b_on & run[:, None]
-            if not live.any():
+            pick = self.b_on & run[:, None]     # 本子步真正要推进的 (局, 槽) 位置
+            if not pick.any():
                 return
-            rows = np.nonzero(live.any(axis=1))[0]
-            live_sub = live[rows]
-            nx = self.b_x[rows] + self.b_vx[rows] * h
+            # 只取"有子弹在飞的槽位"（act）和"有子弹在飞的局"（rows），
+            # 两者交叉出的那个小矩形块才是真正需要算的，其余 96 槽的空位一概跳过。
+            act = np.nonzero(pick.any(axis=0))[0]
+            rows = np.nonzero(pick[:, act].any(axis=1))[0]
+            ix = np.ix_(rows, act)
+            bx = self.b_x[ix]
+            by = self.b_y[ix]
+            bvx = self.b_vx[ix]
+            bvy = self.b_vy[ix]
+            live = pick[ix]
+            nx = bx + bvx * h
             # 撞墙时位置不更新、速度取反，效果就是反弹。
-            hit_x = ~self.free(rows[:, None], nx, self.b_y[rows], BULLET_R)
-            self.b_x[rows] = np.where(hit_x, self.b_x[rows], nx)
-            self.b_vx[rows] = np.where(hit_x, -self.b_vx[rows], self.b_vx[rows])
-            ny = self.b_y[rows] + self.b_vy[rows] * h
-            hit_y = ~self.free(rows[:, None], self.b_x[rows], ny, BULLET_R)
-            self.b_y[rows] = np.where(hit_y, self.b_y[rows], ny)
-            self.b_vy[rows] = np.where(hit_y, -self.b_vy[rows], self.b_vy[rows])
-            self.b_bounce[rows] += (hit_x.astype(np.int16) + hit_y.astype(np.int16))   # 累计反弹次数
+            hit_x = ~self.free(rows[:, None], nx, by, BULLET_R)
+            bx = np.where(hit_x, bx, nx)
+            bvx = np.where(hit_x, -bvx, bvx)
+            ny = by + bvy * h
+            hit_y = ~self.free(rows[:, None], bx, ny, BULLET_R)
+            by = np.where(hit_y, by, ny)
+            bvy = np.where(hit_y, -bvy, bvy)
+            self.b_x[ix] = bx
+            self.b_y[ix] = by
+            self.b_vx[ix] = bvx
+            self.b_vy[ix] = bvy
+            bounce = self.b_bounce[ix] + hit_x.astype(np.int16) + hit_y.astype(np.int16)   # 累计反弹次数
+            self.b_bounce[ix] = bounce
             # 破片弹(K_FRAG)一碰墙就炸开：本体消失，原地放出一圈碎片（shards=True）。
-            frag = live_sub & (self.b_kind[rows] == K_FRAG) & (hit_x | hit_y)
+            # 注意 rows 只是"有子弹的局"的子集，命中位置的全局局号必须写成 rows[fr]，
+            # 不能直接拿块内下标 fr 去索引环境（那样会在错误的局里炸出爆炸）。
+            frag = live & (self.b_kind[ix] == K_FRAG) & (hit_x | hit_y)
             if frag.any():
-                r, c = np.nonzero(frag)
-                self.b_on[r, c] = False
-                self._blast(r, self.b_x[r, c].copy(), self.b_y[r, c].copy(),
-                            np.full(r.size, BLAST_R * 0.7, dtype=np.float32),
-                            self.b_owner[r, c].copy(), True)
-            # 反弹次数超过 BOUNCE_LIMIT 的子弹直接消失（为什么是 7 见文件顶部说明）。
-            dead = self.b_on & run[:, None] & (self.b_bounce > BOUNCE_LIMIT)
-            if dead.any():
-                self.b_on[dead] = False
+                fr, fc = np.nonzero(frag)
+                gr = rows[fr]
+                gc = act[fc]
+                self.b_on[gr, gc] = False
+                self._blast(gr, self.b_x[gr, gc].copy(), self.b_y[gr, gc].copy(),
+                            np.full(fr.size, BLAST_R * 0.7, dtype=np.float32),
+                            self.b_owner[gr, gc].copy(), True)
             # 寿命按子步扣减，保证一帧总共扣掉 dt（而不是每个子步都扣一整个 dt）。
-            self.b_life = np.where(self.b_on & run[:, None], self.b_life - h, self.b_life)
-            gone = self.b_on & run[:, None] & (self.b_life <= 0.0)
+            life = np.where(live, self.b_life[ix] - h, self.b_life[ix])
+            self.b_life[ix] = life
+            # 反弹次数超过 BOUNCE_LIMIT 的子弹直接消失（为什么是 7 见文件顶部说明）。
+            dead = live & (bounce > BOUNCE_LIMIT)
+            if dead.any():
+                dr, dc = np.nonzero(dead)
+                self.b_on[rows[dr], act[dc]] = False
+            gone = live & (life <= 0.0)
             if gone.any():
-                self.b_on[gone] = False
+                gr, gc = np.nonzero(gone)
+                self.b_on[rows[gr], act[gc]] = False
         self._bullet_hits(run)   # 所有子步走完，再统一判定"有没有打中坦克"
 
     # 判定子弹是否打中坦克。子弹是圆、坦克是旋转正方形，精确的圆-方相交比较麻烦，
@@ -935,23 +964,27 @@ class VecEnv:
         live = self.b_on & run[:, None]
         if not live.any():
             return
+        act = np.nonzero(live.any(axis=0))[0]   # 同样只在"有子弹在飞的槽位"里找命中
         for j in range(self.p):
             rows = np.nonzero(self.t_alive[:, j] & run)[0]
             if rows.size == 0:
                 continue
+            ix = np.ix_(rows, act)
             ca = np.cos(self.ta[rows, j])[:, None]
             sa = np.sin(self.ta[rows, j])[:, None]
-            dx = self.b_x[rows] - self.tx[rows, j][:, None]
-            dy = self.b_y[rows] - self.ty[rows, j][:, None]
+            dx = self.b_x[ix] - self.tx[rows, j][:, None]
+            dy = self.b_y[ix] - self.ty[rows, j][:, None]
             # 排除破片弹本体：它只在撞墙时炸开，不会直接把坦克撞死（伤人的是它的碎片）。
-            hit = live[rows] & (self.b_kind[rows] != K_FRAG)
+            hit = live[ix] & (self.b_kind[ix] != K_FRAG)
             hit &= np.abs(dx * ca + dy * sa) <= TANK_H + BULLET_R    # 沿车头方向的偏移
             hit &= np.abs(dy * ca - dx * sa) <= TANK_H + BULLET_R    # 垂直车头方向的偏移
             if not hit.any():
                 continue
-            r, c = np.nonzero(hit)
-            self.b_on[rows[r], c] = False   # 命中后子弹消失
-            self._damage(rows[r], j, self.b_owner[rows[r], c].astype(np.int64))   # 用子弹归属做击杀归因
+            hr, hc = np.nonzero(hit)
+            gr = rows[hr]
+            gc = act[hc]
+            self.b_on[gr, gc] = False   # 命中后子弹消失
+            self._damage(gr, j, self.b_owner[gr, gc].astype(np.int64))   # 用子弹归属做击杀归因
 
     # 计算"与观察者视角无关"的那几个观测通道，并缓存起来：
     # 墙 + 子弹 + 地雷 + 道具 + 激光。这几样对 4 个座位来说完全相同，
@@ -964,7 +997,9 @@ class VecEnv:
             return self._base
         out = self.wall_bits.copy()
         # _dot_bit 把"点状实体"写到它所在的那个观测像素上（按位或进对应通道）。
-        for q in range(B_MAX):
+        # 子弹只遍历"在飞的槽位"（avg ~9 个），而不是 96 个空槽——否则每帧要空转
+        # 87 次 _dot_bit，白扔几百次 numpy 调用。
+        for q in self.columns():
             self._dot_bit(out, BIT_BULLET, self.b_x[:, q], self.b_y[:, q], self.b_on[:, q])
         for q in range(M_MAX):
             self._dot_bit(out, BIT_MINE, self.m_x[:, q], self.m_y[:, q], self.m_on[:, q])
@@ -1060,27 +1095,41 @@ class VecEnv:
         # 先把子弹位置/速度变换到"以自机为原点、自机朝向为 x 轴"的相对坐标系，
         # 这样网络看到的是"我正前方的威胁"，与自机在地图上的绝对朝向无关，
         # 学出来的策略自然就具备旋转不变性，泛化更好。
-        dx = self.b_x - self.tx[:, side][:, None]
-        dy = self.b_y - self.ty[:, side][:, None]
-        ref_ang = self.ta[:, side][:, None]
-        rx = dx * np.cos(ref_ang) + dy * np.sin(ref_ang)
-        ry = dy * np.cos(ref_ang) - dx * np.sin(ref_ang)
-        dist = np.hypot(dx, dy)
-        dist = np.where(self.b_on, dist, 1e9)   # 未启用的槽位距离设为极大，排序时自然落到最后
-        order = np.argsort(dist, axis=1)[:, :NEAR_BULLETS]   # 每局取最近的 8 个槽位
-        rows = np.arange(self.n)
-        for k in range(NEAR_BULLETS):
-            c = order[:, k]
-            sel = dist[rows, c] < 1e8   # 该局不足 8 颗子弹时，剩下的槽位整组填 0
-            out[:, b + 6 * k + 0] = np.where(sel, rx[rows, c] / 300.0, 0.0)   # 相对位置 x
-            out[:, b + 6 * k + 1] = np.where(sel, ry[rows, c] / 300.0, 0.0)   # 相对位置 y
-            vx = self.b_vx[rows, c]
-            vy = self.b_vy[rows, c]
-            # 相对速度同样旋到自机坐标系；除以 540（最快弹速 GATLING_SPEED）做归一。
-            out[:, b + 6 * k + 2] = np.where(sel, (vx * np.cos(self.ta[:, side]) + vy * np.sin(self.ta[:, side])) / 540.0, 0.0)
-            out[:, b + 6 * k + 3] = np.where(sel, (vy * np.cos(self.ta[:, side]) - vx * np.sin(self.ta[:, side])) / 540.0, 0.0)
-            out[:, b + 6 * k + 4] = np.where(sel, self.b_kind[rows, c] / 4.0, 0.0)               # 子弹种类，最大 4
-            out[:, b + 6 * k + 5] = np.where(sel, np.minimum(dist[rows, c], 300.0) / 300.0, 0.0) # 距离，截断在 300
+        # 只在"在飞的槽位"（act）里排序：96 个槽里绝大多数是空的，对整个 96 列做
+        # argsort 等于给 87 个 ±1e9 的假数据排序，纯属浪费。空槽对排序的贡献永远是
+        # 排在最后并被 sel 过滤掉，所以只排真实候选、结果与排全表完全一致。
+        act = self.columns()
+        na = int(act.size)
+        if na:
+            bx = self.b_x[:, act]
+            by = self.b_y[:, act]
+            on = self.b_on[:, act]
+            bkx = self.b_kind[:, act]
+            bvx = self.b_vx[:, act]
+            bvy = self.b_vy[:, act]
+            dx = bx - self.tx[:, side][:, None]
+            dy = by - self.ty[:, side][:, None]
+            ref_ang = self.ta[:, side][:, None]
+            ca = np.cos(ref_ang)
+            sa = np.sin(ref_ang)
+            rx = dx * ca + dy * sa
+            ry = dy * ca - dx * sa
+            dist = np.where(on, np.hypot(dx, dy), 1e9)   # 未启用的槽位距离设为极大，排序时自然落到最后
+            rows = np.arange(self.n)
+            pick_n = min(NEAR_BULLETS, na)   # 子弹不足 8 颗时只填前 pick_n 组，其余保持 0
+            order = np.argsort(dist, axis=1)[:, :pick_n]   # 每局取最近的那些槽位
+            cs = np.cos(self.ta[:, side])
+            sn = np.sin(self.ta[:, side])
+            for k in range(pick_n):
+                c = order[:, k]
+                sel = dist[rows, c] < 1e8   # 该局不足 pick_n 颗子弹时，剩下的槽位整组填 0
+                out[:, b + 6 * k + 0] = np.where(sel, rx[rows, c] / 300.0, 0.0)   # 相对位置 x
+                out[:, b + 6 * k + 1] = np.where(sel, ry[rows, c] / 300.0, 0.0)   # 相对位置 y
+                # 相对速度同样旋到自机坐标系；除以 540（最快弹速 GATLING_SPEED）做归一。
+                out[:, b + 6 * k + 2] = np.where(sel, (bvx[rows, c] * cs + bvy[rows, c] * sn) / 540.0, 0.0)
+                out[:, b + 6 * k + 3] = np.where(sel, (bvy[rows, c] * cs - bvx[rows, c] * sn) / 540.0, 0.0)
+                out[:, b + 6 * k + 4] = np.where(sel, bkx[rows, c] / 4.0, 0.0)               # 子弹种类，最大 4
+                out[:, b + 6 * k + 5] = np.where(sel, np.minimum(dist[rows, c], 300.0) / 300.0, 0.0) # 距离，截断在 300
         b += 6 * NEAR_BULLETS
         # ---- 末尾 4 维：本局得分、死亡停顿进度、本局是否已结束、本回合时间进度 ----
         out[:, b + 0] = self.t_score[:, side] / 10.0

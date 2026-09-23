@@ -3,7 +3,7 @@
 #
 # 在项目中的位置：
 #   selfplay.py 每走一步就把 (观测, 特征, 动作, 奖励, 下一观测, 下一特征, done)
-#   交给 NStep → NStep 攒够 nstep 步后吐出一段打包样本 → 交给 Replay 存起来
+#   交给 NStep → NStep 攒够 nstep 步后吐出一批打包样本 → 交给 Replay 整批存起来
 #   → 训练时 Replay.sample() 按优先级抽一批 → 算完 TD 误差再 update_prio() 写回。
 #
 # 为什么要 n 步回报：这个任务的奖励极其稀疏，一局 30 秒只在结束时给 ±1，
@@ -15,8 +15,6 @@
 # 训练算力被浪费；按 TD 误差加权抽样能把算力集中到还没学明白的局面上。代价是
 # 改变了样本分布、引入估计偏差，所以必须配重要性权重 w 一起用。
 # =============================================================================
-
-from collections import deque
 
 import numpy as np
 
@@ -55,22 +53,40 @@ class Replay:
         self.head = 0
         self.size = 0
 
-    # 写入一条样本。写满一圈后自动覆盖最老的样本：策略一直在变，太老的样本和
-    # 当前策略的分布已经对不上，留着反而有害。
-    def push(self, obs, feat, act, ret, next_obs, next_feat, done):
-        i = self.head
-        self.obs[i] = obs
-        self.feat[i] = feat
-        self.act[i] = act
-        self.ret[i] = ret
-        self.next_obs[i] = next_obs
-        self.next_feat[i] = next_feat
-        self.done[i] = done
-        # 新样本的优先级直接给当前最大值，保证它至少被抽中一次、能算出真实 TD 误差，
-        # 之后再由 update_prio() 决定它值不值得反复抽
-        self.prio[i] = self.max_prio
-        self.head = (self.head + 1) % self.cap
-        self.size = min(self.size + 1, self.cap)
+    # 批量写入一批样本（配合批量 NStep 用）。写满一圈后自动覆盖最老的样本：
+    # 策略一直在变，太老的样本和当前策略的分布已经对不上，留着反而有害。
+    # 新样本的优先级一律给当前最大值，保证它至少被抽中一次、能算出真实 TD 误差，
+    # 之后再由 update_prio() 决定它值不值得反复抽。
+    # 每帧要落库的样本有上千条（1024 个时间线各约一条），逐条写是 7 次带 Python 开销
+    # 的数组赋值 = 每帧上万次 Python 调用；改成整批一次搬运后，实际执行的就是几条大
+    # memcpy——这一步从 9 毫秒降到 1 毫秒以内。
+    # 环形池跨过尾部时会折成两段写；极端情况下（一批比整个池子还大）只保留最新的一批。
+    def push_batch(self, obs, feat, act, ret, next_obs, next_feat, done):
+        t = obs.shape[0]
+        if t == 0:
+            return
+        if t > self.cap:
+            obs, feat, act, ret, next_obs, next_feat, done = (
+                x[-self.cap:] for x in (obs, feat, act, ret, next_obs, next_feat, done))
+            t = self.cap
+        cut = self.cap - self.head
+        parts = [(self.head, cut), (0, t - cut)] if t > cut else [(self.head, t)]
+        off = 0
+        for a, n in parts:
+            if n <= 0:
+                continue
+            sl = slice(a, a + n)
+            self.obs[sl] = obs[off:off + n]
+            self.feat[sl] = feat[off:off + n]
+            self.act[sl] = act[off:off + n]
+            self.ret[sl] = ret[off:off + n]
+            self.next_obs[sl] = next_obs[off:off + n]
+            self.next_feat[sl] = next_feat[off:off + n]
+            self.done[sl] = done[off:off + n]
+            self.prio[sl] = self.max_prio
+            off += n
+        self.head = (self.head + t) % self.cap
+        self.size = min(self.size + t, self.cap)
 
     # 按优先级抽 n 条样本。
     # 返回 (观测, 特征, 动作, 回报, 下一观测, 下一特征, done, 重要性权重, 下标)；
@@ -105,46 +121,100 @@ class Replay:
         self.max_prio = max(self.max_prio, float(self.prio[slot].max()))
 
 
-# n 步回报累加器。
+# n 步回报累加器（整批数组版）。
 # 「流」= 一条独立的决策序列，编号 = 环境序号 × 座位数 + 座位号（见 selfplay.py）：
 # 同一局里每个座位都是独立智能体，必须各自维护自己的 n 步队列，不能混在一起。
-# 每个流一个长度 nstep 的 deque：
-#   攒满 nstep 步 → 打包成一段吐出去；
-#   中途遇到 done  → 把队列里剩下的全部打包吐出去，否则这段经验会永远压在队列里。
+#
+# 为什么是整批数组，而不是"每条流一个 deque"：
+#   训练一帧要处理 256 局 × 4 座位 = 1024 条流。用 deque 就得写 1024 次 Python 循环，
+#   每帧上万个 Python 调用（deque.append、元组打包、生成器），实测独占整轮迭代 25%
+#   的时间，而真正干活的时间（算 n 步折扣累加）不到其中的十分之一。
+#   改成"所有流共用一组 numpy 数组 + 全局帧号取模定位"之后，一帧只做几次数组运算。
+#
+# 三条关键设计：
+#   1) 环形缓冲按"全局帧号 % nstep"定位。每条流每帧都往同一个相对位置写，于是所有
+#      流的写位置相同，写入退化成一次连续切片赋值，不需要对 1024 条流逐个 scatter
+#      （scatter 会把省下来的时间又赔回去）。无效帧也照写不误，反正不会被读到。
+#   2) len[] 记录每条流"当前攒了几步"，取代 deque 的长度。
+#   3) 不变式：某条流无效 ⟹ 它的队列为空。这不是巧合——座位阵亡或回合结束的那一帧
+#      本身是有效的（帧开始时还活着）且 done=1，队列会被一次吐空；此后无效的帧没有
+#      任何残留可攒。所以无效帧直接清 len 与旧行为完全一致。
+#
+# 语义与旧的 deque 版本逐条对齐：
+#   攒满 nstep 步 → 打包成一条 (首状态, 首动作, Σγ^k·r_k, 末状态, done=0)
+#   遇到 done    → 把队列里每一步都当成一段的起点依次吐出，吐完清空，done 一律记 1.0
+#   （done 处记 1.0 是为了不去 bootstrap 一个已经结束的局面，避免对终止后的状态高估价值）
 class NStep:
-    def __init__(self, n_envs, nstep, gamma):
-        self.n_envs = n_envs
+    def __init__(self, n_streams, nstep, gamma, obs_shape, feat_dim):
+        self.n = n_streams
         self.nstep = nstep
         self.gamma = gamma
-        self.q = [deque(maxlen=nstep) for _ in range(n_envs)]
+        # obs_shape 是打包后的观测图尺寸 (OBS_H, OBS_W)，内存与 Replay 里存的一致
+        self.obs = np.zeros((nstep, n_streams) + tuple(obs_shape), dtype=np.uint8)
+        self.feat = np.zeros((nstep, n_streams, feat_dim), dtype=np.float32)
+        self.act = np.zeros((nstep, n_streams), dtype=np.int64)
+        self.rew = np.zeros((nstep, n_streams), dtype=np.float32)
+        self.len = np.zeros(n_streams, dtype=np.int32)
+        # t 是全局帧号（每调用一次 push +1），环形写位置就是 t % nstep
+        self.t = 0
+        # 预先算好 γ^0..γ^(nstep-1)，算 n 步折扣累加时直接查表
+        self.gpick = (gamma ** np.arange(nstep)).astype(np.float32)
 
-    # 塞入一步转移，返回本次可以落库的完整样本列表。
-    # 常态下返回 0 条或 1 条（攒满 nstep 时），遇到 done 时一次返回多条。
-    def push(self, env_idx, obs, feat, act, rew, next_obs, next_feat, done):
-        out = []
-        q = self.q[env_idx]
-        q.append((obs, feat, act, rew, next_obs, next_feat, done))
-        if done:
-            # 回合结束：把队列里从最早一步起的每一步都当成一段的起点依次吐出，吐完清空。
-            # 因为只有 done 才走这里，剩下每一段的末状态都是同一个终止状态，
-            # 所以 done 一律记 1.0，训练时不会再去 bootstrap 一个已经结束的局面，
-            # 可以避免对终止后的状态做价值高估。
-            while q:
-                ret = 0.0
-                for k, item in enumerate(q):
-                    ret += (self.gamma ** k) * item[3]
-                first = q[0]
-                last = q[-1]
-                out.append((first[0], first[1], first[2], ret, last[4], last[5], 1.0))
-                q.popleft()
-        elif len(q) == self.nstep:
-            # 攒满 nstep 步：整段打包成一条 (首状态, 首动作, n 步折扣回报, 末状态, done=0)。
-            # 折扣累加是 Σ γ^k r_k，k 用队列内的相对步数；
-            # 末状态留给 selfplay.py 做 bootstrap：目标 = ret + γ^NSTEP · 目标网络Q(末状态)。
-            ret = 0.0
-            for k, item in enumerate(q):
-                ret += (self.gamma ** k) * item[3]
-            first = q[0]
-            last = q[-1]
-            out.append((first[0], first[1], first[2], ret, last[4], last[5], 0.0))
-        return out
+    # 塞入整批一步转移，返回"本次可以落库的样本"。
+    #   valid/obs/feat/act/rew/next_obs/next_feat/done 都是 (n_streams, ...) 的整批数组
+    #   （无效的流只是不参与吐出，但照常写进环形缓冲）
+    # 返回 (obs, feat, act, ret, next_obs, next_feat, done) 或 None（本帧没有样本落库）。
+    def push(self, valid, obs, feat, act, rew, next_obs, next_feat, done):
+        p = self.t % self.nstep
+        self.obs[p] = obs
+        self.feat[p] = feat
+        self.act[p] = act
+        self.rew[p] = rew
+        # 有效流攒一步；无效流清 0（见上面第 3) 条不变式）。攒满后不再增长，封顶在 nstep。
+        self.len = np.where(valid, np.minimum(self.len + 1, self.nstep), 0)
+        self.t += 1
+        n = self.len   # 队列实际长度；注意 self.len 后面会被整体替换，n 保留的是替换前的值
+        sidx, midx, lidx, dfin = [], [], [], []
+        # ---- 情况 A：这一帧遇到 done ----
+        # 队列里每一步都是一段样本的起点：样本 m 用第 m 步的状态，回报只累加到末步为止，
+        # 全部标 done=1（不同样本的续接长度不同，所以要按 m 逐个算，见下面的累加循环）。
+        fin = valid & done
+        if fin.any():
+            s = np.nonzero(fin)[0]
+            l = n[s]
+            cnt = np.cumsum(l)
+            sidx.append(s[np.repeat(np.arange(s.size), l)])
+            # 每条样本在它自己队列里的序号 0,1,2,...（用累积和拼出来，避免 Python 循环）
+            midx.append(np.arange(int(cnt[-1])) - np.repeat(cnt - l, l))
+            lidx.append(np.repeat(l, l))
+            dfin.append(np.ones(int(cnt[-1]), dtype=np.float32))
+        # ---- 情况 B：攒满 nstep 步 ----
+        # 每帧每流最多吐一条：起点是队列最老的元素，末状态就是本帧的 next_obs。
+        full = valid & ~done & (n >= self.nstep)
+        if full.any():
+            s = np.nonzero(full)[0]
+            sidx.append(s)
+            midx.append(np.zeros(s.size, dtype=np.int64))
+            lidx.append(np.full(s.size, self.nstep, dtype=np.int64))
+            dfin.append(np.zeros(s.size, dtype=np.float32))
+        if not sidx:
+            return None
+        s = np.concatenate(sidx)
+        m = np.concatenate(midx)
+        l = np.concatenate(lidx)
+        # pos：这条样本在环形缓冲里的位置。队列最老的元素在当前写位置往前 (l-1) 格，
+        # 再往后数 m 格就是第 m 个元素。取模后落在 [0, 2*nstep)，下面统一再取一次模。
+        pos = ((p - l + 1) % self.nstep) + m
+        ret = np.zeros(s.size, dtype=np.float32)
+        for k in range(self.nstep):
+            ok = (m + k) < l   # 样本 m 只累加它后面还剩下的步数（done 的长短不一）
+            if not ok.any():
+                break
+            ret += np.where(ok, self.rew[(pos + k) % self.nstep, s] * self.gpick[k], 0.0)
+        pos %= self.nstep
+        # 遇到 done 的流已经"把队列一次吐空"，长度必须归零；否则它的下一次队列
+        # 会把上一段残留下来的长度算进去，吐出的样本起点就错位了。
+        # 注意上面算 ret 用的是替换前的 n，所以这一步放在最后做。
+        self.len = np.where(fin, 0, self.len)
+        return (self.obs[pos, s], self.feat[pos, s], self.act[pos, s], ret,
+                next_obs[s], next_feat[s], np.concatenate(dfin))

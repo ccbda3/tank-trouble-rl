@@ -341,7 +341,9 @@ def main():
     replay = buffer.Replay(config.REPLAY_CAP, (tank_vec.OBS_H, tank_vec.OBS_W), feat_dim)
     # n-step 队列的"时间线"数 = 环境数 × 座位数：每个 (环境, 座位) 是一条独立的时间线，
     # 各自的 n-step 缓冲不能混在一起（不同座位之间没有时间连续性）。
-    nstep = buffer.NStep(args.envs * players, config.NSTEP, config.GAMMA)
+    # 传观测图尺寸和特征维度是因为批量版内部要用数组整批存放队列内容。
+    nstep = buffer.NStep(args.envs * players, config.NSTEP, config.GAMMA,
+                         (tank_vec.OBS_H, tank_vec.OBS_W), feat_dim)
 
     # 把 256 个并行环境分成 4 组，用来混合"自对弈数据"和"打强敌数据"：
     #   第 0 组：4 个座位全部由当前策略驱动 —— 纯自对弈，提供大规模、水平匹配的数据；
@@ -575,19 +577,22 @@ def main():
         # obs/act/rew 都是毫无意义的"死亡停顿帧"（引擎已不再驱动它，动作和奖励都是空的），
         # 把它们当经验灌进池子等于给网络喂噪声。
         valid = before & running[:, None]
-        for i in range(args.envs):
-            for j in range(players):
-                if not valid[i, j]:
-                    continue
-                # stream 编号 s = 环境序号 × 座位数 + 座位号：把二维的 (环境, 座位) 展平成
-                # 一维时间线编号，和 NStep 初始化时的 n_envs = 环境数 × 座位数 对应，
-                # 保证每条 (环境, 座位) 时间线都有自己独立的 n-step 队列。
-                s = i * players + j
-                # nstep.push 会返回 0 条或多条"已经凑够 NSTEP 步"的 n-step 转移，
-                # 逐条转存进回放池——池子里存的是 n-step 回报，不是单步奖励。
-                for t in nstep.push(s, packs[j][i], feats[j][i], acts[i, j], rew[i, j],
-                                    packs_next[j][i], feats_next[j][i], float(done[i, j])):
-                    replay.push(t[0], t[1], t[2], t[3], t[4], t[5], t[6])
+        # stream 编号 s = 环境序号 × 座位数 + 座位号：把二维的 (环境, 座位) 展平成
+        # 一维时间线编号，和 NStep 初始化时的 n_streams = 环境数 × 座位数 对应，
+        # 保证每条 (环境, 座位) 时间线都有自己独立的 n-step 队列。
+        # np.stack(axis=1) 把 4 个座位的观测拼成 (环境, 座位, H, W)，再 reshape 成
+        # (环境×座位, H, W) 就是零拷贝视图，索引恰好是 i*座位数 + j，与 stream 编号一致。
+        shape = (tank_vec.OBS_H, tank_vec.OBS_W)
+        pk = np.stack(packs, axis=1).reshape(-1, *shape)
+        nk = np.stack(packs_next, axis=1).reshape(-1, *shape)
+        ft = np.stack(feats, axis=1).reshape(-1, feat_dim)
+        nf = np.stack(feats_next, axis=1).reshape(-1, feat_dim)
+        # nstep.push 整批推进所有时间线，返回本帧"已经凑够 NSTEP 步 / 遇到 done"的样本；
+        # 一条都没凑够时返回 None。样本里存的是 n-step 折扣回报，不是单步奖励。
+        out = nstep.push(valid.reshape(-1), pk, ft, acts.reshape(-1), rew.reshape(-1),
+                         nk, nf, done.reshape(-1))
+        if out is not None:
+            replay.push_batch(*out)
         # 打完的局在这里统一重置开新局。必须放在采样和存池之后：上面用到的终局观测、
         # 奖励、名次都是"打完那一刻"的状态，提前重置会把它们覆盖掉。
         rows = np.nonzero(new)[0]
