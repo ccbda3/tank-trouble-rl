@@ -15,6 +15,9 @@ COLORS = [(214, 64, 64), (64, 122, 224), (72, 190, 100), (232, 186, 72)]
 
 DTYPE = np.dtype([
     ("round", np.int32),
+    ("maze", np.int32),
+    ("winner", np.int8),
+    ("pause", np.float32),
     ("step", np.int32),
     ("rframe", np.int32),
     ("score", np.int32, (PLAYERS_MAX,)),
@@ -52,6 +55,9 @@ ITEM_COLOR = {
 def _fill(s, env, i):
     p = env.p
     s["round"] = env.rounds[i]
+    s["maze"] = env.maze_seq[i]
+    s["winner"] = env.winner[i]
+    s["pause"] = env.pause[i]
     s["step"] = env.ep_steps[i]
     s["rframe"] = env.round_frames[i]
     s["score"][:p] = env.t_score[i]
@@ -158,6 +164,31 @@ def draw_scene(screen, s, wall_surf=None, p=PLAYERS_MAX):
         elif w > 0:
             pygame.draw.circle(screen, ITEM_COLOR[WEAPON_KINDS[w - 1]], (int(x), int(y)), int(h + 3), 1)
     return screen
+
+
+def draw_pause_overlay(screen, s, font):
+    import pygame
+    left = float(s["pause"])
+    if left <= 0.0:
+        return
+    W, H = int(tank.WIDTH), int(tank.HEIGHT)
+    veil = pygame.Surface((W, H))
+    veil.set_alpha(150)
+    veil.fill((0, 0, 0))
+    screen.blit(veil, (0, 0))
+    w = int(s["winner"])
+    if w >= 0:
+        head = "P%d 存活到最后" % (w + 1)
+        col = COLORS[w % len(COLORS)]
+    else:
+        head = "本回合平局（超时）"
+        col = (200, 200, 200)
+    lines = [head, "%.1f 秒后换新迷宫、全员重生" % left]
+    y = H // 2 - 34
+    for k, txt in enumerate(lines):
+        surf = font.render(txt, True, col if k == 0 else (170, 170, 180))
+        screen.blit(surf, ((W - surf.get_width()) // 2, y))
+        y += 30
 
 
 def render_rgb(env, i=0):
@@ -305,12 +336,13 @@ def follow(envs=VIEW_ENVS, seed=20240923):
         for i in range(envs):
             _fill(snap[i], env, i)
         for i in range(envs):
-            key = (int(snap[i]["round"]), i)
+            key = (int(snap[i]["maze"]), i)
             if key != wall_key[i]:
                 wall_key[i] = key
                 wall_surf[i] = build_walls(snap[i])
         s = snap[env_index]
         draw_scene(screen, s, wall_surf[env_index], envs_p)
+        draw_pause_overlay(screen, s, font)
         st = None if stat is None else stat[0]
         pygame.draw.rect(screen, (14, 14, 18), (0, H, W, HUD))
         line1 = "跟随检查点 %d 步   对局 %d/%d   比分 %s   回合 %d   回合进度 %.0f%%" % (
@@ -365,12 +397,13 @@ def viewer(env_index=0):
             if e.type == pygame.KEYDOWN and pygame.K_1 <= e.key <= pygame.K_4:
                 env_index = e.key - pygame.K_1
         s = state[env_index]
-        key = (int(s["round"]), env_index)
+        key = (int(s["maze"]), env_index)
         if key != wall_key:
             wall_key = key
             wall_surf = build_walls(s)
 
         draw_scene(screen, s, wall_surf)
+        draw_pause_overlay(screen, s, font)
         st = stat[0]
         pygame.draw.rect(screen, (14, 14, 18), (0, H, W, HUD))
         w = int(s["tank"][0, 4])

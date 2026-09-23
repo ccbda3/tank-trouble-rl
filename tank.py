@@ -359,6 +359,14 @@ class World:
             picks.append((x, y))
             if len(picks) == len(self.tanks):
                 break
+        if len(picks) < len(self.tanks):
+            for i, j in cells:
+                x, y = cell_center(i, j)
+                if any(abs(px - x) < 1.0 and abs(py - y) < 1.0 for px, py in picks):
+                    continue
+                picks.append((x, y))
+                if len(picks) == len(self.tanks):
+                    break
         for t, (x, y) in zip(self.tanks, picks):
             t.x = x
             t.y = y

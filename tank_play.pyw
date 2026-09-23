@@ -280,7 +280,7 @@ def start(m, lv):
     global world, laika, mode, level, stage
     mode = m
     level = lv
-    world = World(None, tanks=m)
+    world = World(None, tanks=2 if m == 1 else m)
     laika = tank.Laika(lv, seed=m * 31 + lv) if m == 1 else None
     stage = 0
 

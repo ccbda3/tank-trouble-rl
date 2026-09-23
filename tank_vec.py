@@ -115,6 +115,7 @@ class VecEnv:
         self.t_weapon = np.zeros((self.n, self.p), dtype=np.int8)
         self.t_score = np.zeros((self.n, self.p), dtype=np.int32)
         self.round_frames = np.zeros(self.n, dtype=np.int32)
+        self.maze_seq = np.zeros(self.n, dtype=np.int32)
         self.picked = np.zeros((self.n, self.p), dtype=bool)
         self.t_px = np.zeros((self.n, self.p), dtype=np.float32)
         self.t_py = np.zeros((self.n, self.p), dtype=np.float32)
@@ -164,11 +165,6 @@ class VecEnv:
         self.reset()
 
     def reset(self):
-        for i in range(self.n):
-            seed = int(self.rng.integers(1 << 30))
-            vwall, hwall = ref.generate(seed)
-            self.vwall[i] = vwall
-            self.hwall[i] = hwall
         self.t_score[:] = 0
         self.kills[:] = 0
         self.ep_kills[:] = 0
@@ -191,7 +187,12 @@ class VecEnv:
         self.place[rows] = 0
         self.suicide[rows] = False
         self.round_frames[rows] = 0
+        self.maze_seq[rows] += 1
         self._base = None
+        for i in rows:
+            vwall, hwall = ref.generate(int(self.rng.integers(1 << 30)))
+            self.vwall[i] = vwall
+            self.hwall[i] = hwall
         self.picked[rows] = False
         self.spawn_t[rows] = CAPSULE_EVERY * 0.5
         cells = self.rng.integers(0, NC * NR, size=(rows.size, self.p))
