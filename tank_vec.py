@@ -14,14 +14,14 @@ from tank import (
 W_NORMAL, W_GATLING, W_MISSILE, W_FRAG, W_DOUBLE, W_LASER, W_SHIELD, W_MINE = range(8)
 WEAPON_SECONDS = np.array([0.0] + [WEAPON_TIME[k] for k in WEAPON_KINDS], dtype=np.float32)
 K_BULLET, K_GATLING, K_SHARD, K_MISSILE, K_FRAG = range(5)
-B_MAX = 48
-M_MAX = 3
-C_MAX = 3
-Z_MAX = 6
-L_MAX = 3
+B_MAX = 96
+M_MAX = 5
+C_MAX = 4
+Z_MAX = 8
+L_MAX = 4
 SUBSTEPS = 4
 NEAR_BULLETS = 8
-ROUND_LIMIT = 1200
+ROUND_LIMIT = 1800
 CTRL = np.array(ref.ACTION_CTRL, dtype=np.float32)
 
 OBS_RES = 16
@@ -150,13 +150,17 @@ class VecEnv:
         self.spawn_t = np.full(self.n, CAPSULE_EVERY * 0.5, dtype=np.float32)
         self.pause = np.zeros(self.n, dtype=np.float32)
         self.over = np.zeros(self.n, dtype=bool)
-        self.dead = np.full(self.n, -1, dtype=np.int8)
+        self.winner = np.full(self.n, -1, dtype=np.int8)
+        self.just_died = np.zeros((self.n, self.p), dtype=bool)
+        self.place = np.zeros((self.n, self.p), dtype=np.int8)
+        self.suicide = np.zeros((self.n, self.p), dtype=bool)
         self.kills = np.zeros((self.n, self.p), dtype=np.int32)
         self.rounds = np.zeros(self.n, dtype=np.int32)
         self.ep_kills = np.zeros((self.n, self.p), dtype=np.int32)
         self.ep_deaths = np.zeros((self.n, self.p), dtype=np.int32)
         self.ep_steps = np.zeros(self.n, dtype=np.int32)
         self.wall_bits = np.zeros((self.n, OBS_H, OBS_W), dtype=np.uint8)
+        self._base = None
         self.reset()
 
     def reset(self):
@@ -182,12 +186,16 @@ class VecEnv:
         self.c_on[rows] = False
         self.pause[rows] = 0.0
         self.over[rows] = False
-        self.dead[rows] = -1
+        self.winner[rows] = -1
+        self.just_died[rows] = False
+        self.place[rows] = 0
+        self.suicide[rows] = False
         self.round_frames[rows] = 0
+        self._base = None
         self.picked[rows] = False
         self.spawn_t[rows] = CAPSULE_EVERY * 0.5
         cells = self.rng.integers(0, NC * NR, size=(rows.size, self.p))
-        for _ in range(40):
+        for _ in range(60):
             ci = cells // NR
             cj = cells % NR
             x = WALL_W + ci * PITCH + CORR_W * 0.5
@@ -260,27 +268,33 @@ class VecEnv:
 
     def step(self, ctrl, dt):
         run = ~self.over
+        self._base = None
+        before = self.t_alive.copy()
         if run.any():
             self.picked[:] = False
             self._drive(ctrl, dt, run)
             self._items(dt, run)
             self._bullets(dt, run)
-            newly = run & (self.t_alive.sum(axis=1) < self.p)
-            if newly.any():
-                self.over |= newly
-                self.pause[newly] = DEATH_PAUSE
-                self.rounds[newly] += 1
-                for j in range(self.p):
-                    self.ep_deaths[newly, j] += (~self.t_alive[newly, j]).astype(np.int32)
+        self.just_died = before & ~self.t_alive
         self.ep_steps[run] += 1
+        alive_cnt = self.t_alive.sum(axis=1)
         playing = run & ~self.over
         self.round_frames[playing] += 1
-        timed = playing & (self.round_frames >= ROUND_LIMIT)
-        if timed.any():
-            self.over |= timed
-            self.pause[timed] = DEATH_PAUSE
-            self.rounds[timed] += 1
-            self.dead[timed] = -1
+        ended = playing & ((alive_cnt <= 1) | (self.round_frames >= ROUND_LIMIT))
+        if ended.any():
+            self.over |= ended
+            self.pause[ended] = DEATH_PAUSE
+            self.rounds[ended] += 1
+            one = ended & (alive_cnt == 1)
+            r = np.nonzero(one)[0]
+            if r.size:
+                self.winner[r] = self.t_alive[r].argmax(axis=1)
+                self.place[r, self.winner[r]] = 1
+            for j in range(self.p):
+                self.ep_deaths[ended, j] += (~self.t_alive[ended, j]).astype(np.int32)
+        r, j = np.nonzero(self.just_died & run[:, None])
+        if r.size:
+            self.place[r, j] = np.maximum(alive_cnt[r] + 1, 2)
         self.pause = np.maximum(0.0, self.pause - dt)
         done = self.over & (self.pause <= 0.0)
         if done.any():
@@ -451,11 +465,13 @@ class VecEnv:
             r = rows[shielded]
             self.t_weapon[r, side] = W_NORMAL
             self.t_wt[r, side] = 0.0
+            if not isinstance(killer, (int, np.integer)):
+                killer = np.asarray(killer)[~shielded]
             rows = rows[~shielded]
             if rows.size == 0:
                 return
         self.t_alive[rows, side] = False
-        self.dead[rows] = side
+        self.suicide[rows, side] |= np.asarray(killer == side)
         if isinstance(killer, (int, np.integer)):
             if killer != side:
                 self.t_score[rows, killer] += 1
@@ -689,11 +705,10 @@ class VecEnv:
             self.b_on[rows[r], c] = False
             self._damage(rows[r], j, self.b_owner[rows[r], c].astype(np.int64))
 
-    def obs_pack(self, side):
+    def _obs_base(self):
+        if self._base is not None:
+            return self._base
         out = self.wall_bits.copy()
-        for j in range(self.p):
-            self._blit_bit(out, BIT_SELF if j == side else BIT_ENEMY,
-                           self.tx[:, j], self.ty[:, j], self.t_alive[:, j])
         for q in range(B_MAX):
             self._dot_bit(out, BIT_BULLET, self.b_x[:, q], self.b_y[:, q], self.b_on[:, q])
         for q in range(M_MAX):
@@ -713,6 +728,14 @@ class VecEnv:
                 sel = on & (t <= steps)
                 f = t / np.maximum(steps, 1)
                 self._dot_bit(out, BIT_BEAM, x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, sel)
+        self._base = out
+        return out
+
+    def obs_pack(self, side):
+        out = self._obs_base().copy()
+        for j in range(self.p):
+            self._blit_bit(out, BIT_SELF if j == side else BIT_ENEMY,
+                           self.tx[:, j], self.ty[:, j], self.t_alive[:, j])
         return out
 
     def _blit_bit(self, out, bit, x, y, mask):

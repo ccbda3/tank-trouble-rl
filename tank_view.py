@@ -10,15 +10,17 @@ from tank_vec import B_MAX, C_MAX, L_MAX, M_MAX, NC, NR, ROUND_LIMIT, WEAPON_KIN
 SHM_NAME = "tank_view_state"
 STATS_NAME = "tank_view_stats"
 VIEW_ENVS = 4
+PLAYERS_MAX = 4
+COLORS = [(214, 64, 64), (64, 122, 224), (72, 190, 100), (232, 186, 72)]
 
 DTYPE = np.dtype([
     ("round", np.int32),
     ("step", np.int32),
     ("rframe", np.int32),
-    ("score", np.int32, (3,)),
+    ("score", np.int32, (PLAYERS_MAX,)),
     ("vwall", np.uint8, (NC + 1, NR)),
     ("hwall", np.uint8, (NR + 1, NC)),
-    ("tank", np.float32, (3, 6)),
+    ("tank", np.float32, (PLAYERS_MAX, 6)),
     ("bullet", np.float32, (B_MAX, 5)),
     ("mine", np.float32, (M_MAX, 4)),
     ("capsule", np.float32, (C_MAX, 4)),
@@ -32,7 +34,7 @@ STATS = np.dtype([
     ("eps", np.float32),
     ("spm", np.float32),
     ("buf", np.float32),
-    ("win", np.float32),
+    ("place", np.float32),
     ("draw", np.float32),
     ("span", np.float32),
     ("rpm", np.float32),
@@ -100,13 +102,13 @@ def build_walls(s):
     return surf
 
 
-def draw_scene(screen, s, wall_surf=None):
+def draw_scene(screen, s, wall_surf=None, p=PLAYERS_MAX):
     import pygame
     screen.fill((0, 0, 0))
     if wall_surf is None:
         wall_surf = build_walls(s)
     screen.blit(wall_surf, (0, 0))
-    colors = [(214, 64, 64), (64, 122, 224), (72, 190, 100)]
+    colors = COLORS
     for q in range(Z_MAX):
         if s["blast"][q, 4] > 0:
             k = float(s["blast"][q, 3]) / 0.5
@@ -137,7 +139,7 @@ def draw_scene(screen, s, wall_surf=None):
             r = 2 if s["bullet"][q, 2] in (0.0, 1.0) else 3
             pygame.draw.circle(screen, (255, 255, 255),
                                (int(s["bullet"][q, 0]), int(s["bullet"][q, 1])), r)
-    for i in range(3):
+    for i in range(p):
         if s["tank"][i, 3] <= 0:
             continue
         x, y, a = float(s["tank"][i, 0]), float(s["tank"][i, 1]), float(s["tank"][i, 2])
@@ -197,14 +199,14 @@ class Writer:
         for i in range(upto):
             _fill(self.state[i], env, i)
 
-    def stats(self, loss, rew, eps, spm, buf, win, draw, span, rpm, steps, evals):
+    def stats(self, loss, rew, eps, spm, buf, place, draw, span, rpm, steps, evals):
         s = self.stat[0]
         s["loss"] = loss
         s["rew"] = rew
         s["eps"] = eps
         s["spm"] = spm
         s["buf"] = buf
-        s["win"] = win
+        s["place"] = place
         s["draw"] = draw
         s["span"] = span
         s["rpm"] = rpm
@@ -227,10 +229,12 @@ def follow(envs=VIEW_ENVS, seed=20240923):
     import network
     import selfplay
 
-    env = tank_vec.VecEnv(envs, 2, seed=seed)
+    env = tank_vec.VecEnv(envs, config.PLAYERS, seed=seed)
+    envs_p = env.p
     feat_dim = env.feat(0).shape[1]
     net = network.make(feat_dim)
     net.eval()
+    acts = np.zeros((envs, envs_p), dtype=np.int64)
     bot = None
     mode = 0
     snap = np.zeros((envs,), dtype=DTYPE)
@@ -288,16 +292,14 @@ def follow(envs=VIEW_ENVS, seed=20240923):
                     ck_mtime = None
 
         with torch.no_grad():
-            a0 = net.act(network.obs_tensor(env.obs_pack(0)), network.feat_tensor(env.feat(0)),
-                         0.0).cpu().numpy()
+            for j in range(envs_p):
+                acts[:, j] = net.act(network.obs_tensor(env.obs_pack(j)),
+                                     network.feat_tensor(env.feat(j)), 0.0).cpu().numpy()
             if mode == 1 and bot is not None:
-                a1 = bot.act(env, 1, 0)
-            else:
-                a1 = net.act(network.obs_tensor(env.obs_pack(1)), network.feat_tensor(env.feat(1)),
-                             0.0).cpu().numpy()
-        ctrl = np.zeros((envs, 2, 3), dtype=np.float32)
-        ctrl[:, 0] = tank_vec.CTRL[a0]
-        ctrl[:, 1] = tank_vec.CTRL[a1]
+                acts[:, 0] = bot.act(env, 0, [k for k in range(1, envs_p)])
+        ctrl = np.zeros((envs, envs_p, 3), dtype=np.float32)
+        for j in range(envs_p):
+            ctrl[:, j] = tank_vec.CTRL[acts[:, j]]
         env.step(ctrl, dt)
 
         for i in range(envs):
@@ -308,11 +310,11 @@ def follow(envs=VIEW_ENVS, seed=20240923):
                 wall_key[i] = key
                 wall_surf[i] = build_walls(snap[i])
         s = snap[env_index]
-        draw_scene(screen, s, wall_surf[env_index])
+        draw_scene(screen, s, wall_surf[env_index], envs_p)
         st = None if stat is None else stat[0]
         pygame.draw.rect(screen, (14, 14, 18), (0, H, W, HUD))
-        line1 = "跟随检查点 %d 步   对局 %d/%d   比分 %d : %d   回合 %d   回合进度 %.0f%%" % (
-            ck_steps, env_index + 1, envs, int(s["score"][0]), int(s["score"][1]),
+        line1 = "跟随检查点 %d 步   对局 %d/%d   比分 %s   回合 %d   回合进度 %.0f%%" % (
+            ck_steps, env_index + 1, envs, "/".join(str(int(v)) for v in s["score"]),
             int(s["round"]), 100.0 * min(1.0, int(s["rframe"]) / float(ROUND_LIMIT)))
         screen.blit(font.render(line1, True, (230, 230, 235)), (10, H + 4))
         screen.blit(font.render("1-4 切台   M 切对手   ESC 退出", True, (140, 140, 150)), (560, H + 4))
@@ -323,8 +325,8 @@ def follow(envs=VIEW_ENVS, seed=20240923):
             line3 = "训练进程未开启，仅看当前检查点的对局"
         else:
             names = ("随机", "脚本1", "脚本2", "脚本3", "快照")
-            line3 = "训练 ε %.2f   胜率 %.0f%%   平局 %.0f%%   回合 %.1f 秒   评测: %s" % (
-                float(st["eps"]), 100.0 * float(st["win"]), 100.0 * float(st["draw"]),
+            line3 = "训练 ε %.2f   名次 %.2f（随机 2.5）   平局 %.0f%%   回合 %.1f 秒   评测胜率: %s" % (
+                float(st["eps"]), float(st["place"]), 100.0 * float(st["draw"]),
                 float(st["span"]),
                 " ".join("%s%.0f%%" % (n, 100.0 * float(v)) for n, v in zip(names, st["eval"])))
         screen.blit(font.render(line3, True, (150, 150, 160)), (10, H + 48))
@@ -372,15 +374,15 @@ def viewer(env_index=0):
         st = stat[0]
         pygame.draw.rect(screen, (14, 14, 18), (0, H, W, HUD))
         w = int(s["tank"][0, 4])
-        line1 = "对局 %d   比分 %d : %d   回合 %d   武器 %s   回合进度 %.0f%%" % (
-            env_index + 1, int(s["score"][0]), int(s["score"][1]), int(s["round"]),
+        line1 = "对局 %d   比分 %s   回合 %d   武器 %s   回合进度 %.0f%%" % (
+            env_index + 1, "/".join(str(int(v)) for v in s["score"]), int(s["round"]),
             WEAPON_KINDS[w - 1] if w > 0 else "普通弹",
             100.0 * min(1.0, int(s["rframe"]) / float(ROUND_LIMIT)))
         screen.blit(font.render(line1, True, (230, 230, 235)), (10, H + 4))
         screen.blit(font.render("1-4 切台   ESC 退出", True, (140, 140, 150)), (560, H + 4))
         names = ("随机", "脚本1", "脚本2", "脚本3", "快照")
-        line2 = "ε %.2f   胜率 %.0f%%   平局 %.0f%%   回合 %.1f 秒   评测: %s" % (
-            float(st["eps"]), 100.0 * float(st["win"]), 100.0 * float(st["draw"]),
+        line2 = "ε %.2f   名次 %.2f（随机 2.5）   平局 %.0f%%   回合 %.1f 秒   评测胜率: %s" % (
+            float(st["eps"]), float(st["place"]), 100.0 * float(st["draw"]),
             float(st["span"]),
             " ".join("%s%.0f%%" % (n, 100.0 * float(v)) for n, v in zip(names, st["eval"])))
         screen.blit(font.render(line2, True, (150, 190, 235)), (10, H + 26))

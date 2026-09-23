@@ -35,23 +35,39 @@ class ScriptedBot:
         self.tick = 0
         self.cache = None
 
-    def act(self, env, side, foe):
+    def act(self, env, side, foes):
         if self.cache is None or self.tick % self.period == 0:
-            self.cache = self._decide(env, side, foe)
+            self.cache = self._decide(env, side, foes)
         self.tick += 1
         return self.cache
 
-    def _decide(self, env, side, foe):
-        n = 20
+    def _target(self, env, side, foes):
         rows = np.arange(env.n)
-        tx = env.tx[:, foe] + env.t_vx[:, foe] * self.lead
-        ty = env.ty[:, foe] + env.t_vy[:, foe] * self.lead
+        best = np.full(env.n, 1e18, dtype=np.float32)
+        tx = env.tx[:, side].copy()
+        ty = env.ty[:, side].copy()
+        vx = np.zeros(env.n, dtype=np.float32)
+        vy = np.zeros(env.n, dtype=np.float32)
+        for foe in foes:
+            d = np.where(env.t_alive[:, foe],
+                         (env.tx[:, foe] - tx) ** 2 + (env.ty[:, foe] - ty) ** 2, 1e18)
+            better = d < best
+            best = np.where(better, d, best)
+            tx = np.where(better, env.tx[:, foe], tx)
+            ty = np.where(better, env.ty[:, foe], ty)
+            vx = np.where(better, env.t_vx[:, foe], vx)
+            vy = np.where(better, env.t_vy[:, foe], vy)
+        return rows, tx + vx * self.lead, ty + vy * self.lead
+
+    def _decide(self, env, side, foes):
+        n = 20
+        rows, tx, ty = self._target(env, side, foes)
         want = np.arctan2(ty - env.ty[:, side], tx - env.tx[:, side])
         diff = (want - env.ta[:, side] + np.pi) % (2.0 * np.pi) - np.pi
         turn = np.where(np.abs(diff) < 0.05, 0, np.where(diff > 0, 1, -1))
         f = (np.arange(1, n + 1) / n)[None, :]
-        sx = env.tx[:, side][:, None] + (env.tx[:, foe] - env.tx[:, side])[:, None] * f
-        sy = env.ty[:, side][:, None] + (env.ty[:, foe] - env.ty[:, side])[:, None] * f
+        sx = env.tx[:, side][:, None] + (tx - env.tx[:, side])[:, None] * f
+        sy = env.ty[:, side][:, None] + (ty - env.ty[:, side])[:, None] * f
         clear = env.free(np.repeat(rows[:, None], n, axis=1), sx, sy, 1.0).all(axis=1)
         blocked = ~env.free(rows,
                             env.tx[:, side] + np.cos(env.ta[:, side]) * (tank.TANK_H + tank.PITCH * 0.55),
@@ -67,7 +83,7 @@ class RandomBot:
     def __init__(self, seed=0):
         self.rng = np.random.default_rng(seed)
 
-    def act(self, env, side, foe):
+    def act(self, env, side, foes):
         return self.rng.integers(0, network.ACTIONS, size=env.n)
 
 
@@ -92,48 +108,59 @@ def pick_snapshot(pfsp):
     return int(min(np.searchsorted(np.cumsum(w), RNG.random()), len(pfsp) - 1))
 
 
-def _snap_table(snapshots, snap_at, pfsp, win, lose, draw):
+def _snap_table(snapshots, snap_at, pfsp, place, rounds):
     rows = []
     for i in range(len(snapshots)):
-        tot = win[i] + lose[i] + draw[i]
-        rate = win[i] / tot if tot > 0 else 0.0
+        avg = place[i] / rounds[i] if rounds[i] > 0 else 0.0
         rows.append(["快照%d" % (i + 1), int(snap_at[i]), round(float(pfsp[i]), 3),
-                     int(win[i]), int(lose[i]), int(draw[i]), round(float(rate), 3)])
+                     int(rounds[i]), round(float(avg), 3)])
     return rows
 
 
-def run_eval(policy, opponents, n_envs, frames, seed):
-    env = tank_vec.VecEnv(n_envs, 2, seed=seed)
+def run_eval(policy, opponents, n_envs, frames, seed, players):
+    env = tank_vec.VecEnv(n_envs, players, seed=seed)
+    foes = list(range(1, players))
     out = {}
     for name, opp in opponents.items():
         wins = 0.0
         losses = 0.0
         draws = 0.0
+        place_sum = 0.0
+        place_n = 0
         span = []
         prev = env.rounds.copy()
         for _ in range(frames):
-            a0 = policy_actions(policy, env.obs_pack(0), env.feat(0), slice(0, env.n), 0.0)
-            if isinstance(opp, Snapshot):
-                a1 = opp.act(env.obs_pack(1), env.feat(1), 0.0)
-            else:
-                a1 = opp.act(env, 1, 0)
-            ctrl = np.zeros((env.n, 2, 3), dtype=np.float32)
-            ctrl[:, 0] = tank_vec.CTRL[a0]
-            ctrl[:, 1] = tank_vec.CTRL[a1]
+            ctrl = np.zeros((env.n, players, 3), dtype=np.float32)
+            ctrl[:, 0] = tank_vec.CTRL[policy_actions(policy, env.obs_pack(0), env.feat(0),
+                                                      slice(0, env.n), 0.0)]
+            for j in foes:
+                if isinstance(opp, Snapshot):
+                    a = opp.act(env.obs_pack(j), env.feat(j), 0.0)
+                else:
+                    a = opp.act(env, j, [k for k in range(players) if k != j])
+                ctrl[:, j] = tank_vec.CTRL[a]
             env.step(ctrl, DT)
             new = env.rounds - prev
             prev = env.rounds.copy()
             rows = np.nonzero(new > 0)[0]
             if rows.size:
-                dead = env.dead[rows]
-                wins += float((dead == 1).sum())
-                losses += float((dead == 0).sum())
-                draws += float((dead < 0).sum())
+                won = rows[env.winner[rows] == 0]
+                died = rows[(env.winner[rows] != 0) & (env.place[rows, 0] > 0)]
+                wins += float(won.size)
+                losses += float(died.size)
+                draws += float(rows.size - won.size - died.size)
+                p = env.place[rows, 0]
+                p = p[p > 0]
+                place_sum += float(p.sum())
+                place_n += int(p.size)
                 span.append(float(np.mean(env.round_frames[rows])))
                 env._new_round(rows)
-        tot = wins + losses
-        out[name] = (wins / tot if tot > 0 else 0.5, int(wins + losses + draws),
-                     int(draws), float(np.mean(span)) if span else 0.0)
+        tot = wins + losses + draws
+        out[name] = {"win": wins / max(1.0, wins + losses),
+                     "rounds": int(tot),
+                     "draws": int(draws),
+                     "span": float(np.mean(span)) if span else 0.0,
+                     "place": place_sum / place_n if place_n > 0 else 0.0}
     return out
 
 
@@ -150,11 +177,13 @@ def main():
                         datefmt="%H:%M:%S",
                         handlers=[logging.StreamHandler(sys.stdout),
                                   logging.FileHandler(config.LOG, encoding="utf-8")])
-    log.info("设备 %s  envs %d  观测 %d 通道 %dx%d  特征 %d 维",
-             network.DEVICE, args.envs, tank_vec.OBS_CH, tank_vec.OBS_H, tank_vec.OBS_W,
-             tank_vec.VecEnv(1, 2, 0).feat(0).shape[1])
+    log.info("设备 %s  envs %d  %d 人混战  观测 %d 通道 %dx%d  特征 %d 维",
+             network.DEVICE, args.envs, config.PLAYERS, tank_vec.OBS_CH,
+             tank_vec.OBS_H, tank_vec.OBS_W,
+             tank_vec.VecEnv(1, config.PLAYERS, 0).feat(0).shape[1])
 
-    env = tank_vec.VecEnv(args.envs, 2, seed=config.SEED)
+    players = config.PLAYERS
+    env = tank_vec.VecEnv(args.envs, players, seed=config.SEED)
     feat_dim = env.feat(0).shape[1]
     policy = network.make(feat_dim)
     target = network.make(feat_dim)
@@ -162,23 +191,19 @@ def main():
     target.eval()
     opt = torch.optim.Adam(policy.parameters(), lr=config.LR)
     replay = buffer.Replay(config.REPLAY_CAP, (tank_vec.OBS_H, tank_vec.OBS_W), feat_dim)
-    nstep = buffer.NStep(args.envs, config.NSTEP, config.GAMMA)
+    nstep = buffer.NStep(args.envs * players, config.NSTEP, config.GAMMA)
 
     groups = 4
     size = args.envs // groups
-    sides = np.zeros(args.envs, dtype=np.int64)
-    for g in range(groups):
-        sides[g * size:(g + 1) * size] = g % 2
     group_snap = np.zeros(groups, dtype=np.int64)
     snapshots = [Snapshot(policy.state_dict(), feat_dim)]
     snap_at = [0]
     pfsp = [1.0]
-    snap_win = [0.0]
-    snap_lose = [0.0]
-    snap_draw = [0.0]
+    snap_place = [0.0]
+    snap_rounds = [0.0]
 
     def drop_first(n):
-        for lst in (snapshots, snap_at, pfsp, snap_win, snap_lose, snap_draw):
+        for lst in (snapshots, snap_at, pfsp, snap_place, snap_rounds):
             del lst[0:n]
 
     steps = 0
@@ -190,13 +215,11 @@ def main():
         ck = torch.load(config.CHECKPOINT, map_location=network.DEVICE)
         policy.load_state_dict(ck["model"])
         target.load_state_dict(policy.state_dict())
-        snapshot = Snapshot(policy.state_dict(), feat_dim)
-        snapshots = [snapshot]
+        snapshots = [Snapshot(policy.state_dict(), feat_dim)]
         snap_at = [0]
         pfsp = [1.0]
-        snap_win = [0.0]
-        snap_lose = [0.0]
-        snap_draw = [0.0]
+        snap_place = [0.0]
+        snap_rounds = [0.0]
         steps = int(ck.get("steps", 0))
         last_target = last_snap = last_eval = steps
         log.info("断点续训：载入 %s，从第 %d 步继续", config.CHECKPOINT, steps)
@@ -206,15 +229,16 @@ def main():
     rew_sum = rew_n = 0.0
     loss_sum = loss_n = 0.0
     q_sum = td_sum = td_n = 0.0
-    win_sum = win_n = 0.0
+    place_sum = place_n = 0.0
+    suicide_sum = death_sum = 0.0
     draw_sum = 0.0
     span_sum = 0.0
     span_n = 0
     t0 = time.time()
     t_last = t0
     stats = {"loss": 0.0, "rew": 0.0, "eps": 1.0, "spm": 0.0, "buf": 0.0,
-             "win": 0.5, "draw": 0.0, "span": 0.0, "rpm": 0.0, "rounds": 0.0,
-             "q_mean": 0.0, "td_mean": 0.0, "eval": {}}
+             "place": 2.5, "suicide": 0.0, "draw": 0.0, "span": 0.0, "rpm": 0.0,
+             "rounds": 0.0, "q_mean": 0.0, "td_mean": 0.0, "eval": {}}
 
     monitor = None
     tmon = None
@@ -230,52 +254,63 @@ def main():
         monitor = tmon.build()
         monitor.bars("pool", lambda: [("快照%d" % (i + 1), w) for i, w in enumerate(pfsp)],
                      label="对手池采样权重")
-        monitor.table("snap", lambda: _snap_table(snapshots, snap_at, pfsp, snap_win,
-                                                  snap_lose, snap_draw),
-                      label="快照池", columns=["快照", "诞生步数", "权重", "胜", "负", "平", "对局胜率"])
+        monitor.table("snap", lambda: _snap_table(snapshots, snap_at, pfsp, snap_place, snap_rounds),
+                      label="快照池", columns=["快照", "诞生步数", "权重", "对局数", "平均名次"])
         monitor.start()
         log.info("监控面板 http://127.0.0.1:%d", config.MONITOR_PORT)
 
     deadline = t0 + args.minutes * 60.0
     while time.time() < deadline:
         it += 1
-        packs = [env.obs_pack(0), env.obs_pack(1)]
-        feats = [env.feat(0), env.feat(1)]
-        ctrl = np.zeros((args.envs, 2, 3), dtype=np.float32)
+        packs = [env.obs_pack(j) for j in range(players)]
+        feats = [env.feat(j) for j in range(players)]
+        ctrl = np.zeros((args.envs, players, 3), dtype=np.float32)
         eps = max(config.EPS_END, config.EPS_START - steps / config.EPS_DECAY)
-        acts = np.zeros(args.envs, dtype=np.int64)
+        acts = np.zeros((args.envs, players), dtype=np.int64)
         for g in range(groups):
             sl = slice(g * size, (g + 1) * size)
-            ps = int(sides[g * size])
-            other = 1 - ps
-            a = policy_actions(policy, packs[ps], feats[ps], sl, eps)
-            acts[sl] = a
-            ctrl[sl, ps] = tank_vec.CTRL[a]
             if g == 0:
-                b = policy_actions(policy, packs[other], feats[other], sl, config.OPP_EPS)
+                for j in range(players):
+                    acts[sl, j] = policy_actions(policy, packs[j], feats[j], sl, eps)
             else:
                 k = pick_snapshot(pfsp)
                 group_snap[g] = k
-                b = snapshots[k].act(packs[other][sl], feats[other][sl], config.OPP_EPS)
-            ctrl[sl, other] = tank_vec.CTRL[b]
+                snap = snapshots[k]
+                own = (g - 1) % players
+                for j in range(players):
+                    if j == own:
+                        acts[sl, j] = policy_actions(policy, packs[j], feats[j], sl, eps)
+                    else:
+                        acts[sl, j] = snap.act(packs[j][sl], feats[j][sl], config.OPP_EPS)
+        for j in range(players):
+            ctrl[:, j] = tank_vec.CTRL[acts[:, j]]
 
+        before = env.t_alive.copy()
+        running = ~env.over.copy()
         prev_rounds = env.rounds.copy()
         env.step(ctrl, DT)
-        steps += args.envs
+        steps += args.envs * players
         new = (env.rounds - prev_rounds) > 0
-        dead = env.dead
-        rew = np.full(args.envs, config.STEP_PENALTY, dtype=np.float32)
-        rew += config.ITEM_REWARD * env.picked[np.arange(args.envs), sides]
-        rew[new & (dead == sides)] = -1.0
-        rew[new & (dead >= 0) & (dead != sides)] = 1.0
-        if tmon is not None:
-            tmon.count_acts(acts)
+        died = env.just_died
+        rew = np.full((args.envs, players), config.STEP_PENALTY, dtype=np.float32)
+        rew += config.ITEM_REWARD * env.picked
+        rew[died] = -1.0
+        won_seats = 0
+        if new.any():
+            r = np.nonzero(new)[0]
+            w = env.winner[r]
+            ok = w >= 0
+            rew[r[ok], w[ok]] = 1.0
+            won_seats = int(ok.sum())
+        done = died | new[:, None]
         rounds_total += int(new.sum())
         rew_sum += float(rew.sum())
-        rew_n += args.envs
-        win_sum += float((new & (dead >= 0) & (dead != sides)).sum())
-        win_n += int(new.sum())
-        draw_sum += float((new & (dead < 0)).sum())
+        rew_n += args.envs * players
+        place_sum += float(env.place[died].sum()) + float(won_seats)
+        place_n += float(died.sum()) + won_seats
+        death_sum += float(died.sum())
+        suicide_sum += float((died & env.suicide).sum())
+        draw_sum += float((new & (env.winner < 0)).sum())
         if new.any():
             span_sum += float(env.round_frames[new].sum())
             span_n += int(new.sum())
@@ -284,19 +319,24 @@ def main():
             sl = slice(g * size, (g + 1) * size)
             m = new[sl]
             if m.any():
-                d = dead[sl]
-                sd = sides[sl]
-                snap_win[k] += float((m & (d >= 0) & (d != sd)).sum())
-                snap_lose[k] += float((m & (d == sd)).sum())
-                snap_draw[k] += float((m & (d < 0)).sum())
+                p = env.place[sl][m, (g - 1) % players]
+                p = p[p > 0]
+                snap_place[k] += float(p.sum())
+                snap_rounds[k] += float(p.size)
+        if tmon is not None:
+            tmon.count_acts(acts)
 
-        packs_next = [env.obs_pack(0), env.obs_pack(1)]
-        feats_next = [env.feat(0), env.feat(1)]
+        packs_next = [env.obs_pack(j) for j in range(players)]
+        feats_next = [env.feat(j) for j in range(players)]
+        valid = before & running[:, None]
         for i in range(args.envs):
-            ps = int(sides[i])
-            for t in nstep.push(i, packs[ps][i], feats[ps][i], acts[i], rew[i],
-                                packs_next[ps][i], feats_next[ps][i], float(new[i])):
-                replay.push(t[0], t[1], t[2], t[3], t[4], t[5], t[6])
+            for j in range(players):
+                if not valid[i, j]:
+                    continue
+                s = i * players + j
+                for t in nstep.push(s, packs[j][i], feats[j][i], acts[i, j], rew[i, j],
+                                    packs_next[j][i], feats_next[j][i], float(done[i, j])):
+                    replay.push(t[0], t[1], t[2], t[3], t[4], t[5], t[6])
         rows = np.nonzero(new)[0]
         if rows.size:
             env._new_round(rows)
@@ -341,9 +381,8 @@ def main():
             snapshots.append(Snapshot(policy.state_dict(), feat_dim))
             snap_at.append(steps)
             pfsp.append(1.0)
-            snap_win.append(0.0)
-            snap_lose.append(0.0)
-            snap_draw.append(0.0)
+            snap_place.append(0.0)
+            snap_rounds.append(0.0)
             if len(snapshots) > config.POOL_MAX:
                 drop_first(len(snapshots) - config.POOL_MAX)
 
@@ -351,28 +390,29 @@ def main():
         if now - t_last >= 10.0:
             el = now - t0
             spm = steps / el
-            win_rate = win_sum / max(1.0, win_n)
-            draw_rate = draw_sum / max(1.0, win_n)
+            place = place_sum / max(1.0, place_n)
+            draw_rate = draw_sum / max(1.0, rounds_total)
             span = span_sum / max(1.0, span_n) * DT
             rpm = 60.0 * rounds_total / el
+            kill = suicide_sum / max(1.0, death_sum)
             for k in range(len(pfsp)):
-                tot = snap_win[k] + snap_lose[k] + snap_draw[k]
-                if tot > 0:
-                    pfsp[k] = float(min(1.0, max(0.05, 1.0 - (snap_win[k] + 0.5 * snap_draw[k]) / tot)))
+                if snap_rounds[k] > 0:
+                    pfsp[k] = float(min(1.0, max(0.05, (snap_place[k] / snap_rounds[k] - 1.0) / 3.0)))
             stats.update({"loss": loss_sum / max(1, loss_n), "rew": rew_sum / max(1, rew_n),
                           "eps": eps, "spm": spm, "buf": replay.size / 1000.0,
-                          "win": win_rate, "draw": draw_rate, "span": span,
+                          "place": place, "suicide": kill, "draw": draw_rate, "span": span,
                           "rpm": rpm, "rounds": float(rounds_total),
                           "q_mean": q_sum / max(1.0, td_n),
                           "td_mean": td_sum / max(1.0, td_n)})
-            log.info("步 %d  %.0f 步/秒  ε %.3f  回报 %+.3f  胜率 %.1f%%  平局 %.1f%%  "
-                     "回合 %.1f 秒  %.0f 局/分  回放 %.0fk  损失 %.4f",
-                     steps, spm, eps, stats["rew"], 100.0 * win_rate, 100.0 * draw_rate,
+            log.info("步 %d  %.0f 步/秒  ε %.3f  回报 %+.4f  平均名次 %.2f（随机 2.5）  "
+                     "自杀占死因 %.0f%%  平局 %.0f%%  回合 %.1f 秒  %.0f 局/分  回放 %.0fk  损失 %.4f",
+                     steps, spm, eps, stats["rew"], place, 100.0 * kill, 100.0 * draw_rate,
                      span, rpm, stats["buf"], stats["loss"])
             loss_sum = loss_n = 0.0
             q_sum = td_sum = td_n = 0.0
             rew_sum = rew_n = 0.0
-            win_sum = win_n = 0.0
+            place_sum = place_n = 0.0
+            suicide_sum = death_sum = 0.0
             draw_sum = 0.0
             span_sum = 0.0
             span_n = 0
@@ -384,19 +424,20 @@ def main():
                     "脚本Lv2": ScriptedBot(config.EVAL_ENVS, 2, 3),
                     "脚本Lv3": ScriptedBot(config.EVAL_ENVS, 3, 3),
                     "最早快照": snapshots[0]}
-            res = run_eval(policy, opps, config.EVAL_ENVS, config.EVAL_FRAMES, 999)
+            res = run_eval(policy, opps, config.EVAL_ENVS, config.EVAL_FRAMES, 999, players)
             stats["eval"] = res
             log.info("评测 %s", "  ".join(
-                "%s %.0f%%（%d 局，平 %.0f%%，%.1f 秒）" % (
-                    k, 100.0 * v[0], v[1], 100.0 * v[2] / max(1.0, v[1]), v[3] * DT)
+                "%s 胜 %.0f%%（不含平局）平 %.0f%% 名次 %.2f 共 %d 局 %.1f 秒" % (
+                    k, 100.0 * v["win"], 100.0 * v["draws"] / max(1.0, v["rounds"]),
+                    v["place"] or 0.0, v["rounds"], v["span"] * DT)
                 for k, v in res.items()))
             torch.save({"model": policy.state_dict(), "steps": steps}, config.CHECKPOINT)
 
         if writer is not None:
             writer.push(env)
             writer.stats(stats["loss"], stats["rew"], eps, stats["spm"], stats["buf"],
-                         stats["win"], stats["draw"], stats["span"], stats["rpm"], steps,
-                         [(stats["eval"].get(k) or (0.0,))[0] for k in EVAL_NAMES])
+                         stats["place"], stats["draw"], stats["span"], stats["rpm"], steps,
+                         [(stats["eval"].get(k) or {}).get("win", 0.0) for k in EVAL_NAMES])
 
     torch.save({"model": policy.state_dict(), "steps": steps}, config.CHECKPOINT)
     log.info("训练结束，共 %d 步", steps)

@@ -74,8 +74,8 @@ class NetProbe:
         k1, k2, k3 = self.chans
         self.meta = [
             {"name": "观测", "params": 0, "realCount": tank_vec.OBS_CH,
-             "detail": "%d 通道 × %d×%d · 按位打包（墙/自己/敌人/子弹/地雷/道具/激光 + 保留位）"
-                       % (tank_vec.OBS_CH, tank_vec.OBS_H, tank_vec.OBS_W)},
+             "detail": "%d 通道 × %d×%d · 按位打包（墙/自机/其余 %d 人合并/子弹/地雷/道具/激光 + 保留位）"
+                       % (tank_vec.OBS_CH, tank_vec.OBS_H, tank_vec.OBS_W, config.PLAYERS - 1)},
             {"name": "C1", "params": _nparam(cv[0]), "realCount": k1 * s1 * s1,
              "detail": "%d 通道 × %d×%d · stride 2" % (k1, s1, s1)},
             {"name": "C2", "params": _nparam(cv[1]), "realCount": k2 * s2 * s2,
@@ -340,8 +340,9 @@ class TankMonitor:
             self.grad = out
 
     def count_acts(self, acts):
-        self.act_count += np.bincount(acts, minlength=network.ACTIONS)[:network.ACTIONS]
-        self.act_step += self.env.n
+        self.act_count += np.bincount(np.asarray(acts).ravel(),
+                                      minlength=network.ACTIONS)[:network.ACTIONS]
+        self.act_step += self.env.n * self.env.p
 
     def _weights(self):
         with torch.no_grad():
@@ -444,10 +445,9 @@ class TankMonitor:
         return None
 
     def _alert_eval(self):
-        ev = self.stats.get("eval") or {}
-        r = ev.get("随机")
-        if r and r[1] >= 400 and r[0] < 0.5 and self.steps_fn() > 20000000:
-            return "对随机胜率只有 %.0f%%，策略可能已退化" % (100.0 * r[0])
+        r = (self.stats.get("eval") or {}).get("随机")
+        if r and r["rounds"] >= 400 and r["place"] > 3.2 and self.steps_fn() > 20000000:
+            return "对随机平均名次 %.2f（随机水平 2.5），策略可能已退化" % r["place"]
         return None
 
     def _params(self):
@@ -474,10 +474,14 @@ class TankMonitor:
                 ["当前梯度更新", "%d" % self.updates],
             ]},
             {"title": "运行配置", "rows": [
-                ["并行环境", "%d 局（1 组自对弈 + 3 组 PFSP 快照池）" % self.args.envs],
+                ["对局形式", "%d 人自由混战 · 活到最后只剩 1 人算赢" % config.PLAYERS],
+                ["并行环境", "%d 局（1 组全员自对弈 + 3 组 1 席对 3 席 PFSP 快照）" % self.args.envs],
                 ["迷宫", "%d × %d 格 · 墙厚 %.0fpx · 走廊 %.0fpx" % (tank_vec.NC, tank_vec.NR, tank.WALL_W, tank.CORR_W)],
                 ["动作数 / 观测", "%d 个动作 / %d 通道 %d×%d" % (network.ACTIONS, tank_vec.OBS_CH, tank_vec.OBS_H, tank_vec.OBS_W)],
-                ["回合时限", "%d 帧（%.0f 秒），超时算平局" % (tank_vec.ROUND_LIMIT, tank_vec.ROUND_LIMIT / 60.0)],
+                ["回合计时", "上限 %d 帧（%.0f 秒），到点仍多于 1 人存活算平局（双方 0 奖励）" % (
+                    tank_vec.ROUND_LIMIT, tank_vec.ROUND_LIMIT / 60.0)],
+                ["回合奖励", "最后存活 +1 · 被淘汰 -1 · 每步 %.3f · 拾取道具 +%.2f" % (
+                    config.STEP_PENALTY, config.ITEM_REWARD)],
                 ["子弹反弹上限", "%d 次" % tank.BOUNCE_LIMIT],
                 ["快照池", "每 %d 步存一个，最多 %d 个，PFSP 指数 %.2f" % (
                     config.POOL_SNAPSHOT_EVERY, config.POOL_MAX, config.PFSP_POWER)],
@@ -498,10 +502,14 @@ class TankMonitor:
             "并行": "%d 局" % self.args.envs,
             "参数": "%.2fM" % (sum(p.numel() for p in self.policy.parameters()) / 1e6),
         })
-        ev = lambda k: (lambda: (self.stats.get("eval") or {}).get(k, (None,))[0])
+        ev = lambda k: (lambda: (self.stats.get("eval") or {}).get(k, {}).get("win"))
+        ep = lambda k: (lambda: (self.stats.get("eval") or {}).get(k, {}).get("place"))
         for nm in ("随机", "脚本Lv1", "脚本Lv2", "脚本Lv3", "最早快照"):
             mon.metric("eval_" + nm, ev(nm), label="对" + nm + "胜率", fmt="pct")
-        mon.metric("win", lambda: self.stats.get("win"), label="训练胜率", fmt="pct")
+        mon.metric("place", lambda: self.stats.get("place"), label="平均名次（随机 2.5）", fmt="f3",
+                   color="#3ddc84")
+        mon.metric("suicide", lambda: self.stats.get("suicide"), label="自杀占死因比", fmt="pct",
+                   color="#e08f7f")
         mon.metric("draw", lambda: self.stats.get("draw"), label="平局率", fmt="pct")
         mon.metric("span", lambda: self.stats.get("span"), label="平均回合秒数", fmt="f2")
         mon.metric("rpm", lambda: self.stats.get("rpm"), label="局/分", fmt="int")
@@ -526,6 +534,8 @@ class TankMonitor:
                    label="训练/采样比", unit="×", fmt="f3")
         mon.health("steps", lambda: self.steps_fn(), label="已训练步数", fmt="int")
         mon.health("rounds", lambda: self.stats.get("rounds"), label="累计对局数", fmt="int")
+        for nm in ("随机", "脚本Lv1", "脚本Lv2", "脚本Lv3"):
+            mon.health("place_" + nm, ep(nm), label="对" + nm + "平均名次", fmt="f2")
 
         mon.graph(self.probe.graph)
         mon.surface(self.land.snapshot)
