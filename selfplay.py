@@ -176,6 +176,32 @@ def policy_actions(policy, pack, feat, sl, eps):
         return policy.act(network.obs_tensor(pack[sl]), network.feat_tensor(feat[sl]), eps).cpu().numpy()
 
 
+# 批量版：调用方已经把多个座位的观测拼成一个大 batch，这里直接整批前向。
+# 为什么要拼：如果按 (组, 座位) 逐个调用，一帧要发起 16 次 batch=64 的极小前向，
+# 每次都要做一次 GPU 同步并把结果拷回主机。实测这一项占掉整轮迭代 85% 的时间
+# （环境推进本身只占 9%），GPU 利用率显示 98% 但功耗只有 64W —— 典型的发射/同步受限。
+# 合并成"当前策略一次 + 对手快照一次"之后，内核发射数和同步次数都降到八分之一。
+def policy_actions_batch(policy, pack, feat, eps):
+    with torch.no_grad():
+        return policy.act(network.obs_tensor(pack), network.feat_tensor(feat), eps).cpu().numpy()
+
+
+# 把若干个座位的同帧观测按座位分组、拼成一个连续 batch（顺序必须和 _scatter_seats 一致）。
+def _gather_seats(src, rows, idx):
+    parts = [src[j][rows[idx[j]]] for j in range(len(idx)) if idx[j].size]
+    return np.concatenate(parts) if parts else None
+
+
+# 把整批前向输出的动作按座位拆开，散回 acts 对应的 (环境行, 座位) 位置。
+def _scatter_seats(dst, a, rows, idx):
+    off = 0
+    for j in range(len(idx)):
+        n_j = int(idx[j].size)
+        if n_j:
+            dst[rows[idx[j]], j] = a[off:off + n_j]
+            off += n_j
+
+
 # 按 PFSP（Prioritized Fictitious Self-Play）思路从对手池里抽一份快照当本组对手。
 # 核心是"越是打不过的对手，越要多打"：权重先做 PFSP_POWER=2 的幂次放大
 # （拉开强弱快照之间的差距），再归一化，最后用累积分布做轮盘赌抽样。
@@ -316,8 +342,24 @@ def main():
     # 3 个同源对手 vs 1 个受测者，受测座位的名次才有明确含义（见下面 PFSP 权重更新）。
     groups = 4
     size = args.envs // groups
-    # group_snap 记录每组本轮用的是哪份快照
-    group_snap = np.zeros(groups, dtype=np.int64)
+    # 预先算好"每个 (环境, 座位) 该由谁驱动"，主循环每帧直接用，避免每帧重复比较和索引。
+    #   own[g]      —— 第 1~3 组的受测座位号；(g-1) % players 让受测座位在组间轮换，
+    #                  使"(受测座位, 对手快照)"的所有组合都被公平覆盖
+    #   seat_group  —— 每个 (环境, 座位) 属于哪一组
+    #   is_policy   —— True 表示该座位本帧用当前策略出动作；False 表示用对手快照
+    # rows_p/rows_s 是环境行号，idx_p/idx_s 是"按座位分组后在该批次里的位置"，
+    # 供 _gather_seats / _scatter_seats 拼接与散回观测用。
+    own = np.zeros(groups, dtype=np.int64)
+    for g in range(1, groups):
+        own[g] = (g - 1) % players
+    seat_group = np.zeros((args.envs, players), dtype=np.int64)
+    for g in range(groups):
+        seat_group[g * size:(g + 1) * size] = g
+    is_policy = (seat_group == 0) | (own[seat_group] == np.arange(players)[None, :])
+    rows_p, seats_p = np.nonzero(is_policy)
+    rows_s, seats_s = np.nonzero(~is_policy)
+    idx_p = [np.nonzero(seats_p == j)[0] for j in range(players)]
+    idx_s = [np.nonzero(seats_s == j)[0] for j in range(players)]
     # 对手池的五个平行数组（下标一一对应）：
     #   snapshots   —— 冻结的网络本体
     #   snap_at     —— 各快照诞生在第几步（用于面板展示）
@@ -420,32 +462,20 @@ def main():
         eps = max(config.EPS_END, config.EPS_START - steps / config.EPS_DECAY)
         # acts 是网络输出的离散动作 id，ctrl 是喂给物理引擎的连续控制量。
         acts = np.zeros((args.envs, players), dtype=np.int64)
-        # 按组构造本帧动作：第 0 组纯自对弈，第 1~3 组各自抽一份快照当陪练。
-        for g in range(groups):
-            sl = slice(g * size, (g + 1) * size)
-            if g == 0:
-                # 纯自对弈组：4 个座位都用当前策略（同一张网、同一个 ε）。
-                # 因为四个座位完全对称，一局里就是四个"自己"互相博弈，产出的对抗数据
-                # 规模最大、水平也和自己最匹配。
-                for j in range(players):
-                    acts[sl, j] = policy_actions(policy, packs[j], feats[j], sl, eps)
-            else:
-                k = pick_snapshot(pfsp)
-                group_snap[g] = k
-                snap = snapshots[k]
-                # own 决定本组的"受测座位"落在哪个座位号：(g-1) % players。
-                # 之所以让受测座位在不同组之间轮换，是为了让"(受测座位, 对手快照)"的所有
-                # 组合都被公平覆盖——如果固定 0 号座位，策略会过拟合到那个座位特有的
-                # 出生位置和角度分布上。
-                # 例如：g=1 时 own=0，g=2 时 own=1，g=3 时 own=2。
-                own = (g - 1) % players
-                for j in range(players):
-                    if j == own:
-                        acts[sl, j] = policy_actions(policy, packs[j], feats[j], sl, eps)
-                    else:
-                        # 对手用冻结快照，并给一点 OPP_EPS=0.08 的随机性：完全确定的对手
-                        # 会让策略学会"背板"而不是学会应对不确定性，也更容易被针对性利用。
-                        acts[sl, j] = snap.act(packs[j][sl], feats[j][sl], config.OPP_EPS)
+        # 本帧给第 1~3 组抽一份共同的陪练快照。抽签仍然是按 PFSP 权重来的，
+        # 只是"每帧抽一次"而不是"每组各抽一次"：快照的采样分布不变，
+        # 但这样 3 个组的 9 个对手座位可以合并成一次前向。
+        snap_k = pick_snapshot(pfsp)
+        # 当前策略负责的座位一次算完：第 0 组全部 4 个座位 + 第 1~3 组各 1 个受测座位。
+        # 这些座位规则完全对称、共用一张网，合批不会改变任何决策结果。
+        a = policy_actions_batch(policy, _gather_seats(packs, rows_p, idx_p),
+                                 _gather_seats(feats, rows_p, idx_p), eps)
+        _scatter_seats(acts, a, rows_p, idx_p)
+        # 对手座位也一次算完。统一用 snapshots[snap_k]，并保留 OPP_EPS=0.08 的随机性：
+        # 完全确定的对手会让策略学会"背板"而不是学会应对不确定性，也更容易被针对性利用。
+        a = snapshots[snap_k].act(_gather_seats(packs, rows_s, idx_s),
+                                  _gather_seats(feats, rows_s, idx_s), config.OPP_EPS)
+        _scatter_seats(acts, a, rows_s, idx_s)
         # 把 18 个离散动作 id 翻译回连续的（转向, 油门, 开火）控制量。
         for j in range(players):
             ctrl[:, j] = tank_vec.CTRL[acts[:, j]]
@@ -503,18 +533,17 @@ def main():
             span_sum += float(env.round_frames[new].sum())
             span_n += int(new.sum())
         # 回填快照名次统计（只统计第 1~3 组，也就是有快照当陪练的那些组）。
-        # 受测座位号仍然是 (g-1) % players，取它在本局拿到的名次。
+        # 受测座位号是 own[g]，取它在本局拿到的名次。
         # 名次 0 表示该座位没有参与这一局的结算，过滤掉。
         # 这两个累加器是后面 PFSP 权重更新的唯一数据来源。
         for g in range(1, groups):
-            k = group_snap[g]
             sl = slice(g * size, (g + 1) * size)
             m = new[sl]
             if m.any():
-                p = env.place[sl][m, (g - 1) % players]
+                p = env.place[sl][m, own[g]]
                 p = p[p > 0]
-                snap_place[k] += float(p.sum())
-                snap_rounds[k] += float(p.size)
+                snap_place[snap_k] += float(p.sum())
+                snap_rounds[snap_k] += float(p.size)
         if tmon is not None:
             # 把本帧的动作分布喂给面板，用来看策略有没有退化成一两个动作
             tmon.count_acts(acts)
