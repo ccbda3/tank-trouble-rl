@@ -17,7 +17,7 @@ log = logging.getLogger("tank")
 EDGE_TTL = 5.0
 HIST_TTL = 5.0
 GRAD_EVERY = 200
-GPU_EVERY = 5.0
+GPU_EVERY = 10.0
 
 WEIGHT_KEYS = ("conv.0.weight", "conv.2.weight", "conv.4.weight",
                "fc.0.weight", "value.weight", "adv.weight")
@@ -297,7 +297,8 @@ def _gpu_util():
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=4)
+            capture_output=True, text=True, timeout=4,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return float(out.stdout.strip().splitlines()[0])
     except Exception:
         return None
