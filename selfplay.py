@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import shutil
 import sys
 import time
 
@@ -192,6 +193,7 @@ def main():
     last_snap = 0
     last_eval = 0
     if args.resume and os.path.exists(config.CHECKPOINT):
+        shutil.copyfile(config.CHECKPOINT, config.CHECKPOINT + ".bak")
         ck = torch.load(config.CHECKPOINT, map_location=network.DEVICE)
         policy.load_state_dict(ck["model"])
         target.load_state_dict(policy.state_dict())
