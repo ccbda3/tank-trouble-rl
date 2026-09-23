@@ -21,6 +21,7 @@ Z_MAX = 6
 L_MAX = 3
 SUBSTEPS = 4
 NEAR_BULLETS = 8
+ROUND_LIMIT = 1200
 CTRL = np.array(ref.ACTION_CTRL, dtype=np.float32)
 
 OBS_RES = 16
@@ -113,6 +114,8 @@ class VecEnv:
         self.t_wt = np.zeros((self.n, self.p), dtype=np.float32)
         self.t_weapon = np.zeros((self.n, self.p), dtype=np.int8)
         self.t_score = np.zeros((self.n, self.p), dtype=np.int32)
+        self.round_frames = np.zeros(self.n, dtype=np.int32)
+        self.picked = np.zeros((self.n, self.p), dtype=bool)
         self.t_px = np.zeros((self.n, self.p), dtype=np.float32)
         self.t_py = np.zeros((self.n, self.p), dtype=np.float32)
         self.t_vx = np.zeros((self.n, self.p), dtype=np.float32)
@@ -180,6 +183,8 @@ class VecEnv:
         self.pause[rows] = 0.0
         self.over[rows] = False
         self.dead[rows] = -1
+        self.round_frames[rows] = 0
+        self.picked[rows] = False
         self.spawn_t[rows] = CAPSULE_EVERY * 0.5
         cells = self.rng.integers(0, NC * NR, size=(rows.size, self.p))
         for _ in range(40):
@@ -256,6 +261,7 @@ class VecEnv:
     def step(self, ctrl, dt):
         run = ~self.over
         if run.any():
+            self.picked[:] = False
             self._drive(ctrl, dt, run)
             self._items(dt, run)
             self._bullets(dt, run)
@@ -267,6 +273,14 @@ class VecEnv:
                 for j in range(self.p):
                     self.ep_deaths[newly, j] += (~self.t_alive[newly, j]).astype(np.int32)
         self.ep_steps[run] += 1
+        playing = run & ~self.over
+        self.round_frames[playing] += 1
+        timed = playing & (self.round_frames >= ROUND_LIMIT)
+        if timed.any():
+            self.over |= timed
+            self.pause[timed] = DEATH_PAUSE
+            self.rounds[timed] += 1
+            self.dead[timed] = -1
         self.pause = np.maximum(0.0, self.pause - dt)
         done = self.over & (self.pause <= 0.0)
         if done.any():
@@ -516,6 +530,7 @@ class VecEnv:
                 self.t_weapon[rows[r], j] = self.c_kind[rows[r], c] + 1
                 self.t_wt[rows[r], j] = WEAPON_SECONDS[self.c_kind[rows[r], c] + 1]
                 self.c_on[rows[r], c] = False
+                self.picked[rows[r], j] = True
         self.m_arm = self.m_arm - dt
         armed = self.m_on & (self.m_arm <= 0.0)
         blown = np.zeros_like(self.m_on)
@@ -765,5 +780,5 @@ class VecEnv:
         out[:, b + 0] = self.t_score[:, side] / 10.0
         out[:, b + 1] = self.pause / DEATH_PAUSE
         out[:, b + 2] = self.over
-        out[:, b + 3] = np.clip(self.ep_steps / 1800.0, 0.0, 1.0)
+        out[:, b + 3] = np.clip(self.round_frames / ROUND_LIMIT, 0.0, 1.0)
         return out

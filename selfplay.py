@@ -16,6 +16,7 @@ import tank_vec
 DT = 1.0 / 60.0
 log = logging.getLogger("tank")
 RNG = np.random.default_rng(20240922)
+EVAL_NAMES = ("随机", "脚本Lv1", "脚本Lv2", "脚本Lv3", "最早快照")
 
 
 def pack_action(turn, thrust, fire):
@@ -90,12 +91,31 @@ def pick_snapshot(pfsp):
     return int(min(np.searchsorted(np.cumsum(w), RNG.random()), len(pfsp) - 1))
 
 
+def _obs_montage(env, i=0, cols=4):
+    from aimonitor import imaging
+    ch = tank_vec.unpack(env.obs_pack(i)[i:i + 1])[0]
+    maps = [(ch[c] * 255).astype(np.uint8) for c in range(tank_vec.OBS_CH)]
+    return imaging.montage(maps, cols=cols, pad=1, pad_val=0)
+
+
+def _snap_table(snapshots, snap_at, pfsp, win, lose, draw):
+    rows = []
+    for i in range(len(snapshots)):
+        tot = win[i] + lose[i] + draw[i]
+        rate = win[i] / tot if tot > 0 else 0.0
+        rows.append(["快照%d" % (i + 1), int(snap_at[i]), round(float(pfsp[i]), 3),
+                     int(win[i]), int(lose[i]), int(draw[i]), round(float(rate), 3)])
+    return rows
+
+
 def run_eval(policy, opponents, n_envs, frames, seed):
     env = tank_vec.VecEnv(n_envs, 2, seed=seed)
     out = {}
     for name, opp in opponents.items():
         wins = 0.0
         losses = 0.0
+        draws = 0.0
+        span = []
         prev = env.rounds.copy()
         for _ in range(frames):
             a0 = policy_actions(policy, env.obs_pack(0), env.feat(0), slice(0, env.n), 0.0)
@@ -114,9 +134,12 @@ def run_eval(policy, opponents, n_envs, frames, seed):
                 dead = env.dead[rows]
                 wins += float((dead == 1).sum())
                 losses += float((dead == 0).sum())
+                draws += float((dead < 0).sum())
+                span.append(float(np.mean(env.round_frames[rows])))
                 env._new_round(rows)
         tot = wins + losses
-        out[name] = wins / tot if tot > 0 else 0.5
+        out[name] = (wins / tot if tot > 0 else 0.5, int(wins + losses + draws),
+                     int(draws), float(np.mean(span)) if span else 0.0)
     return out
 
 
@@ -152,9 +175,17 @@ def main():
     sides = np.zeros(args.envs, dtype=np.int64)
     for g in range(groups):
         sides[g * size:(g + 1) * size] = g % 2
-    bots = [ScriptedBot(args.envs, 2, 1), ScriptedBot(args.envs, 3, 2)]
+    group_snap = np.zeros(groups, dtype=np.int64)
     snapshots = [Snapshot(policy.state_dict(), feat_dim)]
+    snap_at = [0]
     pfsp = [1.0]
+    snap_win = [0.0]
+    snap_lose = [0.0]
+    snap_draw = [0.0]
+
+    def drop_first(n):
+        for lst in (snapshots, snap_at, pfsp, snap_win, snap_lose, snap_draw):
+            del lst[0:n]
 
     steps = 0
     last_target = 0
@@ -164,7 +195,13 @@ def main():
         ck = torch.load(config.CHECKPOINT, map_location=network.DEVICE)
         policy.load_state_dict(ck["model"])
         target.load_state_dict(policy.state_dict())
-        snapshots = [Snapshot(policy.state_dict(), feat_dim)]
+        snapshot = Snapshot(policy.state_dict(), feat_dim)
+        snapshots = [snapshot]
+        snap_at = [0]
+        pfsp = [1.0]
+        snap_win = [0.0]
+        snap_lose = [0.0]
+        snap_draw = [0.0]
         steps = int(ck.get("steps", 0))
         last_target = last_snap = last_eval = steps
         log.info("断点续训：载入 %s，从第 %d 步继续", config.CHECKPOINT, steps)
@@ -174,9 +211,14 @@ def main():
     rew_sum = rew_n = 0.0
     loss_sum = loss_n = 0.0
     win_sum = win_n = 0.0
+    draw_sum = 0.0
+    span_sum = 0.0
+    span_n = 0
     t0 = time.time()
     t_last = t0
-    stats = {"loss": 0.0, "rew": 0.0, "eps": 1.0, "spm": 0.0, "buf": 0.0, "eval": {}}
+    stats = {"loss": 0.0, "rew": 0.0, "eps": 1.0, "spm": 0.0, "buf": 0.0,
+             "win": 0.5, "draw": 0.0, "span": 0.0, "rpm": 0.0, "rounds": 0.0,
+             "eval": {}, "pfsp": []}
 
     monitor = None
     writer = None
@@ -185,13 +227,42 @@ def main():
         writer = tank_view.Writer()
         log.info("观战共享内存已开启：另开一个窗口运行 python tank_view.py 就能看到实时对弈")
     if args.monitor:
+        import tank_view
         from aimonitor import Monitor
         monitor = Monitor("坦克动荡 · 自对弈", port=config.MONITOR_PORT)
-        monitor.metric("loss", lambda: stats["loss"], label="TD 损失")
-        monitor.metric("rew", lambda: stats["rew"], label="平均回报")
-        monitor.metric("eps", lambda: stats["eps"], label="ε", fmt=".3f")
-        monitor.metric("spm", lambda: stats["spm"], label="每秒步数")
-        monitor.metric("buf", lambda: stats["buf"], label="回放池(千)")
+        monitor.metric("win", lambda: stats["win"], label="对局胜率", fmt="pct")
+        monitor.metric("draw", lambda: stats["draw"], label="平局率", fmt="pct")
+        monitor.metric("span", lambda: stats["span"], label="平均回合秒数", fmt="f2")
+        monitor.metric("rpm", lambda: stats["rpm"], label="局/分", fmt="int")
+        monitor.metric("loss", lambda: stats["loss"], label="TD 损失", fmt="f4")
+        monitor.metric("rew", lambda: stats["rew"], label="平均回报", fmt="f4")
+        monitor.metric("eps", lambda: stats["eps"], label="ε", fmt="f3")
+        monitor.metric("spm", lambda: stats["spm"], label="每秒步数", fmt="int")
+        monitor.metric("buf", lambda: stats["buf"], label="回放池(千)", fmt="f1")
+        for nm in EVAL_NAMES:
+            monitor.metric("eval_" + nm,
+                           lambda n=nm: (stats["eval"].get(n) or (None,))[0],
+                           label="对" + nm + "胜率", fmt="pct")
+        monitor.bars("pool", lambda: [("快照%d" % (i + 1), w) for i, w in enumerate(pfsp)],
+                     label="对手池采样权重")
+        monitor.table("snap", lambda: _snap_table(snapshots, snap_at, pfsp, snap_win,
+                                                  snap_lose, snap_draw),
+                      label="快照池", columns=["快照", "诞生步数", "权重", "胜", "负", "平", "对局胜率"])
+        monitor.image("battle", lambda: tank_view.render_rgb(env, 0),
+                      label="实时对局 1", scale=1, group="战场")
+        monitor.image("battle2", lambda: tank_view.render_rgb(env, 1),
+                      label="实时对局 2", scale=1, group="战场")
+        monitor.image("obs", lambda: _obs_montage(env, 0),
+                      label="观测通道（1 号位视角）", scale=3, group="输入")
+        monitor.health("steps", lambda: steps, label="已训练步数")
+        monitor.health("rounds", lambda: stats["rounds"], label="累计对局数")
+        monitor.info(lambda: {
+            "device": "设备 %s" % network.DEVICE,
+            "obs": "观测 %d×%d×%d" % (tank_vec.OBS_CH, tank_vec.OBS_H, tank_vec.OBS_W),
+            "envs": "并行 %d 局" % args.envs,
+            "limit": "回合上限 %.0f 秒" % (tank_vec.ROUND_LIMIT * DT),
+        })
+        monitor.watchdog("steps", lambda: steps, label="训练步数", timeout=30.0)
         monitor.attach_logger(log)
         monitor.start()
         log.info("监控面板 http://127.0.0.1:%d", config.MONITOR_PORT)
@@ -213,12 +284,10 @@ def main():
             ctrl[sl, ps] = tank_vec.CTRL[a]
             if g == 0:
                 b = policy_actions(policy, packs[other], feats[other], sl, config.OPP_EPS)
-            elif g == 1:
-                b = snapshots[pick_snapshot(pfsp)].act(packs[other][sl], feats[other][sl], config.OPP_EPS)
-            elif g == 2:
-                b = bots[0].act(env, other, ps)[sl]
             else:
-                b = bots[1].act(env, other, ps)[sl]
+                k = pick_snapshot(pfsp)
+                group_snap[g] = k
+                b = snapshots[k].act(packs[other][sl], feats[other][sl], config.OPP_EPS)
             ctrl[sl, other] = tank_vec.CTRL[b]
 
         prev_rounds = env.rounds.copy()
@@ -226,14 +295,29 @@ def main():
         steps += args.envs
         new = (env.rounds - prev_rounds) > 0
         dead = env.dead
-        rew = np.zeros(args.envs, dtype=np.float32)
+        rew = np.full(args.envs, config.STEP_PENALTY, dtype=np.float32)
+        rew += config.ITEM_REWARD * env.picked[np.arange(args.envs), sides]
         rew[new & (dead == sides)] = -1.0
-        rew[new & (dead != sides)] = 1.0
+        rew[new & (dead >= 0) & (dead != sides)] = 1.0
         rounds_total += int(new.sum())
         rew_sum += float(rew.sum())
         rew_n += args.envs
-        win_sum += float((new & (dead != sides)).sum())
+        win_sum += float((new & (dead >= 0) & (dead != sides)).sum())
         win_n += int(new.sum())
+        draw_sum += float((new & (dead < 0)).sum())
+        if new.any():
+            span_sum += float(env.round_frames[new].sum())
+            span_n += int(new.sum())
+        for g in range(1, groups):
+            k = group_snap[g]
+            sl = slice(g * size, (g + 1) * size)
+            m = new[sl]
+            if m.any():
+                d = dead[sl]
+                sd = sides[sl]
+                snap_win[k] += float((m & (d >= 0) & (d != sd)).sum())
+                snap_lose[k] += float((m & (d == sd)).sum())
+                snap_draw[k] += float((m & (d < 0)).sum())
 
         packs_next = [env.obs_pack(0), env.obs_pack(1)]
         feats_next = [env.feat(0), env.feat(1)]
@@ -279,22 +363,41 @@ def main():
         if steps - last_snap >= config.POOL_SNAPSHOT_EVERY:
             last_snap = steps
             snapshots.append(Snapshot(policy.state_dict(), feat_dim))
+            snap_at.append(steps)
             pfsp.append(1.0)
+            snap_win.append(0.0)
+            snap_lose.append(0.0)
+            snap_draw.append(0.0)
             if len(snapshots) > config.POOL_MAX:
-                snapshots.pop(0)
-                pfsp.pop(0)
+                drop_first(len(snapshots) - config.POOL_MAX)
 
         now = time.time()
         if now - t_last >= 10.0:
-            spm = steps / (now - t0)
+            el = now - t0
+            spm = steps / el
+            win_rate = win_sum / max(1.0, win_n)
+            draw_rate = draw_sum / max(1.0, win_n)
+            span = span_sum / max(1.0, span_n) * DT
+            rpm = 60.0 * rounds_total / el
+            for k in range(len(pfsp)):
+                tot = snap_win[k] + snap_lose[k] + snap_draw[k]
+                if tot > 0:
+                    pfsp[k] = float(min(1.0, max(0.05, 1.0 - (snap_win[k] + 0.5 * snap_draw[k]) / tot)))
             stats.update({"loss": loss_sum / max(1, loss_n), "rew": rew_sum / max(1, rew_n),
-                          "eps": eps, "spm": spm, "buf": replay.size / 1000.0})
-            log.info("步 %d  %.0f 步/秒  ε %.3f  平均回报 %+.3f  胜率 %.1f%%  局/分 %.0f  回放 %.0fk  损失 %.4f",
-                     steps, spm, eps, stats["rew"], 100.0 * win_sum / max(1.0, win_n),
-                     60.0 * rounds_total / (now - t0), stats["buf"], stats["loss"])
+                          "eps": eps, "spm": spm, "buf": replay.size / 1000.0,
+                          "win": win_rate, "draw": draw_rate, "span": span,
+                          "rpm": rpm, "rounds": float(rounds_total),
+                          "pfsp": list(pfsp)})
+            log.info("步 %d  %.0f 步/秒  ε %.3f  回报 %+.3f  胜率 %.1f%%  平局 %.1f%%  "
+                     "回合 %.1f 秒  %.0f 局/分  回放 %.0fk  损失 %.4f",
+                     steps, spm, eps, stats["rew"], 100.0 * win_rate, 100.0 * draw_rate,
+                     span, rpm, stats["buf"], stats["loss"])
             loss_sum = loss_n = 0.0
             rew_sum = rew_n = 0.0
             win_sum = win_n = 0.0
+            draw_sum = 0.0
+            span_sum = 0.0
+            span_n = 0
             t_last = now
 
         if steps - last_eval >= config.EVAL_EVERY:
@@ -305,15 +408,17 @@ def main():
                     "最早快照": snapshots[0]}
             res = run_eval(policy, opps, config.EVAL_ENVS, config.EVAL_FRAMES, 999)
             stats["eval"] = res
-            log.info("评测 %s", "  ".join("%s %.0f%%" % (k, 100.0 * v) for k, v in res.items()))
+            log.info("评测 %s", "  ".join(
+                "%s %.0f%%（%d 局，平 %.0f%%，%.1f 秒）" % (
+                    k, 100.0 * v[0], v[1], 100.0 * v[2] / max(1.0, v[1]), v[3] * DT)
+                for k, v in res.items()))
             torch.save({"model": policy.state_dict(), "steps": steps}, config.CHECKPOINT)
 
         if writer is not None:
             writer.push(env)
             writer.stats(stats["loss"], stats["rew"], eps, stats["spm"], stats["buf"],
-                         win_sum / max(1.0, win_n), steps,
-                         [stats["eval"].get(k, 0.0)
-                          for k in ("随机", "脚本Lv1", "脚本Lv2", "脚本Lv3", "最早快照")])
+                         stats["win"], stats["draw"], stats["span"], stats["rpm"], steps,
+                         [(stats["eval"].get(k) or (0.0,))[0] for k in EVAL_NAMES])
 
     torch.save({"model": policy.state_dict(), "steps": steps}, config.CHECKPOINT)
     log.info("训练结束，共 %d 步", steps)
