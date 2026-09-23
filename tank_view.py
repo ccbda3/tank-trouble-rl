@@ -268,6 +268,7 @@ def follow(envs=VIEW_ENVS, seed=20240923):
     acts = np.zeros((envs, envs_p), dtype=np.int64)
     bot = None
     mode = 0
+    eps_mode = 0
     snap = np.zeros((envs,), dtype=DTYPE)
     ck_steps = 0
     ck_mtime = None
@@ -304,6 +305,8 @@ def follow(envs=VIEW_ENVS, seed=20240923):
                 mode = 1 - mode
                 if mode == 1 and bot is None:
                     bot = selfplay.ScriptedBot(envs, 3, 11)
+            if e.type == pygame.KEYDOWN and e.key == pygame.K_e:
+                eps_mode = 1 - eps_mode
 
         now = time.time()
         if now - last_ck >= 2.0:
@@ -322,10 +325,13 @@ def follow(envs=VIEW_ENVS, seed=20240923):
                 except Exception:
                     ck_mtime = None
 
+        eps_show = 0.0
+        if eps_mode == 1:
+            eps_show = float(stat[0]["eps"]) if stat is not None else 0.2
         with torch.no_grad():
             for j in range(envs_p):
                 acts[:, j] = net.act(network.obs_tensor(env.obs_pack(j)),
-                                     network.feat_tensor(env.feat(j)), 0.0).cpu().numpy()
+                                     network.feat_tensor(env.feat(j)), eps_show).cpu().numpy()
             if mode == 1 and bot is not None:
                 acts[:, 0] = bot.act(env, 0, [k for k in range(1, envs_p)])
         ctrl = np.zeros((envs, envs_p, 3), dtype=np.float32)
@@ -349,9 +355,10 @@ def follow(envs=VIEW_ENVS, seed=20240923):
             ck_steps, env_index + 1, envs, "/".join(str(int(v)) for v in s["score"]),
             int(s["round"]), 100.0 * min(1.0, int(s["rframe"]) / float(ROUND_LIMIT)))
         screen.blit(font.render(line1, True, (230, 230, 235)), (10, H + 4))
-        screen.blit(font.render("1-4 切台   M 切对手   ESC 退出", True, (140, 140, 150)), (560, H + 4))
-        line2 = "对手 %s   本地 60 帧/秒实时推演（2 秒拉一次最新检查点）" % (
-            "脚本Lv3" if mode == 1 else "自己（对等贪心）")
+        screen.blit(font.render("1-4 切台   M 切对手   E 切探索   ESC 退出", True, (140, 140, 150)), (520, H + 4))
+        line2 = "对手 %s   推演 ε %.2f（%s）   本地 60 帧/秒推演，2 秒拉一次最新检查点" % (
+            "脚本Lv3" if mode == 1 else "自己（对等）", eps_show,
+            "贪心，反映真实水平" if eps_mode == 0 else "跟随训练")
         screen.blit(font.render(line2, True, (150, 190, 235)), (10, H + 26))
         if st is None:
             line3 = "训练进程未开启，仅看当前检查点的对局"
