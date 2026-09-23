@@ -92,13 +92,6 @@ def pick_snapshot(pfsp):
     return int(min(np.searchsorted(np.cumsum(w), RNG.random()), len(pfsp) - 1))
 
 
-def _obs_montage(env, i=0, cols=4):
-    from aimonitor import imaging
-    ch = tank_vec.unpack(env.obs_pack(i)[i:i + 1])[0]
-    maps = [(ch[c] * 255).astype(np.uint8) for c in range(tank_vec.OBS_CH)]
-    return imaging.montage(maps, cols=cols, pad=1, pad_val=0)
-
-
 def _snap_table(snapshots, snap_at, pfsp, win, lose, draw):
     rows = []
     for i in range(len(snapshots)):
@@ -212,6 +205,7 @@ def main():
     rounds_total = 0
     rew_sum = rew_n = 0.0
     loss_sum = loss_n = 0.0
+    q_sum = td_sum = td_n = 0.0
     win_sum = win_n = 0.0
     draw_sum = 0.0
     span_sum = 0.0
@@ -220,52 +214,25 @@ def main():
     t_last = t0
     stats = {"loss": 0.0, "rew": 0.0, "eps": 1.0, "spm": 0.0, "buf": 0.0,
              "win": 0.5, "draw": 0.0, "span": 0.0, "rpm": 0.0, "rounds": 0.0,
-             "eval": {}, "pfsp": []}
+             "q_mean": 0.0, "td_mean": 0.0, "eval": {}}
 
     monitor = None
+    tmon = None
     writer = None
     if args.view:
         import tank_view
         writer = tank_view.Writer()
         log.info("观战共享内存已开启：另开一个窗口运行 python tank_view.py 就能看到实时对弈")
     if args.monitor:
-        import tank_view
-        from aimonitor import Monitor
-        monitor = Monitor("坦克动荡 · 自对弈", port=config.MONITOR_PORT)
-        monitor.metric("win", lambda: stats["win"], label="对局胜率", fmt="pct")
-        monitor.metric("draw", lambda: stats["draw"], label="平局率", fmt="pct")
-        monitor.metric("span", lambda: stats["span"], label="平均回合秒数", fmt="f2")
-        monitor.metric("rpm", lambda: stats["rpm"], label="局/分", fmt="int")
-        monitor.metric("loss", lambda: stats["loss"], label="TD 损失", fmt="f4")
-        monitor.metric("rew", lambda: stats["rew"], label="平均回报", fmt="f4")
-        monitor.metric("eps", lambda: stats["eps"], label="ε", fmt="f3")
-        monitor.metric("spm", lambda: stats["spm"], label="每秒步数", fmt="int")
-        monitor.metric("buf", lambda: stats["buf"], label="回放池(千)", fmt="f1")
-        for nm in EVAL_NAMES:
-            monitor.metric("eval_" + nm,
-                           lambda n=nm: (stats["eval"].get(n) or (None,))[0],
-                           label="对" + nm + "胜率", fmt="pct")
+        import tank_monitor
+        tmon = tank_monitor.TankMonitor(env, policy, target, replay, stats,
+                                        lambda: steps, args)
+        monitor = tmon.build()
         monitor.bars("pool", lambda: [("快照%d" % (i + 1), w) for i, w in enumerate(pfsp)],
                      label="对手池采样权重")
         monitor.table("snap", lambda: _snap_table(snapshots, snap_at, pfsp, snap_win,
                                                   snap_lose, snap_draw),
                       label="快照池", columns=["快照", "诞生步数", "权重", "胜", "负", "平", "对局胜率"])
-        monitor.image("battle", lambda: tank_view.render_rgb(env, 0),
-                      label="实时对局 1", scale=1, group="战场")
-        monitor.image("battle2", lambda: tank_view.render_rgb(env, 1),
-                      label="实时对局 2", scale=1, group="战场")
-        monitor.image("obs", lambda: _obs_montage(env, 0),
-                      label="观测通道（1 号位视角）", scale=3, group="输入")
-        monitor.health("steps", lambda: steps, label="已训练步数")
-        monitor.health("rounds", lambda: stats["rounds"], label="累计对局数")
-        monitor.info(lambda: {
-            "device": "设备 %s" % network.DEVICE,
-            "obs": "观测 %d×%d×%d" % (tank_vec.OBS_CH, tank_vec.OBS_H, tank_vec.OBS_W),
-            "envs": "并行 %d 局" % args.envs,
-            "limit": "回合上限 %.0f 秒" % (tank_vec.ROUND_LIMIT * DT),
-        })
-        monitor.watchdog("steps", lambda: steps, label="训练步数", timeout=30.0)
-        monitor.attach_logger(log)
         monitor.start()
         log.info("监控面板 http://127.0.0.1:%d", config.MONITOR_PORT)
 
@@ -301,6 +268,8 @@ def main():
         rew += config.ITEM_REWARD * env.picked[np.arange(args.envs), sides]
         rew[new & (dead == sides)] = -1.0
         rew[new & (dead >= 0) & (dead != sides)] = 1.0
+        if tmon is not None:
+            tmon.count_acts(acts)
         rounds_total += int(new.sum())
         rew_sum += float(rew.sum())
         rew_n += args.envs
@@ -358,6 +327,11 @@ def main():
                 replay.update_prio(slot, td.detach().cpu().numpy())
                 loss_sum += float(loss.item())
                 loss_n += 1
+                q_sum += float(q.detach().mean().item())
+                td_sum += float(td.detach().abs().mean().item())
+                td_n += 1
+                if tmon is not None:
+                    tmon.tick_update(policy)
             if steps - last_target >= config.TARGET_EVERY:
                 last_target = steps
                 target.load_state_dict(policy.state_dict())
@@ -389,12 +363,14 @@ def main():
                           "eps": eps, "spm": spm, "buf": replay.size / 1000.0,
                           "win": win_rate, "draw": draw_rate, "span": span,
                           "rpm": rpm, "rounds": float(rounds_total),
-                          "pfsp": list(pfsp)})
+                          "q_mean": q_sum / max(1.0, td_n),
+                          "td_mean": td_sum / max(1.0, td_n)})
             log.info("步 %d  %.0f 步/秒  ε %.3f  回报 %+.3f  胜率 %.1f%%  平局 %.1f%%  "
                      "回合 %.1f 秒  %.0f 局/分  回放 %.0fk  损失 %.4f",
                      steps, spm, eps, stats["rew"], 100.0 * win_rate, 100.0 * draw_rate,
                      span, rpm, stats["buf"], stats["loss"])
             loss_sum = loss_n = 0.0
+            q_sum = td_sum = td_n = 0.0
             rew_sum = rew_n = 0.0
             win_sum = win_n = 0.0
             draw_sum = 0.0
@@ -424,6 +400,8 @@ def main():
 
     torch.save({"model": policy.state_dict(), "steps": steps}, config.CHECKPOINT)
     log.info("训练结束，共 %d 步", steps)
+    if tmon is not None:
+        tmon.close()
     if monitor is not None:
         monitor.stop()
     if writer is not None:

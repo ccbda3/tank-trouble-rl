@@ -4,6 +4,7 @@ import sys
 import numpy as np
 
 import tank
+import tank_vec
 from tank_vec import B_MAX, C_MAX, L_MAX, M_MAX, NC, NR, ROUND_LIMIT, WEAPON_KINDS, Z_MAX
 
 SHM_NAME = "tank_view_state"
@@ -215,6 +216,124 @@ class Writer:
         self.stats_shm.close()
 
 
+def follow(envs=VIEW_ENVS, seed=20240923):
+    import os
+    import time
+
+    import pygame
+    import torch
+
+    import config
+    import network
+    import selfplay
+
+    env = tank_vec.VecEnv(envs, 2, seed=seed)
+    feat_dim = env.feat(0).shape[1]
+    net = network.make(feat_dim)
+    net.eval()
+    bot = None
+    mode = 0
+    snap = np.zeros((envs,), dtype=DTYPE)
+    ck_steps = 0
+    ck_mtime = None
+    last_ck = 0.0
+
+    stat = None
+    stat_shm = None
+    try:
+        from multiprocessing import shared_memory
+        stat_shm = shared_memory.SharedMemory(name=STATS_NAME)
+        stat = np.ndarray((1,), dtype=STATS, buffer=stat_shm.buf)
+    except (FileNotFoundError, ValueError):
+        stat = None
+
+    pygame.init()
+    W, H = int(tank.WIDTH), int(tank.HEIGHT)
+    HUD = 74
+    screen = pygame.display.set_mode((W, H + HUD))
+    pygame.display.set_caption("坦克动荡 · 跟随训练观战")
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont("Microsoft YaHei", 17)
+    wall_surf = [None] * envs
+    wall_key = [None] * envs
+    dt = 1.0 / 60.0
+    env_index = 0
+    running = True
+    while running:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
+                running = False
+            if e.type == pygame.KEYDOWN and pygame.K_1 <= e.key <= pygame.K_4:
+                env_index = min(envs - 1, e.key - pygame.K_1)
+            if e.type == pygame.KEYDOWN and e.key == pygame.K_m:
+                mode = 1 - mode
+                if mode == 1 and bot is None:
+                    bot = selfplay.ScriptedBot(envs, 3, 11)
+
+        now = time.time()
+        if now - last_ck >= 2.0:
+            last_ck = now
+            try:
+                m = os.path.getmtime(config.CHECKPOINT)
+            except OSError:
+                m = None
+            if m is not None and m != ck_mtime:
+                ck_mtime = m
+                try:
+                    ck = torch.load(config.CHECKPOINT, map_location=network.DEVICE)
+                    net.load_state_dict(ck["model"])
+                    net.eval()
+                    ck_steps = int(ck.get("steps", 0))
+                except Exception:
+                    ck_mtime = None
+
+        with torch.no_grad():
+            a0 = net.act(network.obs_tensor(env.obs_pack(0)), network.feat_tensor(env.feat(0)),
+                         0.0).cpu().numpy()
+            if mode == 1 and bot is not None:
+                a1 = bot.act(env, 1, 0)
+            else:
+                a1 = net.act(network.obs_tensor(env.obs_pack(1)), network.feat_tensor(env.feat(1)),
+                             0.0).cpu().numpy()
+        ctrl = np.zeros((envs, 2, 3), dtype=np.float32)
+        ctrl[:, 0] = tank_vec.CTRL[a0]
+        ctrl[:, 1] = tank_vec.CTRL[a1]
+        env.step(ctrl, dt)
+
+        for i in range(envs):
+            _fill(snap[i], env, i)
+        for i in range(envs):
+            key = (int(snap[i]["round"]), i)
+            if key != wall_key[i]:
+                wall_key[i] = key
+                wall_surf[i] = build_walls(snap[i])
+        s = snap[env_index]
+        draw_scene(screen, s, wall_surf[env_index])
+        st = None if stat is None else stat[0]
+        pygame.draw.rect(screen, (14, 14, 18), (0, H, W, HUD))
+        line1 = "跟随检查点 %d 步   对局 %d/%d   比分 %d : %d   回合 %d   回合进度 %.0f%%" % (
+            ck_steps, env_index + 1, envs, int(s["score"][0]), int(s["score"][1]),
+            int(s["round"]), 100.0 * min(1.0, int(s["rframe"]) / float(ROUND_LIMIT)))
+        screen.blit(font.render(line1, True, (230, 230, 235)), (10, H + 4))
+        screen.blit(font.render("1-4 切台   M 切对手   ESC 退出", True, (140, 140, 150)), (560, H + 4))
+        line2 = "对手 %s   本地 60 帧/秒实时推演（2 秒拉一次最新检查点）" % (
+            "脚本Lv3" if mode == 1 else "自己（对等贪心）")
+        screen.blit(font.render(line2, True, (150, 190, 235)), (10, H + 26))
+        if st is None:
+            line3 = "训练进程未开启，仅看当前检查点的对局"
+        else:
+            names = ("随机", "脚本1", "脚本2", "脚本3", "快照")
+            line3 = "训练 ε %.2f   胜率 %.0f%%   平局 %.0f%%   回合 %.1f 秒   评测: %s" % (
+                float(st["eps"]), 100.0 * float(st["win"]), 100.0 * float(st["draw"]),
+                float(st["span"]),
+                " ".join("%s%.0f%%" % (n, 100.0 * float(v)) for n, v in zip(names, st["eval"])))
+        screen.blit(font.render(line3, True, (150, 150, 160)), (10, H + 48))
+        pygame.display.flip()
+        clock.tick(60)
+    pygame.quit()
+    return 0
+
+
 def viewer(env_index=0):
     import pygame
     from multiprocessing import shared_memory
@@ -280,5 +399,9 @@ def viewer(env_index=0):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--env", type=int, default=0)
+    ap.add_argument("--follow", action="store_true")
+    ap.add_argument("--envs", type=int, default=VIEW_ENVS)
     a = ap.parse_args()
+    if a.follow:
+        sys.exit(follow(a.envs))
     sys.exit(viewer(a.env))
