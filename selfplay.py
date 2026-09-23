@@ -225,6 +225,7 @@ def main():
         log.info("断点续训：载入 %s，从第 %d 步继续", config.CHECKPOINT, steps)
 
     it = 0
+    steps0 = steps
     rounds_total = 0
     rew_sum = rew_n = 0.0
     loss_sum = loss_n = 0.0
@@ -389,7 +390,7 @@ def main():
         now = time.time()
         if now - t_last >= 10.0:
             el = now - t0
-            spm = steps / el
+            spm = (steps - steps0) / el
             place = place_sum / max(1.0, place_n)
             draw_rate = draw_sum / max(1.0, rounds_total)
             span = span_sum / max(1.0, span_n) * DT
