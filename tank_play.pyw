@@ -195,10 +195,37 @@ def draw_hud():
         surf = font_small.render(txt, True, TANK_COLORS[t.side])
         screen.blit(surf, (x, HEIGHT + 9))
         x += surf.get_width() + 16
-    if world.over and world.dead is not None:
-        surf = font_big.render("P%d 阵亡" % (world.dead + 1), True, TANK_COLORS[world.dead])
+    if world.over:
+        if world.timed_out:
+            txt = "时间到 · 本轮无人取胜"
+            col = DIM
+        elif world.last_standing:
+            alive = [t for t in world.tanks if t.alive]
+            if alive:
+                txt = "P%d 存活到最后" % (alive[0].side + 1)
+                col = TANK_COLORS[alive[0].side]
+            else:
+                txt = "平局"
+                col = DIM
+        elif world.dead is not None:
+            txt = "P%d 阵亡" % (world.dead + 1)
+            col = TANK_COLORS[world.dead]
+        else:
+            txt = ""
+            col = DIM
+    else:
+        txt = ""
+        col = DIM
+    if txt:
+        surf = font_big.render(txt, True, col)
         screen.blit(surf, (WIDTH - surf.get_width() - 14, HEIGHT + 4))
-    screen.blit(font_tip.render(TIP1, True, TEXT), (12, HEIGHT + 36))
+    if mode == 4 and world.round_limit > 0.0:
+        left = max(0.0, world.round_limit - world.round_t)
+        surf = font_small.render("回合剩余 %.0f 秒" % left, True,
+                                 DIM if left > 15.0 else (230, 170, 90))
+        screen.blit(surf, (WIDTH - surf.get_width() - 14, HEIGHT + 34))
+    tip1 = TIP1_M4 if mode == 4 else TIP1
+    screen.blit(font_tip.render(tip1, True, TEXT), (12, HEIGHT + 36))
     screen.blit(font_tip.render(TIP2, True, DIM), (12, HEIGHT + 36 + tip_h + 3))
     screen.blit(font_tip.render(TIP3, True, DIM), (12, HEIGHT + 36 + 2 * (tip_h + 3)))
 
@@ -212,6 +239,7 @@ def draw_menu():
             "1   单人（对战 Laika）",
             "2   双人同屏",
             "3   三人同屏（P3 用鼠标）",
+            "4   四人混战（你 + 3 个 Laika，活到最后算赢）",
             "",
             "ESC  退出",
         )
@@ -246,10 +274,11 @@ font_tag = make_font(14)
 font_menu = make_font(26)
 
 TIP1 = "P1：↑ ↓ ← → 移动   M 开火        P2：W A S D 移动   Q 开火        P3：鼠标转向 + 左键开火"
+TIP1_M4 = "四人混战：你是 P1（红）↑ ↓ ← → 移动、M 开火   黄/绿/蓝 依次是 Laika 简单/普通/疯狂"
 TIP2 = "道具限时，捡到新的直接覆盖并重置倒计时；道具到时间自动变回普通弹。R 重开对局   ESC 回菜单"
 TIP3 = "加特林 按住连发 | 追踪导弹 延迟后追最近敌车 | 破片炸弹 撞墙炸出弹片 | 双管炮 一次两发 | 激光 穿墙瞬发秒杀 | 护盾 挡一次 | 地雷 原地埋雷谁踩谁炸"
 tip_size = 15
-while tip_size > 9 and max(make_font(tip_size).size(t)[0] for t in (TIP1, TIP2, TIP3)) > WIDTH - 24:
+while tip_size > 9 and max(make_font(tip_size).size(t)[0] for t in (TIP1, TIP1_M4, TIP2, TIP3)) > WIDTH - 24:
     tip_size -= 1
 font_tip = make_font(tip_size)
 tip_h = font_tip.get_height()
@@ -271,17 +300,24 @@ KEYS_P2 = bind_keys(tank.P2_KEYMAP)
 stage = 1
 mode = 0
 level = 2
-laika = None
+laikas = {}
 world = None
 running = True
 
 
 def start(m, lv):
-    global world, laika, mode, level, stage
+    global world, laikas, mode, level, stage
     mode = m
     level = lv
-    world = World(None, tanks=2 if m == 1 else m)
-    laika = tank.Laika(lv, seed=m * 31 + lv) if m == 1 else None
+    if m == 1:
+        world = World(None, tanks=2)
+        laikas = {1: tank.Laika(lv, seed=m * 31 + lv)}
+    elif m == 4:
+        world = World(None, tanks=4, last_standing=True)
+        laikas = {i: tank.Laika(i, seed=m * 31 + i) for i in (1, 2, 3)}
+    else:
+        world = World(None, tanks=m)
+        laikas = {}
     stage = 0
 
 
@@ -306,11 +342,11 @@ while running:
                     running = False
                 else:
                     stage = 1
-            elif stage == 1 and event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
+            elif stage == 1 and event.key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4):
                 if event.key == pygame.K_1:
                     stage = 2
                 else:
-                    start(event.key - pygame.K_0 - 1, level)
+                    start(event.key - pygame.K_0, level)
             elif stage == 2 and event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
                 start(1, event.key - pygame.K_0)
             elif not stage and event.key == pygame.K_r:
@@ -322,8 +358,10 @@ while running:
     keys = pygame.key.get_pressed()
     ctrls = []
     for i in range(len(world.tanks)):
-        if mode == 1 and i == 1:
-            ctrls.append(laika.act(world, world.tanks[i], world.tanks[0], DT))
+        lk = laikas.get(i)
+        if lk is not None:
+            foes = [world.tanks[j] for j in range(len(world.tanks)) if j != i]
+            ctrls.append(lk.act(world, world.tanks[i], foes, DT))
         elif mode == 3 and i == 2:
             ctrls.append(p3_ctrl())
         else:

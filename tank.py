@@ -72,8 +72,9 @@ CAPSULE_R = 11.0
 CAPSULE_TTL = 22.0
 CAPSULE_EVERY = 5.5
 CAPSULE_MAX = 3
+MELEE_ROUND_TIME = 60.0
 
-TANK_COLORS = ((214, 48, 44), (48, 96, 214), (34, 158, 70))
+TANK_COLORS = ((214, 48, 44), (48, 96, 214), (34, 158, 70), (216, 176, 40))
 
 P1_KEYMAP = {
     "up": ("up",),
@@ -315,8 +316,10 @@ class Mine:
 
 
 class World:
-    def __init__(self, seed=None, tanks=2):
+    def __init__(self, seed=None, tanks=2, last_standing=False):
         self.tanks = [Tank(0.0, 0.0, 0.0, i) for i in range(tanks)]
+        self.last_standing = bool(last_standing)
+        self.round_limit = MELEE_ROUND_TIME if last_standing else 0.0
         self.reset(seed)
 
     def reset(self, seed=None):
@@ -344,6 +347,8 @@ class World:
         self.pause = 0.0
         self.over = False
         self.dead = None
+        self.round_t = 0.0
+        self.timed_out = False
         self.spawn_t = CAPSULE_EVERY * 0.5
         self._spawn_tanks()
         return self
@@ -819,7 +824,21 @@ class World:
             if alive and not hit:
                 keep.append(b)
         self.bullets = keep
-        if any(not t.alive for t in self.tanks):
+        alive = [t for t in self.tanks if t.alive]
+        if self.last_standing:
+            if len(alive) <= 1:
+                if len(alive) == 1:
+                    alive[0].score += 1
+                self.over = True
+                self.pause = DEATH_PAUSE
+            else:
+                self.round_t += dt
+                if self.round_limit > 0.0 and self.round_t >= self.round_limit:
+                    self.over = True
+                    self.pause = DEATH_PAUSE
+                    self.dead = None
+                    self.timed_out = True
+        elif any(not t.alive for t in self.tanks):
             self.over = True
             self.pause = DEATH_PAUSE
 
@@ -921,8 +940,21 @@ class Laika:
                 best = (score, a)
         return None if best is None else best[1]
 
-    def act(self, world, me, foe, dt):
+    def act(self, world, me, foes, dt):
         if not me.alive or world.over:
+            return (0, 0, 0)
+        if not isinstance(foes, (list, tuple)):
+            foes = (foes,)
+        foe = None
+        best = None
+        for o in foes:
+            if o is me or not o.alive:
+                continue
+            d = (o.x - me.x) ** 2 + (o.y - me.y) ** 2
+            if best is None or d < best:
+                best = d
+                foe = o
+        if foe is None:
             return (0, 0, 0)
         me.speed_mul = self.speed_mul
         me.turn_mul = self.turn_mul
