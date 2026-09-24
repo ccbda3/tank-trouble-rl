@@ -37,6 +37,7 @@ import buffer
 import config
 import network
 import tank
+import tank_pool
 import tank_vec
 
 # 物理步长，固定 60Hz，和环境引擎内部的时间约定一致
@@ -186,22 +187,6 @@ def policy_actions_batch(policy, pack, feat, eps):
         return policy.act(network.obs_tensor(pack), network.feat_tensor(feat), eps).cpu().numpy()
 
 
-# 把若干个座位的同帧观测按座位分组、拼成一个连续 batch（顺序必须和 _scatter_seats 一致）。
-def _gather_seats(src, rows, idx):
-    parts = [src[j][rows[idx[j]]] for j in range(len(idx)) if idx[j].size]
-    return np.concatenate(parts) if parts else None
-
-
-# 把整批前向输出的动作按座位拆开，散回 acts 对应的 (环境行, 座位) 位置。
-def _scatter_seats(dst, a, rows, idx):
-    off = 0
-    for j in range(len(idx)):
-        n_j = int(idx[j].size)
-        if n_j:
-            dst[rows[idx[j]], j] = a[off:off + n_j]
-            off += n_j
-
-
 # 按 PFSP（Prioritized Fictitious Self-Play）思路从对手池里抽一份快照当本组对手。
 # 核心是"越是打不过的对手，越要多打"：权重先做 PFSP_POWER=2 的幂次放大
 # （拉开强弱快照之间的差距），再归一化，最后用累积分布做轮盘赌抽样。
@@ -297,6 +282,9 @@ def main():
     # --resume: 从检查点续训。
     ap.add_argument("--minutes", type=float, default=10.0)
     ap.add_argument("--envs", type=int, default=config.ENVS)
+    # --workers：把并行环境拆成几个子进程去推演（详见 tank_pool.py）。
+    # 环境推演是纯 numpy、单核跑满也就那样，拆成 4 份才能真正吃满多核。
+    ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--monitor", action="store_true")
     ap.add_argument("--view", action="store_true")
     ap.add_argument("--resume", action="store_true")
@@ -304,6 +292,11 @@ def main():
     # 两组实验的存档必须分开，否则后一组会把前一组的成果覆盖掉。
     ap.add_argument("--ckpt", default=config.CHECKPOINT)
     ap.add_argument("--log", default=config.LOG)
+    # --steps-max：累计步数上限（0 表示不限，只按 --minutes 的墙钟时间跑）。
+    # 为什么要它：A/B 对比两种训练配置时，如果按墙钟时间跑，机器一快慢两组的
+    # 实际步数就不一样（比如提速后同样的 30 分钟能多跑 50% 的步），
+    # 届时分不清差异是来自配置还是来自"多练了一会儿"。按步数封顶能把变量钉死。
+    ap.add_argument("--steps-max", type=float, default=0.0)
     # 迷宫连通度课程（课程学习）：从 --braid-from 线性退火到 --braid-to，
     # 跨 --braid-steps 步走完。不给 --braid-from 就固定用生成器默认值（0.70）。
     ap.add_argument("--braid-from", type=float, default=None)
@@ -324,8 +317,13 @@ def main():
              tank_vec.VecEnv(1, config.PLAYERS, 0).feat(0).shape[1])
 
     players = config.PLAYERS
-    env = tank_vec.VecEnv(args.envs, players, seed=config.SEED)
-    feat_dim = env.feat(0).shape[1]
+    # 特征维度只跟座位数有关，拿一个 1 局的空环境问一下就够了
+    feat_dim = tank_vec.VecEnv(1, players, 0).feat(0).shape[1]
+    # 环境放进子进程池里并行推演（见 tank_pool.py）：主进程只负责网络与训练。
+    # mirror 打开时子进程会额外抄一份整局物理状态，供监控面板/观战窗口读取。
+    pool = tank_pool.EnvPool(args.envs, players, feat_dim, workers=args.workers,
+                             seed=config.SEED, braid=args.braid_from,
+                             mirror=(args.monitor or args.view))
     # policy 是在线网络：负责选动作，也是唯一被梯度更新的网。
     # target 是目标网络：只负责提供 bootstrap 的目标价值，参数定期从 policy 硬拷贝、
     # 其余时间冻结。这是 DQN 能稳定的关键——如果目标和在线是同一张网，每次更新都会
@@ -358,8 +356,9 @@ def main():
     #                  使"(受测座位, 对手快照)"的所有组合都被公平覆盖
     #   seat_group  —— 每个 (环境, 座位) 属于哪一组
     #   is_policy   —— True 表示该座位本帧用当前策略出动作；False 表示用对手快照
-    # rows_p/rows_s 是环境行号，idx_p/idx_s 是"按座位分组后在该批次里的位置"，
-    # 供 _gather_seats / _scatter_seats 拼接与散回观测用。
+    #   idx_p/idx_s —— 把上面那张布尔表按 (环境序号 × 座位数 + 座位号) 展平后取出的下标。
+    #                  这个展平顺序和环境池里观测/特征的排布、NStep 的时间线编号一致，
+    #                  所以整批前向可以直接拿它去索引，不用再逐座位拼接。
     own = np.zeros(groups, dtype=np.int64)
     for g in range(1, groups):
         own[g] = (g - 1) % players
@@ -367,10 +366,8 @@ def main():
     for g in range(groups):
         seat_group[g * size:(g + 1) * size] = g
     is_policy = (seat_group == 0) | (own[seat_group] == np.arange(players)[None, :])
-    rows_p, seats_p = np.nonzero(is_policy)
-    rows_s, seats_s = np.nonzero(~is_policy)
-    idx_p = [np.nonzero(seats_p == j)[0] for j in range(players)]
-    idx_s = [np.nonzero(seats_s == j)[0] for j in range(players)]
+    idx_p = np.nonzero(is_policy.reshape(-1))[0]
+    idx_s = np.nonzero((~is_policy).reshape(-1))[0]
     # 对手池的五个平行数组（下标一一对应）：
     #   snapshots   —— 冻结的网络本体
     #   snap_at     —— 各快照诞生在第几步（用于面板展示）
@@ -447,7 +444,9 @@ def main():
     # 读到最新状态——对手池权重、快照表都是在训练过程中不断变化的。
     if args.monitor:
         import tank_monitor
-        tmon = tank_monitor.TankMonitor(env, policy, target, replay, stats,
+        # 面板读的是环境池的"镜像"（子进程抄进共享内存的整局状态），
+        # 它跟 VecEnv 接口一样，只是只读，所以面板代码不用改。
+        tmon = tank_monitor.TankMonitor(pool.mirror, policy, target, replay, stats,
                                         lambda: steps, args)
         monitor = tmon.build()
         monitor.bars("pool", lambda: [("快照%d" % (i + 1), w) for i, w in enumerate(pfsp)],
@@ -457,62 +456,58 @@ def main():
         monitor.start()
         log.info("监控面板 http://127.0.0.1:%d", config.MONITOR_PORT)
 
-    # 主循环：按墙钟时间跑满 --minutes 分钟（而不是按固定步数，便于控制实验时长）。
+    # 主循环：按墙钟时间跑满 --minutes 分钟（而不是按固定步数，便于控制实验时长），
+    # 或者按 --steps-max 的累计步数封顶（做 A/B 对比时用它把两组的步数钉成一样）。
     deadline = t0 + args.minutes * 60.0
     # 迷宫难度课程（课程学习）的步数起点：从续训点开始算，跑满 --braid-steps 步退火到位。
     braid_base = steps
-    # 首帧的观测：之后每帧都复用上一帧算好的"末帧观测"，不再每帧算两遍（见循环末尾）。
-    packs = [env.obs_pack(j) for j in range(players)]
-    feats = [env.feat(j) for j in range(players)]
-    while time.time() < deadline:
+    braid = args.braid_from
+    while time.time() < deadline and (args.steps_max <= 0 or steps < args.steps_max):
         it += 1
         # 按训练进度线性调整迷宫连通度：一开始给最开阔的地图（几乎没死胡同），
         # 让策略先学会"瞄准、躲弹、别把自己打死"这些能在开阔场里获得密集反馈的技能，
         # 再逐步加回死胡同，逼它学走廊反弹这种真正的难点。
         # 只影响"之后新生成的迷宫"，已经在打的这局不会被中途换图。
-        if args.braid_from is not None:
+        if braid is not None:
             frac = min(1.0, max(0.0, (steps - braid_base) / args.braid_steps))
-            env.braid = args.braid_from + (args.braid_to - args.braid_from) * frac
+            braid = args.braid_from + (args.braid_to - args.braid_from) * frac
+            pool.set_braid(braid)
         # ---- 采样阶段 ----
-        # 每个座位一份观测（网络按座位分别看自己视角的画面），由循环末尾续上。
-        ctrl = np.zeros((args.envs, players, 3), dtype=np.float32)
+        # 环境池里的观测直接按 (局, 座位, 图) 摆在共享内存里，展平后就是
+        # (局×座位数 + 座位号, 图) 的零拷贝视图，正好能整批喂给网络。
+        obs_flat = pool.obs_flat
+        feat_flat = pool.feat_flat
         # ε-贪心探索率：从 EPS_START=1.0 线性衰减到 EPS_END=0.05，衰减跨 3000 万步。
         # 3000 万步是上千局的量级：足够让策略在"敢乱试"阶段把走位/瞄准/道具的基本盘踩完。
         # 衰减太快会提前锁死在坏策略上再也出不来，太慢则后期还在乱按、曲线上看不出进步。
         # 末端保留 0.05 的残余探索，是为了始终维持一点探索能力。
         eps = max(config.EPS_END, config.EPS_START - steps / config.EPS_DECAY)
-        # acts 是网络输出的离散动作 id，ctrl 是喂给物理引擎的连续控制量。
-        acts = np.zeros((args.envs, players), dtype=np.int64)
+        # acts 是网络输出的离散动作 id（展平成一维，下标 = 局序号 × 座位数 + 座位号）
+        acts = np.zeros(args.envs * players, dtype=np.int64)
         # 本帧给第 1~3 组抽一份共同的陪练快照。抽签仍然是按 PFSP 权重来的，
         # 只是"每帧抽一次"而不是"每组各抽一次"：快照的采样分布不变，
         # 但这样 3 个组的 9 个对手座位可以合并成一次前向。
         snap_k = pick_snapshot(pfsp)
         # 当前策略负责的座位一次算完：第 0 组全部 4 个座位 + 第 1~3 组各 1 个受测座位。
         # 这些座位规则完全对称、共用一张网，合批不会改变任何决策结果。
-        a = policy_actions_batch(policy, _gather_seats(packs, rows_p, idx_p),
-                                 _gather_seats(feats, rows_p, idx_p), eps)
-        _scatter_seats(acts, a, rows_p, idx_p)
+        acts[idx_p] = policy_actions_batch(policy, obs_flat[idx_p], feat_flat[idx_p], eps)
         # 对手座位也一次算完。统一用 snapshots[snap_k]，并保留 OPP_EPS=0.08 的随机性：
         # 完全确定的对手会让策略学会"背板"而不是学会应对不确定性，也更容易被针对性利用。
-        a = snapshots[snap_k].act(_gather_seats(packs, rows_s, idx_s),
-                                  _gather_seats(feats, rows_s, idx_s), config.OPP_EPS)
-        _scatter_seats(acts, a, rows_s, idx_s)
-        # 把 18 个离散动作 id 翻译回连续的（转向, 油门, 开火）控制量。
-        for j in range(players):
-            ctrl[:, j] = tank_vec.CTRL[acts[:, j]]
-
-        # 推进物理之前先快照三个"推进前"的状态，后面判断哪些转移算有效经验全靠它们：
-        #   before      —— 该座位这一帧开始时是否还活着
-        #   running     —— 该局这一帧开始时是否还没结束
-        #   prev_rounds —— 与推进后的 rounds 比较，用来识别"这一帧打完了哪些局"
-        before = env.t_alive.copy()
-        running = ~env.over.copy()
-        prev_rounds = env.rounds.copy()
-        env.step(ctrl, DT)
+        acts[idx_s] = snapshots[snap_k].act(obs_flat[idx_s], feat_flat[idx_s], config.OPP_EPS)
+        # 把 18 个离散动作 id 翻译回连续的（转向, 油门, 开火）控制量，交给环境池并行推进。
+        # 子进程内部会按单进程版完全相同的顺序做完"推物理 → 算观测 → 重开打完的局"。
+        pool.step(tank_vec.CTRL[acts].reshape(args.envs, players, 3))
         # 一帧 = 一个决策步；步数按 环境数 × 座位数 累加，因为每个 (环境, 座位) 都产出一条转移
         steps += args.envs * players
-        new = (env.rounds - prev_rounds) > 0
-        died = env.just_died
+        # 推进后从共享内存读回这一帧的标量（子进程已经算好了，主进程不再碰物理）：
+        #   aux[:,,A_*] 逐座位，aux_env[:,E_*] 逐局，列的含义见 tank_pool.py 开头
+        aux = pool.aux
+        aux_env = pool.aux_env
+        valid = (aux[:, :, tank_pool.A_VALID] > 0.5)          # 帧开始时就活着且这局还在打
+        died = (aux[:, :, tank_pool.A_DIED] > 0.5)            # 这一帧刚阵亡
+        new = aux_env[:, tank_pool.E_NEW] > 0.5               # 这一局这一帧打完了
+        place = aux[:, :, tank_pool.A_PLACE]                  # 名次（本局结束时才有意义）
+        winner = aux_env[:, tank_pool.E_WINNER].astype(np.int64)
         # 奖励设计：整体是稀疏奖励，只有终局才有 ±1 的实质信号，中途加一点点塑形信号。
         #   * 基线 STEP_PENALTY = -0.001：每步都扣一点，让"磨蹭不出手"有代价。
         #     否则在纯稀疏奖励下，最优行为很容易退化成原地躲着不动、等别人互相打死
@@ -522,12 +517,12 @@ def main():
         #   * 被淘汰 -1：终局负信号；活到最后 +1（见下面）。
         # 顺序是：先全填步惩罚 → 叠加道具奖励 → 覆盖阵亡惩罚 → 再补赢家 +1。
         rew = np.full((args.envs, players), config.STEP_PENALTY, dtype=np.float32)
-        rew += config.ITEM_REWARD * env.picked
+        rew += config.ITEM_REWARD * aux[:, :, tank_pool.A_PICKED]
         rew[died] = -1.0
         won_seats = 0
         if new.any():
             r = np.nonzero(new)[0]
-            w = env.winner[r]
+            w = winner[r]
             # winner < 0 表示超时平局、没有赢家，这种情况不给任何终局奖励
             ok = w >= 0
             rew[r[ok], w[ok]] = 1.0
@@ -543,15 +538,15 @@ def main():
         rew_sum += float(rew.sum())
         rew_n += args.envs * players
         # 名次只在"有人阵亡"或"有人夺冠"时才有效，所以分子分母都只按这两类事件累加
-        place_sum += float(env.place[died].sum()) + float(won_seats)
+        place_sum += float(place[died].sum()) + float(won_seats)
         place_n += float(died.sum()) + won_seats
         death_sum += float(died.sum())
         # 自杀 = 被自己打出的子弹打死，是衡量策略"会不会自爆"的关键指标
-        suicide_sum += float((died & env.suicide).sum())
+        suicide_sum += float((died & (aux[:, :, tank_pool.A_SUICIDE] > 0.5)).sum())
         # 平局 = 回合结束但没有赢家（超时收局）
-        draw_sum += float((new & (env.winner < 0)).sum())
+        draw_sum += float((new & (winner < 0)).sum())
         if new.any():
-            span_sum += float(env.round_frames[new].sum())
+            span_sum += float(aux_env[new, tank_pool.E_FRAMES].sum())
             span_n += int(new.sum())
         # 回填快照名次统计（只统计第 1~3 组，也就是有快照当陪练的那些组）。
         # 受测座位号是 own[g]，取它在本局拿到的名次。
@@ -561,55 +556,26 @@ def main():
             sl = slice(g * size, (g + 1) * size)
             m = new[sl]
             if m.any():
-                p = env.place[sl][m, own[g]]
+                p = place[sl][m, own[g]]
                 p = p[p > 0]
                 snap_place[snap_k] += float(p.sum())
                 snap_rounds[snap_k] += float(p.size)
         if tmon is not None:
             # 把本帧的动作分布喂给面板，用来看策略有没有退化成一两个动作
-            tmon.count_acts(acts)
+            tmon.count_acts(acts.reshape(args.envs, players))
 
         # ---- 存池阶段 ----
-        # 推进后的观测就是"下一帧状态"
-        packs_next = [env.obs_pack(j) for j in range(players)]
-        feats_next = [env.feat(j) for j in range(players)]
-        # valid = 该座位这一帧开始时还活着，且该局当时还没结束。
-        # 为什么要判这个：如果座位这一帧开始时就已阵亡，或者这局已经结束，那么它这一帧的
-        # obs/act/rew 都是毫无意义的"死亡停顿帧"（引擎已不再驱动它，动作和奖励都是空的），
-        # 把它们当经验灌进池子等于给网络喂噪声。
-        valid = before & running[:, None]
-        # stream 编号 s = 环境序号 × 座位数 + 座位号：把二维的 (环境, 座位) 展平成
-        # 一维时间线编号，和 NStep 初始化时的 n_streams = 环境数 × 座位数 对应，
-        # 保证每条 (环境, 座位) 时间线都有自己独立的 n-step 队列。
-        # np.stack(axis=1) 把 4 个座位的观测拼成 (环境, 座位, H, W)，再 reshape 成
-        # (环境×座位, H, W) 就是零拷贝视图，索引恰好是 i*座位数 + j，与 stream 编号一致。
-        shape = (tank_vec.OBS_H, tank_vec.OBS_W)
-        pk = np.stack(packs, axis=1).reshape(-1, *shape)
-        nk = np.stack(packs_next, axis=1).reshape(-1, *shape)
-        ft = np.stack(feats, axis=1).reshape(-1, feat_dim)
-        nf = np.stack(feats_next, axis=1).reshape(-1, feat_dim)
-        # nstep.push 整批推进所有时间线，返回本帧"已经凑够 NSTEP 步 / 遇到 done"的样本；
-        # 一条都没凑够时返回 None。样本里存的是 n-step 折扣回报，不是单步奖励。
-        out = nstep.push(valid.reshape(-1), pk, ft, acts.reshape(-1), rew.reshape(-1),
-                         nk, nf, done.reshape(-1))
+        # 这一帧的 (obs, act, rew) 与下一帧的 (obs) 直接就是共享内存里那两块双缓冲的
+        # 视图，不需要任何拷贝或序列化；展平顺序（局序号 × 座位数 + 座位号）与 NStep
+        # 的时间线编号一致，NStep 整批推进后返回本帧能入池的样本（一条都没有时返回 None）。
+        out = nstep.push(valid.reshape(-1), pool.prev_obs_flat, pool.prev_feat_flat,
+                         acts, rew.reshape(-1), pool.obs_flat, pool.feat_flat,
+                         done.reshape(-1))
         if out is not None:
             replay.push_batch(*out)
-        # 打完的局在这里统一重置开新局。必须放在采样和存池之后：上面用到的终局观测、
-        # 奖励、名次都是"打完那一刻"的状态，提前重置会把它们覆盖掉。
-        rows = np.nonzero(new)[0]
-        if rows.size:
-            env._new_round(rows)
-            # 只有这几局换了地图和出生点，其余局的末帧观测依然有效：整批复制上一帧结果，
-            # 再把刚重开的这几行覆盖成重算值。这样每帧全量观测只算一次（而不是两次）。
-            packs = [p.copy() for p in packs_next]
-            feats = [f.copy() for f in feats_next]
-            for j in range(players):
-                packs[j][rows] = env.obs_pack(j, rows)
-                feats[j][rows] = env.feat(j, rows)
-        else:
-            # 没有局重开时，下一帧的"初观测"逐位等于本帧的"末观测"：
-            # 两次 step 之间环境状态没有任何变化，而 obs_pack/feat 是纯函数，直接复用。
-            packs, feats = packs_next, feats_next
+        # 打完的局由子进程立刻重开（和单进程版同样的顺序：先留下终局观测给上面存池，
+        # 再换地图和出生点）。重开后这几局的观测由子进程按新局重算，
+        # 主进程下一帧读到的就已经是新局的状态了。
 
         # ---- 训练阶段 ----
         # LEARN_START：先攒够 2 万步经验再开始学。池子太小时抽出来的 512 条几乎全来自最近
@@ -740,7 +706,7 @@ def main():
             # 课程学习期间把当前迷宫难度也打出来，方便确认退火真的在推进
             if args.braid_from is not None:
                 log.info("本轮迷宫连通度 %.3f（从 %.2f 退火到 %.2f）",
-                         float(env.braid), args.braid_from, args.braid_to)
+                         float(braid), args.braid_from, args.braid_to)
             # 清空本窗口的累加器，开始下一个 10 秒统计窗口
             loss_sum = loss_n = 0.0
             q_sum = td_sum = td_n = 0.0
@@ -776,9 +742,10 @@ def main():
             # 评测后存一次检查点（带上总步数，供 --resume 恢复进度）
             torch.save({"model": policy.state_dict(), "steps": steps}, args.ckpt)
 
-        # 把当前帧画面和各项统计推给观战窗口（另一个进程的 tank_view.py 通过共享内存读）
+        # 把当前帧画面和各项统计推给观战窗口（另一个进程的 tank_view.py 通过共享内存读）。
+        # 画面从环境池的镜像里取（子进程抄进共享内存的整局状态）。
         if writer is not None:
-            writer.push(env)
+            writer.push(pool.mirror)
             writer.stats(stats["loss"], stats["rew"], eps, stats["spm"], stats["buf"],
                          stats["place"], stats["draw"], stats["span"], stats["rpm"], steps,
                          [(stats["eval"].get(k) or {}).get("win", 0.0) for k in EVAL_NAMES])
@@ -786,12 +753,14 @@ def main():
     # 到达时长上限后收尾：最后存一次检查点，再关掉监控/观战相关资源。
     torch.save({"model": policy.state_dict(), "steps": steps}, args.ckpt)
     log.info("训练结束，共 %d 步", steps)
+    # 先停监控/观战（它们持有镜像视图），再关环境池（镜像的内存来自池的共享内存）
     if tmon is not None:
         tmon.close()
     if monitor is not None:
         monitor.stop()
     if writer is not None:
         writer.close()
+    pool.close()
 
 
 if __name__ == "__main__":
